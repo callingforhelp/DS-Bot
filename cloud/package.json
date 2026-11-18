@@ -1,0 +1,14 @@
+{
+  "name": "ds-bot-cloud-mvp",
+  "private": true,
+  "type": "module",
+  "version": "0.0.1",
+  "scripts": {
+    "pg:start": "node scripts/pg.mjs start",
+    "pg:stop": "node scripts/pg.mjs stop",
+    "migrate": "node scripts/migrate.mjs",
+    "test": "node --test --test-force-exit --test-timeout=60000 test/*.test.mjs",
+    "bench": "node scripts/bench.mjs"
+  },
+  "dependencies": { "pg": "8.13.1" }
+}

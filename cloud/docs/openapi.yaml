@@ -1,0 +1,45 @@
+openapi: 3.0.3
+info:
+  title: DS Bot Cloud MVP API (proposed; implemented locally, not deployed)
+  version: 0.0.1
+servers: [{ url: https://controller.example.invalid }]
+components:
+  securitySchemes:
+    signed:
+      type: apiKey
+      in: header
+      name: x-signature
+      description: >
+        HMAC-SHA256 over "timestamp\nnonce\nMETHOD\npath+query\nsha256(body)". Also required: x-principal,
+        x-tenant, x-timestamp (within 5 minutes), x-nonce (single use; a replay returns 409).
+security: [{ signed: [] }]
+paths:
+  /health: { get: { security: [], summary: Liveness, responses: { '200': { description: ok } } } }
+  /ready: { get: { security: [], summary: Database reachable, responses: { '200': { description: ready }, '503': { description: not ready } } } }
+  /v1/tasks:
+    post:
+      summary: Admit a scoped task (user or human principal). Only scope "read-only" is enabled.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [project_id, idempotency_key, scope], properties: { project_id: { type: string }, idempotency_key: { type: string }, scope: { type: string, enum: [read-only] }, job: { type: object } } } } } }
+      responses: { '202': { description: 'admitted; body has run_id' }, '200': { description: 'duplicate idempotency key; same run_id' }, '401': { description: 'unauthenticated, bad signature or stale timestamp' }, '403': { description: 'scope, role or tenant not permitted' }, '409': { description: 'replayed nonce' } }
+  /v1/events:
+    post:
+      summary: Ingest one event envelope (worker principal). Tenant is taken from the authenticated principal; prompts, completions and reasoning are refused; verified_outcome cannot be set.
+      responses: { '200': { description: "{inserted: bool}; false on a replay" }, '403': { description: 'tenant mismatch' }, '422': { description: 'invalid envelope' } }
+  /v1/artifacts/register:
+    post:
+      summary: Register an uploaded object (worker). The API re-reads the object and requires its sha256 and size to match.
+      responses: { '200': { description: registered }, '422': { description: 'missing or mismatched object' } }
+  /v1/approvals:
+    post:
+      summary: Record a human approval for one action, scope and run (human principal only).
+      responses: { '201': { description: "{approval_ref}" }, '403': { description: 'not a human principal' } }
+  /v1/runs/{run_id}:
+    get:
+      summary: Evidence-linked timeline; claimed and verified outcomes are separate fields. Query project_id is required.
+      parameters: [{ name: run_id, in: path, required: true, schema: { type: string } }, { name: project_id, in: query, required: true, schema: { type: string } }]
+      responses: { '200': { description: "{run, events, authorizations, artifacts}" }, '404': { description: 'unknown run in this tenant and project' } }
+  /v1/search:
+    post:
+      summary: Filtered keyword + vector search with weighted RRF. Returns source references and snippets, never generated claims.
+      requestBody: { content: { application/json: { schema: { type: object, required: [project_id, query], properties: { project_id: { type: string }, query: { type: string }, mode: { type: string, enum: [lexical, vector, hybrid] }, limit: { type: integer, maximum: 50 }, from: { type: string, format: date-time }, to: { type: string, format: date-time }, bot_id: { type: string } } } } } }
+      responses: { '200': { description: "{queryId, mode, vectorUsed, results[]}" } }
