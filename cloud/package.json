@@ -7,7 +7,7 @@
     "pg:start": "node scripts/pg.mjs start",
     "pg:stop": "node scripts/pg.mjs stop",
     "migrate": "node scripts/migrate.mjs",
-    "test": "node --test --test-force-exit --test-timeout=60000 test/*.test.mjs",
+    "test": "node --test --test-force-exit --test-concurrency=1 --test-timeout=60000 test/*.test.mjs",
     "bench": "node scripts/bench.mjs"
   },
   "dependencies": { "pg": "8.13.1" }

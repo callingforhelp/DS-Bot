@@ -15,7 +15,14 @@ export function pgStart() {
     mkdirSync(PG_DIR, { recursive: true })
     execFileSync('initdb', ['-D', PG_DIR, '-U', 'postgres', '--auth=trust', '-E', 'UTF8', '--locale=C'], { stdio: 'ignore' })
   }
-  if (!pgStatus()) execFileSync('pg_ctl', ['-D', PG_DIR, '-o', `-p ${PG_PORT} -k ${PG_DIR} -c listen_addresses=127.0.0.1`, '-l', join(PG_DIR, 'server.log'), '-w', 'start'], { stdio: 'ignore' })
+  if (pgStatus()) return
+  try {
+    execFileSync('pg_ctl', ['-D', PG_DIR, '-o', `-p ${PG_PORT} -k ${PG_DIR} -c listen_addresses=127.0.0.1`, '-l', join(PG_DIR, 'server.log'), '-w', 'start'], { stdio: 'ignore' })
+  } catch (error) {
+    // Another process may have started it between the check and the start.
+    for (let i = 0; i < 50 && !pgStatus(); i += 1) spawnSync('sleep', ['0.2'])
+    if (!pgStatus()) throw error
+  }
 }
 export function pgStop() { if (pgStatus()) execFileSync('pg_ctl', ['-D', PG_DIR, '-m', 'fast', '-w', 'stop'], { stdio: 'ignore' }) }
 
