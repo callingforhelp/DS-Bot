@@ -55,7 +55,7 @@ npx @deepseek-ai/dsh@0.2.2-rc.1 web
 
 给 Coder 选择 Liftgate 的 Orchestrator Neon（`gemini-pro-orchestrator-neon`）、**工作区**权限和 **Coding Agent** 职责预设，并允许它响应 Planner。Coder 修改文件并验证后，向 Reviewer 派发 `review` 任务。给 Reviewer 只读权限和 **Code Reviewer** 职责预设，并允许它响应 Coder。每个派活的 bot 都需要允许接收被派 bot 的结果。Chief 不参与这一任务链。
 
-在 **设置 → 模型**中添加 Liftgate，选择 **OpenAI Responses** 和本地 `/v1` 地址，再通过 **Fetch models** 选择 Argon 和 Neon。只有实际提供 `gpt-6.2-sol` 的 provider 才能用于 Reviewer。模型不可用时，将审查标为待处理。
+在 **设置 → 模型**中添加 Liftgate，选择 **OpenAI Responses** 和本地 `/v1` 地址，再通过 **Fetch models** 选择 Argon 和 Neon。如果本地回环网关允许未认证的请求，在 API key 字段填入非敏感占位值，因为 Responses 适配器要求该字段非空。只有实际提供 `gpt-6.2-sol` 的 provider 才能用于 Reviewer。模型不可用时，将审查标为待处理。
 
 也可在单个 bot 的会话中设置执行模型。读取和其他非执行工具的结果仍由主模型处理；在识别到编辑、写入、补丁或终端工具的结果后，下一次模型调用会使用可用的执行模型。符合条件的 Argon 路由默认使用 Orchestrator Neon 作为执行模型。独立的 Coder bot 会先收到派活，再修改文件。
 

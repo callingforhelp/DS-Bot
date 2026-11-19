@@ -55,7 +55,7 @@ For a 1+1 team, start in Planner's chat. Give Planner read-only permissions and 
 
 Give Coder the Liftgate Orchestrator Neon model (`gemini-pro-orchestrator-neon`), **Workspace** permissions and the **Coding Agent** preset. Let it respond to messages from Planner. Coder makes the requested edit, runs the checks, and requests a `review` from Reviewer. Give Reviewer read-only permissions and the **Code Reviewer** preset. Allow Reviewer to respond to Coder and allow each caller to receive its delegate's result. Chief stays out of this work chain.
 
-Add Liftgate under **Settings → Models** with **OpenAI Responses** and its local `/v1` endpoint. Use **Fetch models** to select the Argon and Neon routes. Configure `gpt-6.2-sol` for Reviewer only on a provider whose catalog serves it. If it is unavailable, report review as pending.
+Add Liftgate under **Settings → Models** with **OpenAI Responses** and its local `/v1` endpoint. Use **Fetch models** to select the Argon and Neon routes. For a loopback gateway that accepts unauthenticated requests, enter a nonsecret placeholder in the API key field because the Responses adapter requires a nonempty value. Configure `gpt-6.2-sol` for Reviewer only on a provider whose catalog serves it. If it is unavailable, report review as pending.
 
 An optional executor model can also run within a single bot's session. Reads and other non-execution results stay on the primary model. After a recognized edit, write, patch or shell result, the next model call uses the configured executor if available. The default executor for an eligible Argon route is Orchestrator Neon. A separate Coder bot receives its own task before it edits anything.
 
