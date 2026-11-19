@@ -21,7 +21,8 @@ const [command] = process.argv.slice(2)
 
 if (command === 'migrate') {
   if (env.DS_BOT_DB_NAME !== 'ds_bot') throw new Error('refusing to migrate any database other than ds_bot')
-  const pool = adminPool(env, { secretId: 'rds!db-d64eceae-3dff-46c0-a131-c8c8682ba94e' })
+  if (!env.DS_BOT_DB_ADMIN_SECRET_ID) throw new Error('set DS_BOT_DB_ADMIN_SECRET_ID in .env (the RDS-managed owner secret)')
+  const pool = adminPool(env, { secretId: env.DS_BOT_DB_ADMIN_SECRET_ID })
   try {
     const who = (await pool.query('select current_database() db, current_user u, version() v')).rows[0]
     console.log(`connected: db=${who.db} user=${who.u} ${who.v.split(' on ')[0]}`)

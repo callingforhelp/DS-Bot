@@ -1,18 +1,20 @@
 # AWS resources created for the cloud MVP (19 Nov 2026)
 
-Created in the existing Flinter account (us-east-2) with the user's explicit approval, all tagged
-`Project=ds-bot-cloud-mvp`. Nothing else in the account was changed. No secrets appear in this file.
+Created in an existing AWS account (us-east-2) with the owner's explicit approval, all tagged
+`Project=ds-bot-cloud-mvp`. This repository is public, so resource IDs are placeholders here; the real IDs are in the
+git-ignored `infra/aws-staging.local.md`. Find them with:
+`aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=ds-bot-cloud-mvp`.
 
 | Resource | ID / name | Purpose |
 |---|---|---|
-| EC2 instance | `i-0c1117f3148176425` (`ds-bot-controller`, t3.small, Amazon Linux 2023, IMDSv2 required, 16 GB encrypted gp3) | Runs the controller container |
-| Security group | `sg-081612086c2e0261a` (`ds-bot-controller`) | **No inbound rules**; outbound only |
-| Rule on `flinter-rds-postgres` | `sgr-0eafad21363df7e66` (tcp 5432 from `sg-081612086c2e0261a`) | The only change to an existing Flinter resource |
+| EC2 instance | `<INSTANCE_ID>` (`ds-bot-controller`, t3.small, Amazon Linux 2023, IMDSv2 required, 16 GB encrypted gp3) | Runs the controller container |
+| Security group | `<CONTROLLER_SG_ID>` (`ds-bot-controller`) | **No inbound rules**; outbound only |
+| Rule on `flinter-rds-postgres` | `<DB_RULE_ID>` (tcp 5432 from `<CONTROLLER_SG_ID>`) | The only change to an existing Flinter resource |
 | IAM role + instance profile | `ds-bot-controller` | `AmazonSSMManagedInstanceCore` + `GetSecretValue` on one secret only + an explicit **deny** on Parameter Store reads (the managed SSM policy otherwise allows `ssm:GetParameter*` on every parameter in the account). Verified with the IAM policy simulator: own secret allowed, a Flinter secret denied, parameter reads denied |
 | Secrets Manager secret | `ds-bot/controller-env` | Controller settings (DB login, R2, Daytona, OpenAI, principals) |
 | Database (inside the existing RDS) | `ds_bot` + login `ds_bot_app` | Created 18 Nov; cannot connect to any other database on the instance |
 
-Placement: the bastion's subnet `subnet-028d0584dad035672` in `vpc-0d90aa7ac1485e1f2`. The subnet routes to an internet
+Placement: the bastion's subnet `<SUBNET_ID>` in `<VPC_ID>`. The subnet routes to an internet
 gateway and has no NAT, so the instance has a public IPv4 address for outbound traffic only; its security group admits nothing.
 Access is through AWS Systems Manager only. The controller listens on `127.0.0.1:8080` inside the instance.
 
@@ -46,10 +48,10 @@ on its own (Docker restart policy), `/ready` passed and a signed task ran end to
 
 ```sh
 P="--profile flinter --region us-east-2"
-aws ec2 terminate-instances $P --instance-ids i-0c1117f3148176425
-aws ec2 wait instance-terminated $P --instance-ids i-0c1117f3148176425
-aws ec2 revoke-security-group-ingress $P --group-id sg-040556e5e54989837 --security-group-rule-ids sgr-0eafad21363df7e66
-aws ec2 delete-security-group $P --group-id sg-081612086c2e0261a
+aws ec2 terminate-instances $P --instance-ids <INSTANCE_ID>
+aws ec2 wait instance-terminated $P --instance-ids <INSTANCE_ID>
+aws ec2 revoke-security-group-ingress $P --group-id <DB_SG_ID> --security-group-rule-ids <DB_RULE_ID>
+aws ec2 delete-security-group $P --group-id <CONTROLLER_SG_ID>
 aws iam remove-role-from-instance-profile --profile flinter --instance-profile-name ds-bot-controller --role-name ds-bot-controller
 aws iam delete-instance-profile --profile flinter --instance-profile-name ds-bot-controller
 aws iam delete-role-policy --profile flinter --role-name ds-bot-controller --policy-name ds-bot-read-own-secret
