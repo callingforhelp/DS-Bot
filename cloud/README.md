@@ -9,11 +9,25 @@ pushed, deployed or purchased. Every external service is a **local stand-in**, l
 ```sh
 npm install
 npm run pg:start      # throwaway Postgres 16 on 127.0.0.1:54329, data in ./.pg (git-ignored)
-npm test              # 16 tests, each file on its own fresh database
+npm test              # 80 tests, each file on its own fresh database
 npm run bench         # retrieval benchmark -> docs/benchmark-report.md
 node scripts/drill.mjs   # backup + restore into an empty database, digests compared
 npm run pg:stop
 ```
+
+## DS Bot audit pipeline (implemented locally; not deployed)
+
+```
+DS Bot home (/data, read-only) -> src/lineage (bridge pass -> lineage.sqlite, schema v1)
+  -> src/lineage-sidecar.mjs (ingest principal, POST /v1/events/batch, ordered, stops at a conflict)
+  -> events + authorizations (migration 003; approval_ref always null) -> indexer -> POST /v1/search, GET /v1/authorizations
+```
+
+Sources: Session logs (thrown and returned Responding-to-Bots refusals, allowed and pending calls), the ledger
+(passive deliveries, group category notices) and diagnostics (only refusals the structured sources missed). Keys are
+stable per archive row and revision, so replays insert nothing. See `src/lineage/README.md`. Deploying it needs the
+owner-approved AWS steps (migration 003 on the shared RDS, a new ingest principal in the secret, the sidecar container).
+Coverage is bounded by what DS Bot writes to disk (RISKS.md R23).
 
 ## What is real and what is a stand-in
 
@@ -27,7 +41,7 @@ npm run pg:stop
 | Object storage | `r2ObjectStore` (Cloudflare R2 via the S3 API; conditional writes, digest recomputed on read, 5-minute upload tokens) and `localObjectStore` for tests | **Verified 19 Nov 2026** against the real bucket by `scripts/r2-check.mjs` (11/11: write, readback, digest, retry no-op, overwrite refused, R2 honours If-None-Match with 412, token and path guards, cleanup). Wired into `scripts/daytona-demo.mjs` and picked up automatically by `src/serve.mjs` |
 | Controller | `src/serve.mjs` in the `cloud/Dockerfile` image | **Running on AWS EC2** (see `infra/aws-staging.md`), built on the instance, reaching RDS directly; a signed task ran end to end there (Daytona sandbox, artifact in R2), also after an instance reboot. While it runs it is the only writer, so the Mac demo scripts cannot dispatch. Internal only: no TLS, no inbound access, no independent security review yet |
 | Signed API | HMAC, timestamp window, single-use nonce, tenant from principal | Verified by tests. WeChat callback signing **not implemented** |
-| Lineage ingestion | Adapter over the PoC `lineage.sqlite` layout | Tested on a synthetic fixture only; the real PoC output was not read |
+| Lineage ingestion | DS Bot audit pipeline (below): bridge `src/lineage`, sidecar, ingest principal, refusals in `authorizations` | **Implemented locally, not deployed.** Tested end to end on a synthetic DS Bot home built from DS Bot and DSH source shapes; no real DS Bot data was read |
 | dsh-observe / OTLP | Not integrated | WP0 gap: exact package, version (0.2.27 vs 0.2.28) and digest not pinned |
 
 ## What the tests prove (`npm test`)

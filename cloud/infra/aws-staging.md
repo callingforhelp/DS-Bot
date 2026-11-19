@@ -51,7 +51,14 @@ Command output; read it in an interactive Session Manager shell.
 
 - TLS in front of the API and an independent security review (spec gates). The API is reachable only from the instance itself.
 - OpenAI embeddings on this host stay the mock until `OPENAI_EMBEDDINGS_CONSENT=yes` is set in the secret.
-- No automatic redeploy: code is copied by SSM and the image rebuilt on the instance.
+- No automatic redeploy: code is copied by SSM and the image rebuilt on the instance (a deploy tool is designed, not built; RISKS.md R36).
+
+## Planned, not deployed
+
+- **Lineage sidecar** (`src/lineage-sidecar.mjs`): a container from the controller image, uid 1000, DS Bot's `/data` mounted
+  read-only, its own writable `/lineage` folder, sharing the controller's network namespace (never host networking). Needs
+  migration 003 and an `ingest` principal first. See RISKS.md R38.
+- **Off-host backup of DS Bot `/data`**: designed only; see RISKS.md R11 and R37.
 
 ## Teardown (in this order)
 

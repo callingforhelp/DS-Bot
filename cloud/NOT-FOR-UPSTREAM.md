@@ -5,3 +5,5 @@ request head, and is not covered by the upstream tests, lint or repository scan.
 
 Targets (pin before any deployment; not yet pinned): DS Bot image digest, DSH version, and the
 `feat/responding-to-bots` commit. See `README.md` and `docs/wp0-inventory.md` for what is real and what is a stand-in.
+
+Folders added for the DS Bot audit pipeline, also fork-only: `src/lineage/`, `src/lineage-sidecar.mjs`, `test/fixtures/`.
