@@ -24,8 +24,8 @@ npm run pg:stop
 | Vector search | pgvector (`embedding_v`, cosine `<=>`) when migration 002 is applied, else `real[]` + SQL cosine | Verified locally (pgvector 0.8.7) and on RDS (0.8.1); ranks agree with the array fallback. No HNSW index yet |
 | Embeddings | `openaiEmbedder` (text-embedding-3-small, 1536-d) | **Verified 19 Nov 2026** on the synthetic fixture only (`scripts/bench-remote.mjs`); consent for real transcripts still needs an explicit `yes` in `.env`. The mock remains the test default |
 | Daytona | `daytonaProvider` (SDK 0.232.0): ephemeral sandbox, no network, 10-minute TTL, one read-only job; `mockDaytona` remains for tests | **Verified 19 Nov 2026** by `scripts/daytona-demo.mjs`: signed request -> RDS -> real sandbox -> result matched the local reference -> sandbox deleted -> evidence kept (8/8). Volumes **not** exercised (no volume configured) |
-| S3/R2 | `localObjectStore`: immutable objects, per-key expiring upload tokens | Real S3 policy / pre-signed URLs unverified |
-| Controller | Single-writer lease via Postgres advisory lock + dispatch loop | **Not the official DS Bot Docker image.** No EC2/EBS, no DSH `/data` |
+| Object storage | `r2ObjectStore` (Cloudflare R2 via the S3 API; conditional writes, digest recomputed on read) and `localObjectStore` for tests | R2 adapter tested against an in-memory fake only: **not run against a real bucket** (no R2 credentials yet) |
+| Controller | `src/serve.mjs` (API + writer lease + dispatch loop) and a `Dockerfile` | Service smoke-tested as a separate process on this Mac against local Postgres, with a standby taking over from a stopped writer. **Image not built** (Docker daemon was down); **not deployed anywhere** (no cloud host chosen). Not the official DS Bot image |
 | Signed API | HMAC, timestamp window, single-use nonce, tenant from principal | Verified by tests. WeChat callback signing **not implemented** |
 | Lineage ingestion | Adapter over the PoC `lineage.sqlite` layout | Tested on a synthetic fixture only; the real PoC output was not read |
 | dsh-observe / OTLP | Not integrated | WP0 gap: exact package, version (0.2.27 vs 0.2.28) and digest not pinned |
@@ -66,3 +66,12 @@ with text-embedding-3-small versus 0.85 for keyword search (paraphrase-only quer
 The sample is tiny, so treat it as a sanity check, not a measurement. Latencies (1.4-2.2 s per query) are dominated
 by round trips through the SSM tunnel (a search runs several statements), not by pgvector. Index time for 27 events
 was 65-84 s for the same reason. Run the service next to the database before drawing latency conclusions.
+
+## Decisions (19 Nov 2026)
+
+- **Controller host:** no AWS resources are created. The controller is packaged to run on any host; the host choice
+  waits for a separate staging account (the existing AWS account belongs to another project and is not used for hosting).
+- **Daytona volumes:** verified on the real account with a throwaway volume (persistence across sandboxes and per-tenant
+  subpath isolation), then deleted. No volume is kept; create one per tenant on demand.
+- **Object storage:** Cloudflare R2 (free tier: 10 GB-month, 1M Class A and 10M Class B operations per month, no egress
+  fee for direct reads, per Cloudflare's pricing page; whether a card is required to enable R2 is unverified).

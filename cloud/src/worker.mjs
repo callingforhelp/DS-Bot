@@ -54,8 +54,8 @@ export async function runJob({ provider, objectStore, api, bucket = 'artifacts',
     const result = await provider.run(sandbox, job)
     const key = `${tenant}/${project}/${run}/result.json`
     const bytes = Buffer.from(JSON.stringify(result))
-    const token = objectStore.presign({ bucket, key })
-    const stored = objectStore.put({ bucket, key, token, bytes })
+    const token = await objectStore.presign({ bucket, key })
+    const stored = await objectStore.put({ bucket, key, token, bytes })
     const reg = await api('POST', '/v1/artifacts/register', { project_id: project, run_id: run, artifact_id: `${run}-result`, bucket, key, sha256: stored.sha256, bytes: stored.bytes, media_type: 'application/json', provenance: { sandbox: sandbox.id, trace_id: traceId } })
     if (reg.status !== 200) throw new Error(`artifact registration failed: ${reg.status}`)
     await emit('task.result', { claimed: 'completed', body: { summary: `read-only job finished: ${result.words} words`, commit: undefined } })

@@ -9,10 +9,16 @@ export async function acquireWriterLease(pool, instance) {
   const client = await pool.connect()
   const { rows } = await client.query('select pg_try_advisory_lock(hashtext($1)) as ok', [LEASE_KEY])
   if (!rows[0].ok) { client.release(); return { held: false, instance } }
+  let released = false
   return {
     held: true,
     instance,
-    release: async () => { await client.query('select pg_advisory_unlock(hashtext($1))', [LEASE_KEY]).catch(() => {}); client.release() },
+    release: async () => {
+      if (released) return
+      released = true
+      await client.query('select pg_advisory_unlock(hashtext($1))', [LEASE_KEY]).catch(() => {})
+      client.release()
+    },
   }
 }
 

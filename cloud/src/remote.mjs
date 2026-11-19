@@ -26,9 +26,11 @@ function sslFor(env) {
   return { ca: readFileSync(ca, 'utf8'), servername: env.DS_BOT_DB_HOST, rejectUnauthorized: true }
 }
 
+// DS_BOT_DB_SSL=off exists only for the throwaway local Postgres; every remote target verifies TLS.
+// HOSTADDR is the tunnel address; without it (a host inside the same network) the host name is used.
 const config = (env, user, password, max) => ({
-  host: env.DS_BOT_DB_HOSTADDR, port: Number(env.DS_BOT_DB_PORT), database: env.DS_BOT_DB_NAME,
-  user, password, ssl: sslFor(env), max, connectionTimeoutMillis: 10_000,
+  host: env.DS_BOT_DB_HOSTADDR || env.DS_BOT_DB_HOST, port: Number(env.DS_BOT_DB_PORT || 5432), database: env.DS_BOT_DB_NAME,
+  user, password, ssl: env.DS_BOT_DB_SSL === 'off' ? false : sslFor(env), max, connectionTimeoutMillis: 10_000,
 })
 
 // The restricted application login from .env.

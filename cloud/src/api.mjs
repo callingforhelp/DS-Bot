@@ -88,7 +88,7 @@ export function createApi({ pool, embedder, principals, now = Date.now, skewMs =
 
     async 'POST /v1/artifacts/register'(p, input) {
       if (p.role !== 'worker') throw new HttpError(403, 'only workers register artifacts')
-      const head = objectStore?.head({ bucket: need(input.bucket, 'bucket'), key: need(input.key, 'key') })
+      const head = await objectStore?.head({ bucket: need(input.bucket, 'bucket'), key: need(input.key, 'key') })
       if (!head || head.sha256 !== input.sha256 || head.bytes !== input.bytes) throw new HttpError(422, 'the object is missing or does not match the declared sha256 and size')
       return scoped(p, async (c) => {
         await c.query(
@@ -151,5 +151,5 @@ export function createApi({ pool, embedder, principals, now = Date.now, skewMs =
     }
   }
 
-  return { handle, listen: (port = 0) => new Promise(resolve => { const server = createServer(handle); server.listen(port, '127.0.0.1', () => resolve(server)) }) }
+  return { handle, listen: (port = 0, host = '127.0.0.1') => new Promise(resolve => { const server = createServer(handle); server.listen(port, host, () => resolve(server)) }) }
 }
