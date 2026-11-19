@@ -23,6 +23,15 @@ Verified on the instance: Docker image built from `cloud/Dockerfile`; `/ready` r
 with a matching digest; all test rows and objects removed. **Restart:** after an instance reboot the container came back
 on its own (Docker restart policy), `/ready` passed and a signed task ran end to end again.
 
+## DS Bot container (19 Nov 2026)
+
+The official DS Bot image, built on the instance from the public fork at `feat/responding-to-bots` `2ee1a772`
+(`docker/Dockerfile`, DSH 0.2.2-rc.1), runs as container `ds-bot`: DSH home `/opt/ds-bot/dsbot/data`, workspace
+`/opt/ds-bot/dsbot/workspace`, web UI on `127.0.0.1:13080` only. One provider: GMI (`deepseek-ai/deepseek-v4.1-flash-1017`),
+key from `GMI_API_KEY` in the secret, passed to this container alone. The team starts empty; nothing is imported from the Mac.
+Permission mode is the image's own `danger-full-access` (see RISKS.md R2/R3). The login token is never written to Run
+Command output; read it in an interactive Session Manager shell.
+
 ## Operating notes
 
 - **Single writer.** This controller holds the writer lock in `ds_bot` for as long as it runs, so `scripts/daytona-demo.mjs`
