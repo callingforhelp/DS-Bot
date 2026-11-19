@@ -20,7 +20,8 @@ npm run pg:stop
 | Piece | In this MVP | Status |
 |---|---|---|
 | PostgreSQL schema, RLS, FTS (`tsvector`, GIN, `ts_rank_cd`), outbox, idempotent ingest | Real, on local Postgres 16 | Verified by tests |
-| Vector search | `real[]` + SQL cosine; `migrations/002_pgvector.optional.sql` adds `vector(1536)` | pgvector **not available locally, not tested** |
+| Remote database | `scripts/remote.mjs migrate` / `smoke` against database `ds_bot` on the existing RDS instance (PostgreSQL 18.3, pgvector 0.8.1), through an SSM tunnel, restricted login, TLS verified against the RDS host name | **Verified 18 Nov 2026**: schema applied, 8/8 smoke checks passed. Not yet run: the full 18-test suite remotely (it creates databases, which the restricted login must not) |
+| Vector search | pgvector (`embedding_v`, cosine `<=>`) when migration 002 is applied, else `real[]` + SQL cosine | Verified locally (pgvector 0.8.7) and on RDS (0.8.1); ranks agree with the array fallback. No HNSW index yet |
 | Embeddings | Offline hashed mock. `openaiEmbedder` is written but **never called** | OpenAI path unverified; needs key + explicit consent flag |
 | Daytona | `mockDaytona`: a temp directory, deleted after the job | **Not Daytona.** No account, key or volume tested; FUSE volumes not exercised |
 | S3/R2 | `localObjectStore`: immutable objects, per-key expiring upload tokens | Real S3 policy / pre-signed URLs unverified |
