@@ -22,8 +22,8 @@ npm run pg:stop
 | PostgreSQL schema, RLS, FTS (`tsvector`, GIN, `ts_rank_cd`), outbox, idempotent ingest | Real, on local Postgres 16 | Verified by tests |
 | Remote database | `scripts/remote.mjs migrate` / `smoke` against database `ds_bot` on the existing RDS instance (PostgreSQL 18.3, pgvector 0.8.1), through an SSM tunnel, restricted login, TLS verified against the RDS host name | **Verified 18 Nov 2026**: schema applied, 8/8 smoke checks passed. Not yet run: the full 18-test suite remotely (it creates databases, which the restricted login must not) |
 | Vector search | pgvector (`embedding_v`, cosine `<=>`) when migration 002 is applied, else `real[]` + SQL cosine | Verified locally (pgvector 0.8.7) and on RDS (0.8.1); ranks agree with the array fallback. No HNSW index yet |
-| Embeddings | Offline hashed mock. `openaiEmbedder` is written but **never called** | OpenAI path unverified; needs key + explicit consent flag |
-| Daytona | `mockDaytona`: a temp directory, deleted after the job | **Not Daytona.** No account, key or volume tested; FUSE volumes not exercised |
+| Embeddings | `openaiEmbedder` (text-embedding-3-small, 1536-d) | **Verified 19 Nov 2026** on the synthetic fixture only (`scripts/bench-remote.mjs`); consent for real transcripts still needs an explicit `yes` in `.env`. The mock remains the test default |
+| Daytona | `daytonaProvider` (SDK 0.232.0): ephemeral sandbox, no network, 10-minute TTL, one read-only job; `mockDaytona` remains for tests | **Verified 19 Nov 2026** by `scripts/daytona-demo.mjs`: signed request -> RDS -> real sandbox -> result matched the local reference -> sandbox deleted -> evidence kept (8/8). Volumes **not** exercised (no volume configured) |
 | S3/R2 | `localObjectStore`: immutable objects, per-key expiring upload tokens | Real S3 policy / pre-signed URLs unverified |
 | Controller | Single-writer lease via Postgres advisory lock + dispatch loop | **Not the official DS Bot Docker image.** No EC2/EBS, no DSH `/data` |
 | Signed API | HMAC, timestamp window, single-use nonce, tenant from principal | Verified by tests. WeChat callback signing **not implemented** |
@@ -58,3 +58,11 @@ and self-asserted `verified_outcome` refused at ingest; synthetic lineage replay
 `migrations/` schema (+ down script, optional pgvector) · `src/` ingest, indexer, search, API, controller,
 worker, object store, authz, bridge adapter · `test/` · `scripts/` Postgres helper, benchmark, restore drill ·
 `docs/openapi.yaml`, `docs/benchmark-report.md`, `docs/wp0-inventory.md` · `infra/` staging template · `env.example`.
+
+## Remote results (19 Nov 2026, RDS + pgvector + real OpenAI embeddings, synthetic corpus)
+
+See `docs/benchmark-report-remote.md`. On 25 documents and 11 queries, hybrid and vector search reached Recall@5 1.00
+with text-embedding-3-small versus 0.85 for keyword search (paraphrase-only queries: 1.00 vs 0.67, three queries).
+The sample is tiny, so treat it as a sanity check, not a measurement. Latencies (1.4-2.2 s per query) are dominated
+by round trips through the SSM tunnel (a search runs several statements), not by pgvector. Index time for 27 events
+was 65-84 s for the same reason. Run the service next to the database before drawing latency conclusions.

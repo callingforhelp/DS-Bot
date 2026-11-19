@@ -10,5 +10,8 @@
     "test": "node --test --test-force-exit --test-concurrency=1 --test-timeout=60000 test/*.test.mjs",
     "bench": "node scripts/bench.mjs"
   },
-  "dependencies": { "pg": "8.13.1" }
+  "dependencies": {
+    "@daytonaio/sdk": "0.232.0",
+    "pg": "8.13.1"
+  }
 }

@@ -19,6 +19,7 @@ export function mockDaytona() {
       live.set(sandbox.id, sandbox)
       return sandbox
     },
+    async run(sandbox, job) { return execReadOnly(sandbox, job) },
     async destroy(sandbox) {
       rmSync(sandbox.dir, { recursive: true, force: true })
       sandbox.destroyed = true
@@ -50,7 +51,7 @@ export async function runJob({ provider, objectStore, api, bucket = 'artifacts',
   })
   try {
     await emit('worker.started', { body: { summary: `sandbox ${sandbox.id} started read-only job ${job.kind}` } })
-    const result = execReadOnly(sandbox, job)
+    const result = await provider.run(sandbox, job)
     const key = `${tenant}/${project}/${run}/result.json`
     const bytes = Buffer.from(JSON.stringify(result))
     const token = objectStore.presign({ bucket, key })
@@ -64,6 +65,6 @@ export async function runJob({ provider, objectStore, api, bucket = 'artifacts',
     throw error
   } finally {
     await provider.destroy(sandbox)
-    if (existsSync(sandbox.dir)) throw new Error('sandbox directory was not removed')
+    if (sandbox.dir && existsSync(sandbox.dir)) throw new Error('sandbox directory was not removed')
   }
 }

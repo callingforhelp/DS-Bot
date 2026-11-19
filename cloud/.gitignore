@@ -3,3 +3,7 @@ node_modules/
 .objects/
 *.log
 .env
+
+# Local secrets: any env file or backup of one, never committed
+.env*
+!env.example
