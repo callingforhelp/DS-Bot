@@ -57,6 +57,41 @@ test('R2 store: a digest is recomputed from the bytes, never taken from metadata
   assert.notEqual((await store.head({ key: 'k' })).sha256, put.sha256, 'tampering with the stored object changes the digest the API sees')
 })
 
+test('R2 store: concurrent writes of identical bytes succeed and different bytes remain immutable', async () => {
+  const s3 = fakeS3()
+  const store = r2ObjectStore({ client: s3, bucket: 'b', secret: 's' })
+  const key = 'concurrent'
+  const token = store.presign({ key })
+  const bytes = Buffer.from('first')
+  const [first, duplicate, conflicting] = await Promise.allSettled([
+    store.put({ key, token, bytes }),
+    store.put({ key, token, bytes }),
+    store.put({ key, token, bytes: Buffer.from('other') }),
+  ])
+  assert.equal(first.status, 'fulfilled')
+  assert.deepEqual(duplicate, first)
+  assert.equal(conflicting.status, 'rejected')
+  assert.match(conflicting.reason.message, /immutable/)
+  assert.deepEqual(await store.get({ key }), bytes)
+})
+
+test('R2 store: only intact tokens within their TTL and bucket can write', async () => {
+  const s3 = fakeS3()
+  let clock = 0
+  const store = r2ObjectStore({ client: s3, bucket: 'b', secret: 's', now: () => clock })
+  const key = 'test'
+  const token = store.presign({ key, ttlSec: 1 })
+  const bytes = Buffer.from('test')
+  for (const ttlSec of [0, 301, 1.5, Infinity, '1']) assert.throws(() => store.presign({ key, ttlSec }), /TTL/)
+  for (const suffix of ['f', '.extra', '\n', 'é']) {
+    await assert.rejects(store.put({ key, token: token + suffix, bytes }), /token/)
+  }
+  await assert.rejects(store.put({ bucket: 'other', key, token, bytes }), /bucket/)
+  await store.put({ key, token, bytes })
+  clock = 1000
+  await assert.rejects(store.put({ key, token, bytes }), /expired/)
+})
+
 let db
 let server
 let base
@@ -82,7 +117,13 @@ test('the full task flow works on the R2 store, and a tampered object is refused
   assert.equal(timeline.status, 200)
   const [artifact] = timeline.body.artifacts
   assert.equal(artifact.sha256, (await store.head({ key: artifact.object_key })).sha256)
+  const register = {
+    project_id: 'p', run_id: 'run-r2', artifact_id: 'second', bucket: artifact.bucket,
+    key: artifact.object_key, sha256: artifact.sha256, bytes: artifact.bytes,
+  }
+  const wrongBucket = await as('worker')('POST', '/v1/artifacts/register', { ...register, bucket: 'other' })
+  assert.equal(wrongBucket.status, 422, 'an object in R2 cannot be registered under a different bucket')
   s3.objects.set(artifact.object_key, Buffer.from('swapped after the fact'))
-  const again = await as('worker')('POST', '/v1/artifacts/register', { project_id: 'p', run_id: 'run-r2', artifact_id: 'second', bucket: artifact.bucket, key: artifact.object_key, sha256: artifact.sha256, bytes: artifact.bytes })
+  const again = await as('worker')('POST', '/v1/artifacts/register', register)
   assert.equal(again.status, 422, 'registration re-reads the object, so a swapped object is refused')
 })
