@@ -102,7 +102,7 @@ export function install(rt) {
     const section = sectionNameOf(bot.sectionId)
     // What work this Bot takes, so a caller can state the category on the first try.
     const accepts = bot.responsibility?.categories?.length ? `accepts ${bot.responsibility.categories.join(', ')}` : ''
-    const tags = [bot.role, accepts, section ? `section "${section}"` : '', model ? `model ${model}` : '', bot.workDir ? `works in ${bot.workDir}` : '', rt.isMain(bot.id) ? 'Main Bot' : '', bot.private === true ? 'private' : '', bot.id === self ? 'you' : ''].filter(Boolean).join(', ')
+    const tags = [bot.role, accepts, section ? `section "${section}"` : '', model ? `model ${model}` : '', bot.executorModel ? `executor ${bot.executorModel}` : '', bot.workDir ? `works in ${bot.workDir}` : '', rt.isMain(bot.id) ? 'Main Bot' : '', bot.private === true ? 'private' : '', bot.id === self ? 'you' : ''].filter(Boolean).join(', ')
     const job = bot.instructions ? ` — ${bot.instructions.split('\n')[0].slice(0, 120)}` : ''
     const now = bot.id === self ? '' : `\n  now: ${rt.statusOf(bot.id)}`
     return `- ${bot.name}${tags ? ` (${tags})` : ''}${job}${now}`
@@ -494,6 +494,7 @@ export function install(rt) {
       instructions: { type: 'string', required: true, description: 'What this Bot is responsible for and how it should work' },
       brief: { type: 'string', description: 'Why the user wants it, passed to the new Bot as its first context' },
       model: { type: 'string', description: 'Model the Bot runs on, as provider/model or a model id. Only when the user names one; otherwise the team default model from DS Bot settings, or the model you run on.' },
+      executor_model: { type: 'string', description: 'Optional fast execution model for tool-continuation steps (1+1 mode), as provider/model or a model id; an empty string turns switching off, and "auto" or no value keeps the default.' },
       effort: { type: 'string', description: 'Thinking level for the model, as list_bot_models shows it. Only when the user names one.' },
       work_dir: WORK_DIR_PARAM,
       section: SECTION_PARAM,
@@ -515,7 +516,7 @@ export function install(rt) {
         const served = new Set((await rt.catalog()).filter(entry => entry.needsKey !== true && rt.isLocalAgentRef?.(entry.ref) !== true).map(entry => entry.ref))
         const fallback = [state.prefs.defaultBotModel, creator?.model].find(ref => ref && served.has(ref))
         const model = args.model || fallback
-        const bot = await rt.createBot({ ...args, avatar: avatar === undefined ? undefined : { image: avatar }, model, workDir, effort: args.effort, section: args.section, createdBy: creator?.id, taskContext: rt.live.get(exec.agent?.id)?.taskContext })
+        const bot = await rt.createBot({ ...args, avatar: avatar === undefined ? undefined : { image: avatar }, model, executorModel: args.executor_model, workDir, effort: args.effort, section: args.section, createdBy: creator?.id, taskContext: rt.live.get(exec.agent?.id)?.taskContext })
         return `Created ${bot.name}${workDir ? `, working in ${workDir}` : ''}. It is greeting the user now.`
       } catch (error) {
         return `Could not create the Bot: ${error.message}`
@@ -534,6 +535,7 @@ export function install(rt) {
       color: { type: 'string', description: `One of ${[...COLORS, ...EXTRA_COLORS].join(', ')}` },
       avatar: { ...AVATAR_PARAM, description: `${AVATAR_PARAM.description} An empty string removes the photo and shows the Bot's character again.` },
       model: { type: 'string', description: 'Move the Bot to another model, as provider/model or a model id. It stays on what it runs on: only the user moves a Bot between DS Bot models and a local agent CLI, or between two CLIs, in its settings.' },
+      executor_model: { type: 'string', description: 'Optional fast execution model for tool-continuation steps (1+1 mode), as provider/model or a model id; an empty string disables switching, and "auto" restores the default.' },
       effort: { type: 'string', description: 'Thinking level for the Bot\'s model, as list_bot_models shows; an empty string returns to the model\'s default' },
       work_dir: { ...WORK_DIR_PARAM, description: `${WORK_DIR_PARAM.description}; an empty string returns it to the team workspace` },
       section: { ...SECTION_PARAM, description: `${SECTION_PARAM.description}; an empty string removes the Bot from its section (Main Bot only)` },
@@ -561,7 +563,7 @@ export function install(rt) {
         // does: setting one keeps a custom character, and clearing removes only the image.
         // They are read here, after the waits above, so a change made meanwhile stays.
         const avatar = image === undefined ? undefined : { ...rt.botOf(bot.id)?.avatar, image }
-        const next = await rt.updateBot(bot.id, { name: newName, role, instructions, color, ...(avatar !== undefined ? { avatar } : {}), ...(model ? { model } : {}), ...(effort === undefined ? {} : { effort }), ...(section === undefined ? {} : { section }), ...(moving ? { workDir: workDir ?? '' } : {}) }, self, exec.agent?.id)
+        const next = await rt.updateBot(bot.id, { name: newName, role, instructions, color, ...(avatar !== undefined ? { avatar } : {}), ...(model ? { model } : {}), ...(args.executor_model === undefined ? {} : { executorModel: args.executor_model }), ...(effort === undefined ? {} : { effort }), ...(section === undefined ? {} : { section }), ...(moving ? { workDir: workDir ?? '' } : {}) }, self, exec.agent?.id)
         if (!moving) return `Updated ${next.name}.`
         const folder = workDir ?? 'the team workspace'
         return bot.id === caller.id ? `Updated ${next.name}. From your next step on, you work in ${folder}.` : `Updated ${next.name}. It now works in ${folder}.`

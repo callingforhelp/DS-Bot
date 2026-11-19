@@ -11,6 +11,88 @@ const ROUTE_WAIT_MS = 30_000
 // The DeepSeek account's sign-in grant (dsh-deepseek-account-platform).
 const ACCOUNT_RECORD = 'deepseek-account-platform/default'
 const TRANSIENT_LLM_CODES = new Set(['TRANSPORT', 'TIMEOUT'])
+const ORCHESTRATOR_MODEL = /^([^/]+)\/gemini-pro-orchestrator-/
+const ARGON_MODEL = /^([^/]+)\/(?:gemini-pro-orchestrator-(?:g1-pro|argon)|gemini-4-argon(?:-[^/]+)?)$/
+const NEON_ORCHESTRATOR_ID = 'gemini-pro-orchestrator-neon'
+const EXECUTION_TOOLS = new Set(['apply_patch', 'edit', 'write', 'bash', 'pwsh', 'terminal_open', 'terminal_send'])
+// Plugins add context between steps as user-role messages with one of these forms
+// (clock, memory updates, job and subagent notices, reminders).
+const CONTEXT_FORMS = new Set(['instructions', 'catalog', 'snapshot', 'notice'])
+const CLOCK_KINDS = new Set(['ds-bot-time-context', 'time-context', 'runtime-context'])
+
+// str_replace_editor also views files; only its other commands change them.
+function isExecutionCall(block) {
+  if (EXECUTION_TOOLS.has(block.name)) return true
+  if (block.name !== 'str_replace_editor') return false
+  try {
+    return JSON.parse(block.arguments)?.command !== 'view'
+  } catch {
+    return true
+  }
+}
+
+// The index of the message that started the current task. Context that arrives
+// after a tool result belongs to the running turn; real input, or context that
+// opens a turn after the model's answer, starts a new task.
+function taskStart(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role !== 'user') continue
+    if (!CONTEXT_FORMS.has(message.source?.form) && !CLOCK_KINDS.has(message.source?.kind)) return index
+    const before = messages.findLast((previous, at) => at < index && (previous?.role === 'assistant' || previous?.role === 'tool'))
+    if (before?.role !== 'tool') return index
+  }
+  return -1
+}
+
+function argonFallbackRef(ref, entries) {
+  const match = ARGON_MODEL.exec(ref ?? '')
+  if (!match) return undefined
+  const neonRef = `${match[1]}/${NEON_ORCHESTRATOR_ID}`
+  return entries.some(entry => entry.ref === neonRef) ? neonRef : undefined
+}
+
+// Pure per-step 1+1 decision from the turn's messages since the last user message:
+// - Step 1 (no tool results since the last user message): 'planner'
+// - Read, handoff, and unclassified results stay with the planner.
+// - Results of execution tools go to the executor unless an error or cadence
+//   review is due. A tool name is paired with its result by the call ID.
+export function stepRouteDecision(messages = [], { reviewCadence = 12 } = {}) {
+  const tail = messages.slice(taskStart(messages) + 1)
+  const batches = []
+  const calls = new Map()
+  for (const message of tail) {
+    if (message?.role === 'assistant') {
+      for (const block of message.content ?? []) {
+        if (block.type === 'tool-call') calls.set(block.id, isExecutionCall(block))
+      }
+      if (batches.length > 0) batches.at(-1).open = false
+    }
+    if (message?.role !== 'tool') continue
+    if (!batches.at(-1)?.open) batches.push({ open: true, hasError: false, execution: false })
+    const batch = batches.at(-1)
+    batch.hasError ||= Boolean(message.isError)
+    batch.execution ||= calls.get(message.toolCallId) === true
+  }
+  if (batches.length === 0) return { role: 'planner', reason: 'initial-plan', step: 0, consecutiveErrors: 0 }
+  let sincePlan = 0
+  let consecutiveErrors = 0
+  for (let index = 0; index < batches.length; index += 1) {
+    const batch = batches[index]
+    if (batch.execution) sincePlan += 1
+    consecutiveErrors = batch.hasError ? consecutiveErrors + 1 : 0
+    const errorReview = consecutiveErrors >= 2
+    const cadenceReview = reviewCadence > 0 && sincePlan >= reviewCadence
+    if (index === batches.length - 1) {
+      if (errorReview || cadenceReview) return { role: 'planner', reason: errorReview ? 'error-review' : 'cadence-review', step: batches.length, consecutiveErrors }
+      return batch.execution
+        ? { role: 'executor', reason: 'continuation', step: batches.length, consecutiveErrors }
+        : { role: 'planner', reason: 'inspection', step: batches.length, consecutiveErrors }
+    }
+    if (!batch.execution || errorReview || cadenceReview) sincePlan = 0
+    if (errorReview || cadenceReview) consecutiveErrors = 0
+  }
+}
 
 function retryPolicyOf(ctx, provider) {
   try {
@@ -294,7 +376,23 @@ export function install(rt) {
     if (isLocal(bot.model)) return bot.model
     const entries = await catalog()
     if (entries.some(entry => entry.ref === bot.model)) return bot.model
+    const neon = argonFallbackRef(bot.model, usableOf(entries))
+    if (neon !== undefined) return neon
     return usableOf(entries).some(entry => entry.ref === bot.appliedModel) ? bot.appliedModel : pickDefault(entries)
+  }
+
+  async function desiredExecutorModel(bot) {
+    if (!bot || bot.executorModel === null) return undefined
+    const primary = bot.appliedModel ?? bot.model
+    if (!primary || isLocal(primary)) return undefined
+    const entries = usableOf(await catalog())
+    if (typeof bot.executorModel === 'string' && bot.executorModel !== '') {
+      return entries.some(entry => entry.ref === bot.executorModel) ? bot.executorModel : undefined
+    }
+    const match = ORCHESTRATOR_MODEL.exec(primary) ?? ARGON_MODEL.exec(primary)
+    if (!match) return undefined
+    const neonRef = `${match[1]}/${NEON_ORCHESTRATOR_ID}`
+    return neonRef !== primary && entries.some(entry => entry.ref === neonRef) ? neonRef : undefined
   }
 
   // The thinking level a Bot asked for, when the model it runs on serves it; else the
@@ -463,9 +561,10 @@ export function install(rt) {
       refused.set(ref, served)
       rt.warn('ds-bot: %s is not a model endpoint, so it is not chosen again', ref)
       const entries = await catalog()
+      const usable = usableOf(entries)
       const pinned = Object.values(state.bots).filter(other => other.model === ref || other.appliedModel === ref)
       for (const other of pinned) {
-        if (other.model === ref) other.model = pickDefault(entries)
+        if (other.model === ref) other.model = argonFallbackRef(ref, usable) ?? pickDefault(entries)
         if (other.appliedModel === ref) delete other.appliedModel
       }
       await rt.save()
@@ -480,11 +579,87 @@ export function install(rt) {
   ctx.effect?.(() => () => { closing = true; lifetime.abort() }, 'ds-bot: auxiliary llm retry')
   const assembleLlm = options => assembleLlmStream(ctx, options, { signal: lifetime.signal, backoff: rt.config?.llmRetryBackoff })
 
+  const routedSteps = new WeakSet()
+  // The session header still names the original route after a stream rewrite.
+  const reroutedRefusals = new Map()
+  function takeReroutedRefusal(sessionId) {
+    const ref = reroutedRefusals.get(sessionId)
+    reroutedRefusals.delete(sessionId)
+    return ref
+  }
+  async function* streamReroutedStep(options, route, bot) {
+    const ref = `${route.provider}/${route.model}`
+    const reasoningEffort = bot === undefined ? undefined : await desiredEffort(bot, ref)
+    const rewritten = { ...options, provider: route.provider, model: route.model, reasoningEffort }
+    routedSteps.add(rewritten)
+    rt.carryUsageTag?.(options.messages, rewritten.messages)
+    for await (const chunk of ctx.llm.stream(rewritten)) {
+      if (chunk?.type === 'finish' && chunk.reason?.kind === 'error' && chunk.reason.failure?.code === 'HOSTED_ENGINE_ROUTE') {
+        reroutedRefusals.set(options.sessionId, ref)
+      }
+      yield chunk
+    }
+  }
+  ctx.on?.('llm/stream', (options, next) => {
+    if (routedSteps.has(options) || options.sessionId === undefined || options.purpose !== undefined || rt.ownRequest?.(options)) return next()
+    return (async function* routeOrchestratorStep() {
+      // A retry can take a different route before the turn ends.
+      reroutedRefusals.delete(options.sessionId)
+      await rt.load()
+      if (rt.roomOf?.(options.sessionId) !== undefined) {
+        yield* next()
+        return
+      }
+      const bot = rt.botOf?.(rt.selfOf?.(options.sessionId))
+      const plannerRef = bot?.appliedModel ?? bot?.model
+      const execRef = bot === undefined ? undefined : await desiredExecutorModel(bot)
+      if (plannerRef && execRef && execRef !== plannerRef) {
+        const decision = stepRouteDecision(options.messages ?? [], { reviewCadence: rt.config?.orchestratorReviewCadence ?? 12 })
+        if (decision.role === 'executor') {
+          const execRoute = splitRef(execRef)
+          if (execRoute?.provider && execRoute?.model && (options.provider !== execRoute.provider || options.model !== execRoute.model)) {
+            yield* streamReroutedStep(options, execRoute, bot)
+            return
+          }
+        }
+      }
+      const activeRef = options.provider && options.model ? `${options.provider}/${options.model}` : ''
+      const neonRef = ARGON_MODEL.test(activeRef) ? argonFallbackRef(activeRef, usableOf(await catalog())) : undefined
+      if (neonRef === undefined) {
+        yield* next()
+        return
+      }
+      const neonRoute = splitRef(neonRef)
+      let emitted = false
+      let fallback = false
+      try {
+        for await (const chunk of next()) {
+          if (chunk?.type === 'finish') {
+            if (chunk.reason?.kind === 'error' && !emitted && !options.signal?.aborted) {
+              fallback = true
+              break
+            }
+            yield chunk
+            return
+          }
+          if (chunk?.type !== 'usage') emitted = true
+          yield chunk
+        }
+      } catch (error) {
+        if (emitted || options.signal?.aborted) throw error
+        fallback = true
+      }
+      if (!fallback) return
+      rt.warn?.('ds-bot: %s unavailable at runtime, falling back to %s', activeRef, neonRef)
+      yield* streamReroutedStep(options, neonRoute, bot)
+    })()
+  })
+
   Object.assign(rt, {
     // Work that starts while the host runs can ask whether the host is still there.
     hostClosing: () => llm() === undefined,
     catalog, cachedCatalog: () => answerable(catalogCache.value), cachedDefault: () => pickDefault(catalogCache.value),
-    defaultRef, defaultModel, defaultBotModel, defaultEffort, isUsable, resolveModel, desiredModel, reasoningOf, resolveEffort, desiredEffort,
-    selectSessionModel, applyModel, selectRoomSession, syncRoomSessions, waitForModel, syncModels, routeRefused, dropCatalog, assembleLlm,
+    defaultRef, defaultModel, defaultBotModel, defaultEffort, isUsable, resolveModel, desiredModel, desiredExecutorModel, reasoningOf, resolveEffort, desiredEffort,
+    selectSessionModel, applyModel, selectRoomSession, syncRoomSessions, waitForModel, syncModels, routeRefused, takeReroutedRefusal, dropCatalog, assembleLlm,
   })
 }

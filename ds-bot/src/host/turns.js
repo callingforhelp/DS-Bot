@@ -840,6 +840,7 @@ export function install(rt) {
   ctx.on('session/event', (session, event) => {
     const id = session?.id
     if (id === undefined) return
+    const reroutedRefusal = event.type === 'turn/end' ? rt.takeReroutedRefusal?.(id) : undefined
     const switchedEnd = event.type === 'turn/end' && live.get(id)?.switched === true && rt.pastOwners?.has(id)
     if (!rt.isBotSession(id) && !rt.roomOf(id) && !switchedEnd) {
       // A deleted Bot's Session can still be ending its turn; nothing of it stays.
@@ -1208,12 +1209,14 @@ export function install(rt) {
         const reason = event.data?.reason
         const failure = reason?.kind === 'error' && !switched ? turnFailure(reason.error) : undefined
         if (failure !== undefined) noteTurnFailure(id, failure)
-        // A route that is not a model endpoint refuses every generation; the failed
-        // Session's own request names it, so it is refused everywhere from now on.
+        // A route that is not a model endpoint refuses every generation. A rerouted
+        // step does not change the Session's selection, so it needs no re-selection.
         if (failure?.code === 'HOSTED_ENGINE_ROUTE') {
           const config = session.requestHeader?.()?.config
-          const ref = config?.provider && config?.model ? `${config.provider}/${config.model}` : undefined
-          if (ref !== undefined) void rt.routeRefused(ref, rt.botOf(rt.selfOf(id))).catch(error => rt.warn('ds-bot: %s still failing: %s', ref, error))
+          const headerRef = config?.provider && config?.model ? `${config.provider}/${config.model}` : undefined
+          const ref = reroutedRefusal ?? headerRef
+          const bot = reroutedRefusal === undefined ? rt.botOf(rt.selfOf(id)) : undefined
+          if (ref !== undefined) void rt.routeRefused(ref, bot).catch(error => rt.warn('ds-bot: %s still failing: %s', ref, error))
         }
         const held = rt.groupOwners.has(id) ? rt.takeRoomSteps?.(id) ?? '' : ''
         if (switched) break

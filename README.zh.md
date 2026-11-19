@@ -49,6 +49,16 @@ npx @deepseek-ai/dsh@0.2.2-rc.1 web
 
 我强烈建议你直接通过和 bot 对话来配置其他 bot 和群聊。
 
+### Planner、Coder 和 Reviewer
+
+使用 1+1 团队时，从 Planner 的对话开始。给 Planner 只读权限，并选择 Liftgate 的 Argon 模型（`gemini-pro-orchestrator-g1-pro`）。Argon 不可用时，路由可回退到 Orchestrator Neon。将 Planner 的执行模型设为 **Same as model**，让它在自己的会话中读取文件并制定计划。用户授权修改后，Planner 用 `message_bot` 给 Coder 派发 `coding` 任务，注明工作目录、允许修改的文件和验收检查。
+
+给 Coder 选择 Liftgate 的 Orchestrator Neon（`gemini-pro-orchestrator-neon`）、**工作区**权限和 **Coding Agent** 职责预设，并允许它响应 Planner。Coder 修改文件并验证后，向 Reviewer 派发 `review` 任务。给 Reviewer 只读权限和 **Code Reviewer** 职责预设，并允许它响应 Coder。每个派活的 bot 都需要允许接收被派 bot 的结果。Chief 不参与这一任务链。
+
+在 **设置 → 模型**中添加 Liftgate，选择 **OpenAI Responses** 和本地 `/v1` 地址，再通过 **Fetch models** 选择 Argon 和 Neon。如果本地回环网关允许未认证的请求，在 API key 字段填入非敏感占位值，因为 Responses 适配器要求该字段非空。只有实际提供 `gpt-6.2-sol` 的 provider 才能用于 Reviewer。模型不可用时，将审查标为待处理。
+
+也可在单个 bot 的会话中设置执行模型。读取和其他非执行工具的结果仍由主模型处理；在识别到编辑、写入、补丁或终端工具的结果后，下一次模型调用会使用可用的执行模型。符合条件的 Argon 路由默认使用 Orchestrator Neon 作为执行模型。独立的 Coder bot 会先收到派活，再修改文件。
+
 ### 网页搜索
 
 DS Bot 会把 `auto` 搜索 provider 选为整个 profile 的后端。禁用 `web-search-auto` 时，也要为该 profile 选择另一个已注册的搜索 provider。详见[网页搜索说明](ds-bot/README.md#web-search)和[恢复步骤](docs/known-issues.zh.md#关掉-web-search-auto-后所有会话的网页搜索都失败)。

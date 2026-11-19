@@ -5,6 +5,7 @@ import { isMainOf } from './sources.js'
 import { PencilIcon, ChevronRightIcon } from './icons.js'
 import { lookOf, BotMark } from './mark.js'
 import { ModelMenu, modelOf } from './model-menu.js'
+import { modelsFor } from './agent-routes.js'
 import { RunModeCard } from './agent-cards.js'
 import { FolderMenu } from './folder-menu.js'
 import { BotSchedules } from './schedules.js'
@@ -310,7 +311,17 @@ export function BotSettingsForm({ bot, roster, actions, run }) {
     h(Card, { title: t('Model') },
       h('div', { className: 'bt-set-row bt-bs-row' },
         h('span', { className: 'bt-set-copy' }, h('span', { className: 'bt-bs-label' }, t('Model')), h('span', { className: 'bt-set-hint' }, modelHint(bot, roster))),
-        h(ModelMenu, { bot, roster, actions, run }))),
+        h(ModelMenu, { bot, roster, actions, run })),
+      !bot.engine ? h(Row, { label: t('Executor model'), hint: t('Optional fast model for tool steps after planning (1+1 mode).') },
+        h('select', {
+          className: 'bt-bs-input',
+          'aria-label': t('Executor model'),
+          value: bot.executorModel === undefined ? 'auto' : (bot.executorModel ?? ''),
+          onChange: event => save({ executorModel: event.target.value || null }),
+        },
+        h('option', { value: 'auto' }, t('Default')),
+        h('option', { value: '' }, t('Same as model')),
+        modelsFor(roster.models).filter(entry => !entry.needsKey).map(entry => h('option', { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`)))) : null),
     h(Card, { title: t('Working folder') },
       h('div', { className: 'bt-set-row bt-bs-row' },
         h('span', { className: 'bt-set-copy' }, h('span', { className: 'bt-bs-label' }, t('Folder'))),

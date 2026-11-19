@@ -701,6 +701,9 @@ var JA = {
   "Messages from other Bots never start new work. Your own messages always do.": "他の Bot からのメッセージは、新しい作業を自動で始めません。あなた自身のメッセージは常に始めます。",
   "Only the Bots you pick below can start new work with a message.": "下で選んだ Bot だけが、メッセージで新しい作業を始められます。",
   "Any Bot can start new work with a message. The loop limits still apply.": "どの Bot でも、メッセージで新しい作業を始められます。ループの上限は引き続き適用されます。",
+  "Executor model": "実行モデル",
+  "Optional fast model for tool steps after planning (1+1 mode).": "計画後のツール実行ステップに使う高速モデル（1+1 モード・任意）。",
+  "Same as model": "メインモデルと同じ",
   "Not chosen yet: Bot messages work as they did before this setting.": "未選択：Bot のメッセージは、この設定ができる前と同じ動作です。",
   "Any Bot can start work here, including work that uses tools. Bots can then keep each other busy; choose this only for Bots you trust.": "どの Bot もここで作業を始められ、ツールを使う作業も含まれます。Bot 同士が互いを忙しくさせることがあるため、信頼できる Bot にだけ選んでください。",
   "Allowed Bots": "許可する Bot",
@@ -3125,6 +3128,9 @@ var KO = {
   "Code review": "코드 검토",
   "Research": "조사",
   "Responding to Bots": "Bot에 응답",
+  "Executor model": "실행 모델",
+  "Optional fast model for tool steps after planning (1+1 mode).": "계획 후 도구 실행 단계에 사용할 빠른 모델(1+1 모드, 선택 사항)입니다.",
+  "Same as model": "기본 모델과 동일",
   "Messages from other Bots never start new work. Your own messages always do.": "다른 Bot의 메시지는 새 작업을 자동으로 시작하지 않습니다. 직접 보낸 메시지는 항상 시작합니다.",
   "Only the Bots you pick below can start new work with a message.": "아래에서 고른 Bot만 메시지로 새 작업을 시작할 수 있습니다.",
   "Any Bot can start new work with a message. The loop limits still apply.": "어떤 Bot이든 메시지로 새 작업을 시작할 수 있습니다. 반복 제한은 계속 적용됩니다.",
@@ -5586,6 +5592,9 @@ var ES = {
   "Code review": "Revisión de código",
   "Research": "Investigación",
   "Responding to Bots": "Responder a Bots",
+  "Executor model": "Modelo ejecutor",
+  "Optional fast model for tool steps after planning (1+1 mode).": "Modelo rápido opcional para los pasos de herramientas tras la planificación (modo 1+1).",
+  "Same as model": "Igual que el modelo principal",
   "Messages from other Bots never start new work. Your own messages always do.": "Los mensajes de otros Bots nunca inician trabajo nuevo. Los tuyos siempre.",
   "Only the Bots you pick below can start new work with a message.": "Solo los Bots que elijas abajo pueden iniciar trabajo nuevo con un mensaje.",
   "Any Bot can start new work with a message. The loop limits still apply.": "Cualquier Bot puede iniciar trabajo nuevo con un mensaje. Los límites de bucle siguen vigentes.",
@@ -8039,6 +8048,9 @@ var FR = {
   "Messages from other Bots never start new work. Your own messages always do.": "Les messages des autres Bots ne démarrent jamais de nouveau travail. Les vôtres, toujours.",
   "Only the Bots you pick below can start new work with a message.": "Seuls les Bots choisis ci-dessous peuvent démarrer un nouveau travail par message.",
   "Any Bot can start new work with a message. The loop limits still apply.": "Tout Bot peut démarrer un nouveau travail par message. Les limites de boucle s’appliquent toujours.",
+  "Executor model": "Modèle exécuteur",
+  "Optional fast model for tool steps after planning (1+1 mode).": "Modèle rapide facultatif pour les étapes d’outils après la planification (mode 1+1).",
+  "Same as model": "Identique au modèle principal",
   "Not chosen yet: Bot messages work as they did before this setting.": "Pas encore choisi : les messages de Bots fonctionnent comme avant ce réglage.",
   "Any Bot can start work here, including work that uses tools. Bots can then keep each other busy; choose this only for Bots you trust.": "Tout Bot peut démarrer du travail ici, y compris avec des outils. Les Bots peuvent alors s’occuper mutuellement ; ne choisissez ceci que pour des Bots de confiance.",
   "Allowed Bots": "Bots autorisés",
@@ -10463,6 +10475,9 @@ var DE = {
   "Code review": "Codeprüfung",
   "Research": "Recherche",
   "Responding to Bots": "Auf Bots antworten",
+  "Executor model": "Ausführungsmodell",
+  "Optional fast model for tool steps after planning (1+1 mode).": "Optionales schnelles Modell für Werkzeugschritte nach der Planung (1+1-Modus).",
+  "Same as model": "Wie Hauptmodell",
   "Messages from other Bots never start new work. Your own messages always do.": "Nachrichten anderer Bots starten nie automatisch neue Arbeit. Deine eigenen Nachrichten immer.",
   "Only the Bots you pick below can start new work with a message.": "Nur die unten gewählten Bots können mit einer Nachricht neue Arbeit starten.",
   "Any Bot can start new work with a message. The loop limits still apply.": "Jeder Bot kann mit einer Nachricht neue Arbeit starten. Die Schleifengrenzen gelten weiterhin.",
@@ -12899,6 +12914,9 @@ var ZH = {
   "Code review": "代码审查",
   "Research": "研究",
   "Responding to Bots": "回应其他 Bot",
+  "Executor model": "执行模型",
+  "Optional fast model for tool steps after planning (1+1 mode).": "可选的快速模型，用于规划后的工具执行步骤（1+1 模式）。",
+  "Same as model": "与主模型相同",
   "Messages from other Bots never start new work. Your own messages always do.": "其他 Bot 发来的消息不会自动开始新工作。你自己发的消息始终会。",
   "Only the Bots you pick below can start new work with a message.": "只有你在下面选中的 Bot，才能用消息开始新工作。",
   "Any Bot can start new work with a message. The loop limits still apply.": "任何 Bot 都能用消息开始新工作，循环上限仍然有效。",
@@ -26056,7 +26074,23 @@ function BotSettingsForm({ bot, roster, actions, run: run2 }) {
         { className: "bt-set-row bt-bs-row" },
         (0, import_react27.createElement)("span", { className: "bt-set-copy" }, (0, import_react27.createElement)("span", { className: "bt-bs-label" }, t("Model")), (0, import_react27.createElement)("span", { className: "bt-set-hint" }, modelHint(bot, roster))),
         (0, import_react27.createElement)(ModelMenu, { bot, roster, actions, run: run2 })
-      )
+      ),
+      !bot.engine ? (0, import_react27.createElement)(
+        Row,
+        { label: t("Executor model"), hint: t("Optional fast model for tool steps after planning (1+1 mode).") },
+        (0, import_react27.createElement)(
+          "select",
+          {
+            className: "bt-bs-input",
+            "aria-label": t("Executor model"),
+            value: bot.executorModel === void 0 ? "auto" : bot.executorModel ?? "",
+            onChange: (event) => save({ executorModel: event.target.value || null })
+          },
+          (0, import_react27.createElement)("option", { value: "auto" }, t("Default")),
+          (0, import_react27.createElement)("option", { value: "" }, t("Same as model")),
+          modelsFor(roster.models).filter((entry) => !entry.needsKey).map((entry) => (0, import_react27.createElement)("option", { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`))
+        )
+      ) : null
     ),
     (0, import_react27.createElement)(
       Card2,
