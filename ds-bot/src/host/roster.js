@@ -195,7 +195,7 @@ export function install(rt) {
     const cleanAvatarValue = cleanAvatar(avatar)
     // The model is fixed at creation, so a later change of the DSH default leaves it alone.
     const modelRef = model ? await rt.resolveModel(model) : pickModel ? undefined : await rt.defaultBotModel()
-    const hasExecutor = executorModel !== undefined && executorModel !== null && executorModel !== ''
+    const hasExecutor = executorModel !== undefined && executorModel !== null && executorModel !== '' && executorModel !== 'auto'
     const executorModelRef = hasExecutor ? await rt.resolveModel(executorModel) : executorModel === null || executorModel === '' ? null : undefined
     if (typeof executorModelRef === 'string' && (rt.isLocalAgentRef?.(executorModelRef) || rt.isLocalAgentRef?.(modelRef))) {
       throw new Error('A local agent CLI cannot use an executor model')
@@ -363,7 +363,8 @@ export function install(rt) {
       color: bot.color,
       avatar: bot.avatar,
       model: served ? bot.model : undefined,
-      executorModel: bot.executorModel === null ? null : bot.executorModel && entries.some(entry => entry.ref === bot.executorModel) ? bot.executorModel : undefined,
+      // A Bot moved to a local agent before its executor was cleared keeps it stored.
+      executorModel: bot.executorModel === null ? null : bot.executorModel && !rt.isLocalAgentRef?.(bot.model) && entries.some(entry => entry.ref === bot.executorModel) ? bot.executorModel : undefined,
       // A copy of a Bot on the model's own default stays on it (null marks the
       // explicit Default pick); else the create would inherit the profile level.
       effort: served ? (bot.effort ?? null) : undefined,
@@ -468,6 +469,8 @@ export function install(rt) {
     if (patch.executorModel !== undefined) {
       if (executorModelRef === undefined) delete bot.executorModel
       else bot.executorModel = executorModelRef
+    } else if (modelRef && rt.isLocalAgentRef?.(modelRef) && typeof bot.executorModel === 'string') {
+      delete bot.executorModel
     }
     if (patch.effort !== undefined) {
       if (effortId === null) delete bot.effort

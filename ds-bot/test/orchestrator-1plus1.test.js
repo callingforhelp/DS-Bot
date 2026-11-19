@@ -116,6 +116,40 @@ test('stepRouteDecision handles Step 1 planning, executor continuation, 2-error 
   assert.deepEqual(stepRouteDecision([user, assistant, okTool, assistant, okTool, assistant, okTool, assistant, okTool], { reviewCadence: 3 }), { role: 'executor', reason: 'continuation', step: 4, consecutiveErrors: 0 })
 })
 
+test('stepRouteDecision keeps routing history across context injected mid-turn', () => {
+  const user = { role: 'user', content: [{ type: 'text', text: 'Implement feature' }] }
+  const assistant = toolCall('edit', 'edit')
+  const okTool = toolResult('edit')
+  const errTool = toolResult('edit', true)
+  const memory = { role: 'user', source: { kind: 'ds-bot-memory-update', form: 'snapshot', sections: [] } }
+  const jobs = { role: 'user', source: { kind: 'tool-jobs', form: 'notice', summary: 'bash done' } }
+  const settled = { role: 'user', source: { kind: 'subagent-settled', form: 'notice', summary: 'done' } }
+  const reminder = { role: 'user', source: { kind: 'repeat-tool-reminder', form: 'notice', summary: 'repeat' } }
+
+  for (const context of [memory, jobs, settled, reminder]) {
+    assert.deepEqual(stepRouteDecision([user, assistant, okTool, context]), { role: 'executor', reason: 'continuation', step: 1, consecutiveErrors: 0 }, context.source.kind)
+    assert.deepEqual(stepRouteDecision([user, assistant, errTool, context, assistant, errTool]), { role: 'planner', reason: 'error-review', step: 2, consecutiveErrors: 2 }, context.source.kind)
+  }
+  assert.deepEqual(stepRouteDecision([user, assistant, okTool, assistant, okTool, jobs, assistant, okTool], { reviewCadence: 3 }), { role: 'planner', reason: 'cadence-review', step: 3, consecutiveErrors: 0 })
+  const developer = { role: 'developer', content: [{ type: 'text', text: 'note' }] }
+  const clock = { role: 'user', source: { kind: 'ds-bot-time-context', form: 'snapshot', sections: [] } }
+  assert.deepEqual(stepRouteDecision([user, assistant, okTool, developer, clock]), { role: 'executor', reason: 'continuation', step: 1, consecutiveErrors: 0 })
+  assert.deepEqual(stepRouteDecision([user, assistant, okTool, developer, memory]), { role: 'executor', reason: 'continuation', step: 1, consecutiveErrors: 0 })
+
+  // A notice that opens a turn after the model's answer, and a user steer, start a new task.
+  const answer = { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] }
+  assert.deepEqual(stepRouteDecision([user, assistant, okTool, answer, jobs]), { role: 'planner', reason: 'initial-plan', step: 0, consecutiveErrors: 0 })
+  assert.deepEqual(stepRouteDecision([user, assistant, okTool, { role: 'user', source: { kind: 'user' } }]), { role: 'planner', reason: 'initial-plan', step: 0, consecutiveErrors: 0 })
+})
+
+test('stepRouteDecision treats terminal input and editor changes as execution, and editor views as reads', () => {
+  const user = { role: 'user', content: [{ type: 'text', text: 'Implement feature' }] }
+  const editor = (id, command) => ({ role: 'assistant', content: [{ type: 'tool-call', id, name: 'str_replace_editor', arguments: JSON.stringify({ command, path: 'a.txt' }) }] })
+  assert.equal(stepRouteDecision([user, toolCall('t', 'terminal_send'), toolResult('t')]).role, 'executor')
+  assert.equal(stepRouteDecision([user, editor('e', 'str_replace'), toolResult('e')]).role, 'executor')
+  assert.deepEqual(stepRouteDecision([user, editor('v', 'view'), toolResult('v')]), { role: 'planner', reason: 'inspection', step: 1, consecutiveErrors: 0 })
+})
+
 test('llm/stream keeps reads on Argon, sends execution continuations to Neon, and hands back on 2 errors', async (t) => {
   const { ctx, calls, tool, stop } = start()
   t.after(stop)
@@ -185,7 +219,36 @@ test('explicit executor opt-out survives updates and copies', async (t) => {
   const created = await rt.createBot({ name: 'Opt out', model: 'liftgate/gemini-pro-orchestrator-g1-pro', executorModel: null })
   assert.equal(state().bots[created.id].executorModel, null)
   await rt.updateBot('m1', { executorModel: 'auto' })
+  assert.equal('executorModel' in state().bots.m1, false)
   assert.equal(await rt.desiredExecutorModel(state().bots.m1), 'liftgate/gemini-pro-orchestrator-neon')
+  const auto = await rt.createBot({ name: 'Auto', model: 'liftgate/gemini-pro-orchestrator-g1-pro', executorModel: 'auto' })
+  assert.equal('executorModel' in state().bots[auto.id], false)
+})
+
+test('a Bot on a local agent drops an executor it kept, so it can still be copied', async (t) => {
+  const { rt, tool, state, stop } = start({
+    ...TEAM,
+    bots: {
+      ...TEAM.bots,
+      l1: { id: 'l1', sessionId: 'l1', name: 'Local', model: 'local-codex-cli/gpt-5.1-codex', appliedModel: 'local-codex-cli/gpt-5.1-codex', executorModel: 'deepseek/v4-lite', createdAt: 3 },
+    },
+  }, {
+    providers: {
+      liftgate: [{ id: 'gemini-pro-orchestrator-g1-pro' }, { id: 'gemini-pro-orchestrator-neon' }],
+      deepseek: [{ id: 'v4' }, { id: 'v4-lite' }],
+      'local-codex-cli': [{ id: 'gpt-5.1-codex' }],
+    },
+  })
+  t.after(stop)
+  // The fake context has no local agent adapter to register the CLI's route.
+  rt.isLocalAgentAvailable = () => true
+  await tool('list_bots', {}, 'm1')
+  const copy = await rt.duplicateBot('l1')
+  assert.equal(state().bots[copy.id].model, 'local-codex-cli/gpt-5.1-codex')
+  assert.equal('executorModel' in state().bots[copy.id], false)
+
+  await rt.updateBot('b2', { model: 'local-codex-cli/gpt-5.1-codex', changeEngine: true })
+  assert.equal('executorModel' in state().bots.b2, false)
 })
 
 test('a Planner coding handoff and a Coder review handoff reach separate Sessions', async (t) => {

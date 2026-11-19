@@ -14,7 +14,36 @@ const TRANSIENT_LLM_CODES = new Set(['TRANSPORT', 'TIMEOUT'])
 const ORCHESTRATOR_MODEL = /^([^/]+)\/gemini-pro-orchestrator-/
 const ARGON_MODEL = /^([^/]+)\/(?:gemini-pro-orchestrator-(?:g1-pro|argon)|gemini-4-argon(?:-[^/]+)?)$/
 const NEON_ORCHESTRATOR_ID = 'gemini-pro-orchestrator-neon'
-const EXECUTION_TOOLS = new Set(['apply_patch', 'edit', 'write', 'bash', 'pwsh'])
+const EXECUTION_TOOLS = new Set(['apply_patch', 'edit', 'write', 'bash', 'pwsh', 'terminal_open', 'terminal_send'])
+// Plugins add context between steps as user-role messages with one of these forms
+// (clock, memory updates, job and subagent notices, reminders).
+const CONTEXT_FORMS = new Set(['instructions', 'catalog', 'snapshot', 'notice'])
+const CLOCK_KINDS = new Set(['ds-bot-time-context', 'time-context', 'runtime-context'])
+
+// str_replace_editor also views files; only its other commands change them.
+function isExecutionCall(block) {
+  if (EXECUTION_TOOLS.has(block.name)) return true
+  if (block.name !== 'str_replace_editor') return false
+  try {
+    return JSON.parse(block.arguments)?.command !== 'view'
+  } catch {
+    return true
+  }
+}
+
+// The index of the message that started the current task. Context that arrives
+// after a tool result belongs to the running turn; real input, or context that
+// opens a turn after the model's answer, starts a new task.
+function taskStart(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role !== 'user') continue
+    if (!CONTEXT_FORMS.has(message.source?.form) && !CLOCK_KINDS.has(message.source?.kind)) return index
+    const before = messages.findLast((previous, at) => at < index && (previous?.role === 'assistant' || previous?.role === 'tool'))
+    if (before?.role !== 'tool') return index
+  }
+  return -1
+}
 
 function argonFallbackRef(ref, entries) {
   const match = ARGON_MODEL.exec(ref ?? '')
@@ -29,14 +58,13 @@ function argonFallbackRef(ref, entries) {
 // - Results of execution tools go to the executor unless an error or cadence
 //   review is due. A tool name is paired with its result by the call ID.
 export function stepRouteDecision(messages = [], { reviewCadence = 12 } = {}) {
-  const lastUser = messages.findLastIndex(message => message?.role === 'user' && !['ds-bot-time-context', 'time-context', 'runtime-context'].includes(message.source?.kind))
-  const tail = lastUser === -1 ? messages : messages.slice(lastUser + 1)
+  const tail = messages.slice(taskStart(messages) + 1)
   const batches = []
   const calls = new Map()
   for (const message of tail) {
     if (message?.role === 'assistant') {
       for (const block of message.content ?? []) {
-        if (block.type === 'tool-call') calls.set(block.id, block.name)
+        if (block.type === 'tool-call') calls.set(block.id, isExecutionCall(block))
       }
       if (batches.length > 0) batches.at(-1).open = false
     }
@@ -44,7 +72,7 @@ export function stepRouteDecision(messages = [], { reviewCadence = 12 } = {}) {
     if (!batches.at(-1)?.open) batches.push({ open: true, hasError: false, execution: false })
     const batch = batches.at(-1)
     batch.hasError ||= Boolean(message.isError)
-    batch.execution ||= EXECUTION_TOOLS.has(calls.get(message.toolCallId))
+    batch.execution ||= calls.get(message.toolCallId) === true
   }
   if (batches.length === 0) return { role: 'planner', reason: 'initial-plan', step: 0, consecutiveErrors: 0 }
   let sincePlan = 0

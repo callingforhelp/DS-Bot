@@ -494,7 +494,7 @@ export function install(rt) {
       instructions: { type: 'string', required: true, description: 'What this Bot is responsible for and how it should work' },
       brief: { type: 'string', description: 'Why the user wants it, passed to the new Bot as its first context' },
       model: { type: 'string', description: 'Model the Bot runs on, as provider/model or a model id. Only when the user names one; otherwise the team default model from DS Bot settings, or the model you run on.' },
-      executor_model: { type: 'string', description: 'Optional fast execution model for tool-continuation steps (1+1 mode), as provider/model or a model id.' },
+      executor_model: { type: 'string', description: 'Optional fast execution model for tool-continuation steps (1+1 mode), as provider/model or a model id; an empty string turns switching off, and "auto" or no value keeps the default.' },
       effort: { type: 'string', description: 'Thinking level for the model, as list_bot_models shows it. Only when the user names one.' },
       work_dir: WORK_DIR_PARAM,
       section: SECTION_PARAM,
