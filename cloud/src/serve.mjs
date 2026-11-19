@@ -3,6 +3,7 @@
 // environment or a mounted file. Missing optional services fall back to the local stand-ins and
 // say so in the log, so a half-configured host is never mistaken for a fully remote one.
 import { readFileSync } from 'node:fs'
+import { validatePrincipals } from './api.mjs'
 import { startController } from './controller-service.mjs'
 import { mockEmbedder, openaiEmbedder } from './embed.mjs'
 import { localObjectStore } from './objectstore.mjs'
@@ -15,8 +16,11 @@ const env = process.env
 const say = (...a) => console.log(new Date().toISOString(), ...a)
 
 if (!env.PRINCIPALS_FILE) { console.error('PRINCIPALS_FILE (a JSON file of principals, mounted as a secret) is required'); process.exit(2) }
-const principals = JSON.parse(readFileSync(env.PRINCIPALS_FILE, 'utf8'))
+let principals
+try { principals = JSON.parse(readFileSync(env.PRINCIPALS_FILE, 'utf8')) } catch { console.error('PRINCIPALS_FILE is not readable JSON'); process.exit(2) }
 if (!principals.worker) { console.error('principals must include a "worker" principal'); process.exit(2) }
+const principalErrors = validatePrincipals(principals)
+if (principalErrors.length) { for (const e of principalErrors) console.error(`principals: ${e}`); process.exit(2) }
 
 const pool = appPool(env, Number(env.DB_POOL_MAX || 8))
 const haveR2 = ['R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET'].every(k => env[k])
