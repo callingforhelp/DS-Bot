@@ -53,11 +53,26 @@ Command output; read it in an interactive Session Manager shell.
 - OpenAI embeddings on this host stay the mock until `OPENAI_EMBEDDINGS_CONSENT=yes` is set in the secret.
 - No automatic redeploy: code is copied by SSM and the image rebuilt on the instance (a deploy tool is designed, not built; RISKS.md R36).
 
+## DS Bot audit pipeline (deployed 19 Nov 2026)
+
+- **Migration 003** applied to `ds_bot` on the existing RDS (additive: authorizations gain target, room, source event and
+  private-agent scoping). Remote smoke test 8/8 afterwards.
+- **Secret** `ds-bot/controller-env` gained an `ingest` principal `dsbot-shipper` (tenant `dsbot-cloud`, source
+  `ds-bot-lineage`, project `dsbot-aws-staging`), `LINEAGE_PRINCIPAL_JSON` (kept out of the controller's env and written to a
+  root-owned 0400 file for the sidecar), tenant `dsbot-cloud` for `operator`, and `EMBED_LOCAL_TENANTS=dsbot-cloud` (DS Bot
+  audit data uses local embeddings only until the owner decides whether the OpenAI consent covers it). Live principals were
+  checked against the new startup rules first (both 48-character secrets, valid roles, none shared).
+- **Controller** redeployed with the new code; the previous image is kept as `ds-bot-controller:prev`, and the swap rolls back
+  automatically if `/ready` fails. The existing end-to-end check still passes 7/7.
+- **Lineage sidecar** container `ds-bot-lineage`: controller image, `node src/lineage-sidecar.mjs`, uid 1000, `/data` read-only,
+  `/opt/ds-bot/lineage` writable, the controller's network namespace (never host networking), read-only root, all
+  capabilities dropped, 256 MB / 64 pids, restart unless stopped. Restart it after any controller swap. Status:
+  `/opt/ds-bot/lineage/status.json` (counts only). Live probes: the shipper authenticates (an empty batch is refused as
+  input, 400), cannot search (403); a wrong secret gets 401; `operator` can search and list refusals in `dsbot-cloud`.
+  **No DS Bot data has flowed yet**: the cloud DS Bot has no Chief and no Sessions.
+
 ## Planned, not deployed
 
-- **Lineage sidecar** (`src/lineage-sidecar.mjs`): a container from the controller image, uid 1000, DS Bot's `/data` mounted
-  read-only, its own writable `/lineage` folder, sharing the controller's network namespace (never host networking). Needs
-  migration 003 and an `ingest` principal first. See RISKS.md R38.
 - **Off-host backup of DS Bot `/data`**: designed only; see RISKS.md R11 and R37.
 
 ## Teardown (in this order)
