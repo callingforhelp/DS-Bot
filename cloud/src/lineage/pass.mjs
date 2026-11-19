@@ -47,7 +47,9 @@ export async function runPass({ home, archive, readers, classify, now = Date.now
   const botByName = new Map([...seenBots.map(b => [b.name, b.id]), ...state.bots.filter(b => b.name).map(b => [b.name, b.id])])
   const roomByName = new Map([...seenRooms.map(r => [r.name, r.id]), ...state.rooms.filter(r => r.name).map(r => [r.name, r.id])])
   const botName = id => state.bots.find(b => b.id === id)?.name ?? seenBots.find(b => b.id === id)?.name ?? null
-  const botId = name => (name == null || name === '' ? null : botByName.get(String(name).replace(/^@/, '')) ?? unresolved(name))
+  // DS Bot falls back to the Bot's id when it has no name, so an id is accepted as a name.
+  const knownIds = new Set([...seenBots.map(b => b.id), ...state.bots.map(b => b.id)])
+  const botId = name => (name == null || name === '' ? null : botByName.get(String(name).replace(/^@/, '')) ?? (knownIds.has(String(name)) ? String(name) : unresolved(name)))
   const roomId = name => (name == null || name === '' ? null : roomByName.get(String(name)) ?? unresolved(name))
 
   const linked = link({ sessions, ledger, botName })
