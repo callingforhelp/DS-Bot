@@ -59,14 +59,14 @@ Command output; read it in an interactive Session Manager shell.
   private-agent scoping). Remote smoke test 8/8 afterwards.
 - **Secret** `ds-bot/controller-env` gained an `ingest` principal `dsbot-shipper` (tenant `dsbot-cloud`, source
   `ds-bot-lineage`, project `dsbot-aws-staging`), `LINEAGE_PRINCIPAL_JSON` (kept out of the controller's env and written to a
-  root-owned 0400 file for the sidecar), tenant `dsbot-cloud` for `operator`, and `EMBED_LOCAL_TENANTS=dsbot-cloud` (DS Bot
-  audit data uses local embeddings only until the owner decides whether the OpenAI consent covers it). Live principals were
+  root-owned 0400 file for the sidecar), tenant `dsbot-cloud` for `operator`, and `EMBED_LOCAL_TENANTS=dsbot-cloud` (removed
+  the same day once the owner confirmed the OpenAI consent covers DS Bot audit data; all tenants now use text-embedding-3-small). Live principals were
   checked against the new startup rules first (both 48-character secrets, valid roles, none shared).
 - **Controller** redeployed with the new code; the previous image is kept as `ds-bot-controller:prev`, and the swap rolls back
   automatically if `/ready` fails. The existing end-to-end check still passes 7/7.
 - **Lineage sidecar** container `ds-bot-lineage`: controller image, `node src/lineage-sidecar.mjs`, uid 1000, `/data` read-only,
   `/opt/ds-bot/lineage` writable, the controller's network namespace (never host networking), read-only root, all
-  capabilities dropped, 256 MB / 64 pids, restart unless stopped. Restart it after any controller swap. Status:
+  capabilities dropped, 256 MB / 64 pids, restart unless stopped. After any controller swap it must be **recreated** (`docker rm -f` and run again), not restarted: it is pinned to the old controller container's network namespace. Status:
   `/opt/ds-bot/lineage/status.json` (counts only). Live probes: the shipper authenticates (an empty batch is refused as
   input, 400), cannot search (403); a wrong secret gets 401; `operator` can search and list refusals in `dsbot-cloud`.
   **No DS Bot data has flowed yet**: the cloud DS Bot has no Chief and no Sessions.
