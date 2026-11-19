@@ -26088,7 +26088,7 @@ function BotSettingsForm({ bot, roster, actions, run: run2 }) {
           },
           (0, import_react27.createElement)("option", { value: "auto" }, t("Default")),
           (0, import_react27.createElement)("option", { value: "" }, t("Same as model")),
-          (roster.models ?? []).filter((entry) => !entry.needsKey && !String(entry.ref).startsWith("local-")).map((entry) => (0, import_react27.createElement)("option", { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`))
+          modelsFor(roster.models).filter((entry) => !entry.needsKey).map((entry) => (0, import_react27.createElement)("option", { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`))
         )
       ) : null
     ),

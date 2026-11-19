@@ -29,11 +29,24 @@ function walk(node, found = []) {
   walk(node.props?.children, found)
   return found
 }
-function settings(bot, { main = false, rooms = [] } = {}) {
-  const roster = { mainBotIds: main ? [bot.id] : [], mainBotId: main ? bot.id : null, rooms, models: [], memory: false }
+function settings(bot, { main = false, rooms = [], models = [] } = {}) {
+  const roster = { mainBotIds: main ? [bot.id] : [], mainBotId: main ? bot.id : null, rooms, models, memory: false }
   return walk(BotSettingsForm({ bot, roster, actions: {}, run: fn => fn }))
 }
 const bot = { id: 'b', name: 'Writer', role: 'Writer', instructions: '', capabilities: [] }
+
+test('the executor picker includes local model endpoints and excludes local agents', () => {
+  const models = [
+    { ref: 'local-openai/qwen-coder' },
+    { ref: 'local-codex-cli/gpt-6.2-sol' },
+    { ref: 'local-acp-review/default' },
+    { ref: 'deepseek/v4' },
+    { ref: 'unconfigured/flash', needsKey: true },
+  ]
+  const picker = settings(bot, { models }).find(node => node.props?.['aria-label'] === 'Executor model')
+  const choices = walk(picker).filter(node => node.type === 'option').map(node => node.props.value)
+  assert.deepEqual(choices, ['auto', '', 'local-openai/qwen-coder', 'deepseek/v4'])
+})
 
 test('the Private switch is enabled only for a state the host accepts', () => {
   const noFolder = settings(bot).find(node => node.props?.label === 'Private')

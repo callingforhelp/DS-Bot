@@ -22,7 +22,7 @@ const TEAM = {
   questions: {},
 }
 
-function start(team = TEAM, { providers } = {}) {
+function start(team = TEAM, { providers, failureFor } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-1plus1-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(team))
   const catalogMap = providers ?? {
@@ -52,7 +52,8 @@ function start(team = TEAM, { providers } = {}) {
         const run = index => (index < chain.length ? chain[index](options, () => run(index + 1)) : (async function* () {
           calls.push({ provider: options.provider, model: options.model })
           requests.push(options)
-          yield { type: 'finish', reason: { kind: 'stop' } }
+          const failure = failureFor?.(options)
+          yield { type: 'finish', reason: failure === undefined ? { kind: 'stop' } : { kind: 'error', failure } }
         })())
         return run(0)
       },
@@ -298,6 +299,44 @@ test('executor does not inherit an unsupported planner reasoning effort', async 
   await drain(ctx.llm.stream({ sessionId: 'm1', provider: 'liftgate', model: 'gemini-pro-orchestrator-g1-pro', reasoningEffort: 'high', messages }))
   assert.equal(requests.at(-1).model, 'gemini-pro-orchestrator-neon')
   assert.equal(requests.at(-1).reasoningEffort, undefined)
+})
+
+test('an executor or fallback refusal leaves the planner available', async (t) => {
+  for (const scenario of ['executor', 'fallback']) await t.test(scenario, async (t) => {
+    const planner = 'gemini-pro-orchestrator-g1-pro'
+    const neon = 'gemini-pro-orchestrator-neon'
+    const refusal = { code: 'HOSTED_ENGINE_ROUTE', message: 'Not a model endpoint' }
+    let failPlanner = scenario === 'fallback'
+    const { ctx, rt, tool, calls, stop } = start(TEAM, {
+      failureFor: ({ model }) => model === neon ? refusal : failPlanner ? { code: 'QUOTA', message: 'Argon quota exhausted' } : undefined,
+    })
+    t.after(stop)
+    await tool('list_bots', {}, 'm1')
+    const refused = t.mock.method(rt, 'routeRefused')
+    const config = { provider: 'liftgate', model: planner }
+    const session = { id: 'm1', requestHeader: () => ({ config }) }
+    const emit = (type, data) => {
+      for (const listener of ctx.listeners.get('session/event') ?? []) listener(session, { type, data })
+    }
+    const user = { role: 'user' }
+    const messages = [user, toolCall('edit', 'edit'), toolResult('edit')]
+
+    emit('turn/start', { turn: 1 })
+    const input = scenario === 'executor' ? messages : [user]
+    await drain(ctx.llm.stream({ ...config, sessionId: session.id, messages: input }))
+    assert.equal(calls.at(-1).model, neon)
+    emit('turn/end', { turn: 1, reason: { kind: 'error', error: refusal } })
+    assert.equal(refused.mock.calls[0]?.arguments[0], `liftgate/${neon}`)
+    await refused.mock.calls[0].result
+
+    assert.equal(rt.botOf('m1').model, `liftgate/${planner}`)
+    assert.equal(rt.botOf('m1').appliedModel, `liftgate/${planner}`)
+    assert.equal(await rt.desiredExecutorModel(rt.botOf('m1')), undefined)
+    assert.equal((await rt.catalog()).some(entry => entry.ref === `liftgate/${neon}`), false)
+    failPlanner = false
+    await drain(ctx.llm.stream({ ...config, sessionId: session.id, messages }))
+    assert.equal(calls.at(-1).model, planner)
+  })
 })
 
 test('Argon models fall back to Orchestrator (Neon) when absent from catalog and never auto-pair with Hydrogen', async (t) => {

@@ -580,9 +580,31 @@ export function install(rt) {
   const assembleLlm = options => assembleLlmStream(ctx, options, { signal: lifetime.signal, backoff: rt.config?.llmRetryBackoff })
 
   const routedSteps = new WeakSet()
+  // The session header still names the original route after a stream rewrite.
+  const reroutedRefusals = new Map()
+  function takeReroutedRefusal(sessionId) {
+    const ref = reroutedRefusals.get(sessionId)
+    reroutedRefusals.delete(sessionId)
+    return ref
+  }
+  async function* streamReroutedStep(options, route, bot) {
+    const ref = `${route.provider}/${route.model}`
+    const reasoningEffort = bot === undefined ? undefined : await desiredEffort(bot, ref)
+    const rewritten = { ...options, provider: route.provider, model: route.model, reasoningEffort }
+    routedSteps.add(rewritten)
+    rt.carryUsageTag?.(options.messages, rewritten.messages)
+    for await (const chunk of ctx.llm.stream(rewritten)) {
+      if (chunk?.type === 'finish' && chunk.reason?.kind === 'error' && chunk.reason.failure?.code === 'HOSTED_ENGINE_ROUTE') {
+        reroutedRefusals.set(options.sessionId, ref)
+      }
+      yield chunk
+    }
+  }
   ctx.on?.('llm/stream', (options, next) => {
     if (routedSteps.has(options) || options.sessionId === undefined || options.purpose !== undefined || rt.ownRequest?.(options)) return next()
     return (async function* routeOrchestratorStep() {
+      // A retry can take a different route before the turn ends.
+      reroutedRefusals.delete(options.sessionId)
       await rt.load()
       if (rt.roomOf?.(options.sessionId) !== undefined) {
         yield* next()
@@ -596,10 +618,7 @@ export function install(rt) {
         if (decision.role === 'executor') {
           const execRoute = splitRef(execRef)
           if (execRoute?.provider && execRoute?.model && (options.provider !== execRoute.provider || options.model !== execRoute.model)) {
-            const rewritten = { ...options, provider: execRoute.provider, model: execRoute.model, reasoningEffort: await desiredEffort(bot, execRef) }
-            routedSteps.add(rewritten)
-            rt.carryUsageTag?.(options.messages, rewritten.messages)
-            yield* ctx.llm.stream(rewritten)
+            yield* streamReroutedStep(options, execRoute, bot)
             return
           }
         }
@@ -632,10 +651,7 @@ export function install(rt) {
       }
       if (!fallback) return
       rt.warn?.('ds-bot: %s unavailable at runtime, falling back to %s', activeRef, neonRef)
-      const fallbackReq = { ...options, provider: neonRoute.provider, model: neonRoute.model, reasoningEffort: bot ? await desiredEffort(bot, neonRef) : undefined }
-      routedSteps.add(fallbackReq)
-      rt.carryUsageTag?.(options.messages, fallbackReq.messages)
-      yield* ctx.llm.stream(fallbackReq)
+      yield* streamReroutedStep(options, neonRoute, bot)
     })()
   })
 
@@ -644,6 +660,6 @@ export function install(rt) {
     hostClosing: () => llm() === undefined,
     catalog, cachedCatalog: () => answerable(catalogCache.value), cachedDefault: () => pickDefault(catalogCache.value),
     defaultRef, defaultModel, defaultBotModel, defaultEffort, isUsable, resolveModel, desiredModel, desiredExecutorModel, reasoningOf, resolveEffort, desiredEffort,
-    selectSessionModel, applyModel, selectRoomSession, syncRoomSessions, waitForModel, syncModels, routeRefused, dropCatalog, assembleLlm,
+    selectSessionModel, applyModel, selectRoomSession, syncRoomSessions, waitForModel, syncModels, routeRefused, takeReroutedRefusal, dropCatalog, assembleLlm,
   })
 }

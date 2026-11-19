@@ -5,6 +5,7 @@ import { isMainOf } from './sources.js'
 import { PencilIcon, ChevronRightIcon } from './icons.js'
 import { lookOf, BotMark } from './mark.js'
 import { ModelMenu, modelOf } from './model-menu.js'
+import { modelsFor } from './agent-routes.js'
 import { RunModeCard } from './agent-cards.js'
 import { FolderMenu } from './folder-menu.js'
 import { BotSchedules } from './schedules.js'
@@ -320,7 +321,7 @@ export function BotSettingsForm({ bot, roster, actions, run }) {
         },
         h('option', { value: 'auto' }, t('Default')),
         h('option', { value: '' }, t('Same as model')),
-        (roster.models ?? []).filter(entry => !entry.needsKey && !String(entry.ref).startsWith('local-')).map(entry => h('option', { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`)))) : null),
+        modelsFor(roster.models).filter(entry => !entry.needsKey).map(entry => h('option', { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`)))) : null),
     h(Card, { title: t('Working folder') },
       h('div', { className: 'bt-set-row bt-bs-row' },
         h('span', { className: 'bt-set-copy' }, h('span', { className: 'bt-bs-label' }, t('Folder'))),
