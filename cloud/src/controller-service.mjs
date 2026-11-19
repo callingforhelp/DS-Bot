@@ -1,6 +1,7 @@
 import { createApi } from './api.mjs'
 import { apiClient } from './client.mjs'
 import { acquireWriterLease, dispatchPending } from './controller.mjs'
+import { runIndexer } from './indexer.mjs'
 import { runJob } from './worker.mjs'
 
 // The always-on controller: the signed API, the single-writer lease, and the dispatch loop, in one
@@ -39,6 +40,12 @@ export async function startController({
           state.failed += 1
           log('job-failed', task.run_id, String(error.message).slice(0, 120))
         }
+      }
+      // Recorded events become searchable here. Only the writer indexes, so one event is never
+      // embedded twice; an embedding outage leaves the event on retry and search stays lexical.
+      for (const tenant of tenants) {
+        const stats = await runIndexer(pool, tenant, embedder)
+        if (stats.indexed > 0) { state.indexed = (state.indexed ?? 0) + stats.indexed; log('indexed', tenant, stats.indexed, stats.embedFailed ? `embed-failed=${stats.embedFailed}` : '') }
       }
     } catch (error) {
       log('tick-error', String(error.message).slice(0, 120))

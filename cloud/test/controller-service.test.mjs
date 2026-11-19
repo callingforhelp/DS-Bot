@@ -36,6 +36,12 @@ test('the controller dispatches an admitted task by itself and records the whole
   })
   assert.ok(timeline, 'the task ran without anyone calling dispatch')
   assert.equal(timeline.body.artifacts.length, 1)
+  const found = await waitFor(async () => {
+    const s = await as('POST', '/v1/search', { project_id: 'p', query: 'read-only job finished words' })
+    return s.body.results?.length > 0 ? s : undefined
+  })
+  assert.ok(found, 'the controller indexed the run by itself, so search finds it')
+  assert.equal(found.body.vectorUsed, true)
   assert.equal(ctl.state.writer, true)
   assert.equal((await fetch(`${ctl.base}/ready`)).status, 200)
 })

@@ -14,5 +14,7 @@ internet: the instance has no inbound rules and every service listens on localho
 | R7 | **The fork's `dev` is not a clean upstream base**: it contains `cloud/` and the feature merge. Upstream PR branches must be cut from `origin/dev`. | Open, process |
 | R8 | **No TLS and no independent security review** (spec gates before any exposure). | Open: blocks exposure |
 | R9 | **Parameter Store readable by the instance role** (managed SSM policy grants `ssm:GetParameter*` on `*`; 10 parameters exist). | Mitigated: explicit deny, verified with the policy simulator |
-| R10 | **Model spend** once DS Bot runs: every bot turn calls a paid model. | Open: needs a spend ceiling from the owner |
+| R10 | **Model spend** once DS Bot runs: every bot turn calls a paid model (GMI). | Open: no spend ceiling set yet |
+| R12 | **The live GMI key is mirrored** into `ds-bot/controller-env` (owner's instruction). It is the same key as the Mac app's, so cloud usage bills to it, anyone with read access to that secret in the account can use it, and rotating it on the Mac leaves the cloud copy stale. It is kept out of the controller's env and goes only to DS Bot. | Open, accepted |
+| R13 | **Real task summaries go to OpenAI** for embeddings (consent set to `yes` on 19 Nov 2026), after redaction. Redaction is a floor, not a guarantee. | Open, accepted |
 | R11 | **Single host**: one t3.small runs the controller and DS Bot; no automatic redeploy, no off-host backup of DS Bot `/data` yet. | Open |
