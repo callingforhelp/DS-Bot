@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -73,7 +73,7 @@ test('diagnostics refusals: a repeat within 2 s is dropped; a different target o
       { time: T + 1500, text: 'ds-bot: bot message from Ana to Bo did not start work (recipient-off)', file: 'diagnostics.jsonl' },
       { time: T + 41_000, text: 'ds-bot: bot message from Ana to Cy did not start work (recipient-off) in Desk', file: 'diagnostics.jsonl' },
     ],
-  }))
+  }), () => T + 41_000 + 120_001)
   const diag = auths(a).filter(r => r.source === 'diagnostics')
   assert.deepEqual(diag.map(r => [r.target, r.at - T, r.room_id]), [['bot-b', 1500, null], ['bot-c', 41_000, 'room-r']])
 })
@@ -130,4 +130,44 @@ test('the CLI refuses an archive inside the DS Bot home', () => {
   const r = spawnSync(process.execPath, [cli, '--home', dir, '--db', join(dir, 'bot', 'x.sqlite')], { encoding: 'utf8' })
   assert.notEqual(r.status, 0)
   assert.match(r.stderr, /outside --home/)
+})
+
+test('a diagnostics line is held back while a log is torn or the line is recent, so it cannot outrun its tool result', async () => {
+  const line = { time: T + 1500, text: 'ds-bot: bot message from Ana to Cy did not start work (recipient-off)', file: 'diagnostics.jsonl' }
+  const a = openArchive(join(tmp('pass-'), 'l.sqlite'))
+  const recent = await pass(a, fakeReaders({ sessions: { 'chat-a': [call(1, 0, 'k', 'message_bot', { to: 'Cy' })] }, diagnostics: [line] }), () => T + 60_000)
+  assert.equal(recent.counts.diagnosticsHeldBack, 1)
+  assert.equal(auths(a).filter(r => r.source === 'diagnostics').length, 0)
+  // The tool result lands later; the line is then recognised as its repeat.
+  await pass(a, fakeReaders({ sessions: { 'chat-a': [call(1, 0, 'k', 'message_bot', { to: 'Cy' }), res(2, 1000, 'k', refusal('Cy', 'Ana', 'recipient-off'), true)] }, diagnostics: [line] }), () => T + 300_000)
+  assert.equal(auths(a).filter(r => r.source === 'diagnostics').length, 0)
+  assert.equal(auths(a).filter(r => r.reason === 'recipient-off').length, 1)
+})
+
+test('a torn home converges to the same rows as a fresh pass once the log is repaired', async () => {
+  const dir = tmp('pass-torn-')
+  const { home } = makeHome(join(dir, 'home'), { torn: true })
+  const opts = { home, readers: realReaders, classify, now: () => Date.now() }
+  const inc = openArchive(join(dir, 'inc.sqlite'))
+  await runPass({ ...opts, archive: inc })
+  makeHome(join(dir, 'home'))
+  await runPass({ ...opts, archive: inc })
+  const fresh = openArchive(join(dir, 'fresh.sqlite'))
+  await runPass({ ...opts, archive: fresh })
+  assert.deepEqual(snapshot(inc), snapshot(fresh))
+})
+
+test('deleting a Bot does not rewrite its history', async () => {
+  const dir = tmp('pass-delete-')
+  const { home, ids } = makeHome(join(dir, 'home'))
+  const a = openArchive(join(dir, 'l.sqlite'))
+  const opts = { home, archive: a, readers: realReaders, classify, now: () => Date.now() }
+  await runPass(opts)
+  const statePath = join(home, 'bot', 'state.json')
+  const state = JSON.parse(readFileSync(statePath, 'utf8'))
+  delete state.bots[ids.writer]
+  writeFileSync(statePath, JSON.stringify(state))
+  const second = await runPass(opts)
+  assert.deepEqual(second.counts.changes, { events: { inserted: 0, revised: 0 }, authorizations: { inserted: 0, revised: 0 } })
+  assert.ok(auths(a).some(r => r.target === ids.writer))
 })

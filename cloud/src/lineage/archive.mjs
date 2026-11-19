@@ -62,6 +62,11 @@ export function openArchive(path, { readOnly = false } = {}) {
     const next = { ...row }
     if (table === 'authorizations' && DECIDED.has(old.outcome) && next.outcome === 'pending') { next.outcome = old.outcome; next.reason = old.reason; next.at = old.at; next.seq = old.seq }
     for (const f of ['task_id', 'run_id']) if (next[f] == null && old[f] != null) next[f] = old[f]
+    // A Bot or room that was resolved once stays resolved: deleting or renaming it later must not
+    // rewrite its history (and re-ship every row) as 'unresolved:...'.
+    for (const f of ['actor', 'target', 'room_id']) {
+      if (old[f] != null && !String(old[f]).startsWith('unresolved:') && (next[f] == null || String(next[f]).startsWith('unresolved:'))) next[f] = old[f]
+    }
     const differs = TRACKED.some(f => f in old && (next[f] ?? null) !== (old[f] ?? null))
     const otherDiffers = COLUMNS[table].some(c => !['rev', 'updated_at'].includes(c) && (next[c] ?? null) !== (old[c] ?? null))
     if (!differs && !otherDiffers) return 'unchanged'

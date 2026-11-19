@@ -7,6 +7,7 @@ import { link, rowId } from './link.mjs'
 
 const unresolved = name => `unresolved:${createHash('sha256').update(String(name)).digest('hex').slice(0, 12)}`
 const parseArgs = raw => { if (raw && typeof raw === 'object') return raw; try { return JSON.parse(raw) } catch { return {} } }
+export const DIAG_GRACE_MS = 120_000
 const textOf = message => (Array.isArray(message?.content) ? message.content.map(c => c?.text ?? '').join(' ') : '')
 
 export async function runPass({ home, archive, readers, classify, now = Date.now, textKey }) {
@@ -39,9 +40,13 @@ export async function runPass({ home, archive, readers, classify, now = Date.now
   const diag = readers.readDiagnostics(home, prevCursor)
 
   // --- resolve names to ids; raw names live only in bots.name and rooms.name ---
-  const botByName = new Map(state.bots.filter(b => b.name).map(b => [b.name, b.id]))
-  const roomByName = new Map(state.rooms.filter(r => r.name).map(r => [r.name, r.id]))
-  const botName = id => state.bots.find(b => b.id === id)?.name ?? null
+  // Current names first; Bots and rooms the archive has seen before still resolve after they
+  // are deleted from state.json.
+  const seenBots = archive.db.prepare('SELECT id, name FROM bots WHERE name IS NOT NULL').all()
+  const seenRooms = archive.db.prepare('SELECT id, name FROM rooms WHERE name IS NOT NULL').all()
+  const botByName = new Map([...seenBots.map(b => [b.name, b.id]), ...state.bots.filter(b => b.name).map(b => [b.name, b.id])])
+  const roomByName = new Map([...seenRooms.map(r => [r.name, r.id]), ...state.rooms.filter(r => r.name).map(r => [r.name, r.id])])
+  const botName = id => state.bots.find(b => b.id === id)?.name ?? seenBots.find(b => b.id === id)?.name ?? null
   const botId = name => (name == null || name === '' ? null : botByName.get(String(name).replace(/^@/, '')) ?? unresolved(name))
   const roomId = name => (name == null || name === '' ? null : roomByName.get(String(name)) ?? unresolved(name))
 
@@ -79,13 +84,18 @@ export async function runPass({ home, archive, readers, classify, now = Date.now
     auths.push({ id: rowId('auth', 'notice', r.roomId, r.seq), at: r.time, actor: botId(r.fromName), target: r.toId, room_id: r.roomId, action: r.action, outcome: 'denied', reason: r.reason, source: 'group-notice', task_id: null, run_id: null, session_id: null, seq: r.seq, ref: `group:${r.roomId}#${r.seq}` })
   }
   // A diagnostics line repeats a structured denial when actor, target and reason match within
-  // 2 s; anything else is a refusal the structured sources did not see, and is kept.
+  // 2 s; anything else is a refusal the structured sources did not see, and is kept. Rows are
+  // never deleted, so a line is held back until its tool result has surely landed: while any
+  // Session log is torn (a frame still being written) and for DIAG_GRACE_MS after the line.
   const structured = auths.filter(a => a.outcome === 'denied')
+  const diagCutoff = now() - DIAG_GRACE_MS
+  let heldBack = 0
   const names = state.bots.map(b => b.name).filter(Boolean)
   const roomNames = state.rooms.map(r => r.name).filter(Boolean)
   for (const line of diag.lines) {
     const p = classify.parseDiagnosticRefusal(line.text, names, roomNames)
     if (!p || !Number.isFinite(line.time)) continue
+    if (torn > 0 || line.time > diagCutoff) { heldBack += 1; continue }
     const actor = botId(p.fromName)
     const target = botId(p.toName)
     if (structured.some(a => a.actor === actor && a.target === target && a.reason === p.reason && Math.abs(a.at - line.time) <= 2000)) continue
@@ -106,7 +116,7 @@ export async function runPass({ home, archive, readers, classify, now = Date.now
     for (const a of auths) { if (!Number.isFinite(a.at)) continue; const r = archive.upsert('authorizations', a, t); if (r in result.authorizations) result.authorizations[r] += 1 }
     archive.put('cursors', { source: 'diagnostics', value: JSON.stringify(diag.cursor) })
     const totals = Object.fromEntries(['tasks', 'runs', 'events', 'authorizations', 'artifacts'].map(n => [n, archive.count(n)]))
-    const counts = { ...totals, changes: result, sessions: sessions.length, torn, badLines, rotated: diag.rotated, cleared: diag.cleared, stateError: state.stateError === true, ms: now() - startedAt }
+    const counts = { ...totals, changes: result, sessions: sessions.length, torn, badLines, diagnosticsHeldBack: heldBack, rotated: diag.rotated, cleared: diag.cleared, stateError: state.stateError === true, ms: now() - startedAt }
     archive.put('sync', { id: 1, at: t, counts: JSON.stringify(counts) })
     return counts
   })
