@@ -9,6 +9,17 @@ export const makePool = (url, max = 5) => new pg.Pool({ connectionString: url, m
 // whose private rows it may read) for row-level security. The setting dies with the
 // transaction ('ingest' is the service role that may write and index private rows; search
 // never has it), so a pooled connection never carries one request's tenant into the next.
+// Whether this database has the pgvector column (migration 002). Checked once per pool.
+const vectorSeen = new WeakMap()
+export async function hasPgvector(pool) {
+  if (!vectorSeen.has(pool)) {
+    const { rowCount } = await pool.query("select 1 from information_schema.columns where table_name = 'retrieval_chunks' and column_name = 'embedding_v'")
+    vectorSeen.set(pool, rowCount > 0)
+  }
+  return vectorSeen.get(pool)
+}
+export const vectorLiteral = v => `[${v.join(',')}]`
+
 export async function withScope(pool, { tenant, agent = '', role = '' }, fn) {
   if (typeof tenant !== 'string' || tenant === '') throw new Error('tenant is required')
   const client = await pool.connect()

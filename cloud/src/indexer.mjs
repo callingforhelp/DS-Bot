@@ -1,4 +1,4 @@
-import { withScope } from './db.mjs'
+import { hasPgvector, vectorLiteral, withScope } from './db.mjs'
 import { chunk, redact } from './redact.mjs'
 import { sha256 } from './ingest.mjs'
 
@@ -18,6 +18,7 @@ const backoff = attempts => `${Math.min(3600, 2 ** attempts * 5)} seconds`
 // exists; an embedding failure leaves the chunk searchable and the outbox row on retry.
 export async function runIndexer(pool, tenant, embedder, { limit = 50 } = {}) {
   const stats = { indexed: 0, embedded: 0, embedFailed: 0 }
+  const native = await hasPgvector(pool)
   await withScope(pool, { tenant, role: 'ingest' }, async (c) => {
     const { rows } = await c.query(
       `select o.attempts, e.* from ingestion_outbox o join events e using (tenant_id, event_id)
@@ -39,7 +40,8 @@ export async function runIndexer(pool, tenant, embedder, { limit = 50 } = {}) {
       try {
         const vectors = await embedder.embed(ids.map(([, text]) => text))
         for (const [i, [id]] of ids.entries()) {
-          await c.query('update retrieval_chunks set embedding = $3, embedding_model = $4, embedding_dim = $5 where tenant_id = $1 and chunk_id = $2', [tenant, id, vectors[i], embedder.model, embedder.dim])
+          await c.query(`update retrieval_chunks set embedding = $3, embedding_model = $4, embedding_dim = $5${native ? ', embedding_v = $6::vector' : ''} where tenant_id = $1 and chunk_id = $2`,
+            [tenant, id, vectors[i], embedder.model, embedder.dim, ...(native ? [vectorLiteral(vectors[i])] : [])])
         }
         stats.embedded += ids.length
       } catch (error) {

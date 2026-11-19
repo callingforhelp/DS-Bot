@@ -6,10 +6,10 @@ import { sha256 } from '../src/ingest.mjs'
 
 // A fresh database per test file, on the throwaway local Postgres, owned by `postgres`
 // and used through the restricted application role, exactly as the services will be.
-export async function freshDb() {
+export async function freshDb({ optional = [] } = {}) {
   pgStart()
   const name = `t_${randomBytes(5).toString('hex')}`
-  await migrate(name)
+  await migrate(name, { optional })
   const pool = makePool(appUrl(name))
   const admin = makePool(adminUrl(name), 2)
   const drop = async () => {

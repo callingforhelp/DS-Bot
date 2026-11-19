@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { withScope } from './db.mjs'
+import { hasPgvector, vectorLiteral, withScope } from './db.mjs'
 import { redact } from './redact.mjs'
 
 export const RETRIEVAL_VERSION = 1
@@ -28,6 +28,7 @@ export async function search(pool, { tenant, project, agent = '', principal, que
   const base = [tenant, project, from ?? null, to ?? null, ...(botId ? [botId] : [])]
   const n = base.length
   const pool_n = Math.max(limit * 5, 30)
+  const native = await hasPgvector(pool)
   return withScope(pool, { tenant, agent }, async (c) => {
     const rank = { lexical: [], vector: [] }
     if (mode !== 'vector' && terms.length > 0) {
@@ -40,9 +41,13 @@ export async function search(pool, { tenant, project, agent = '', principal, que
     if (mode !== 'lexical') {
       try {
         const [qv] = await embedder.embed([redact(query)])
-        const { rows } = await c.query(
-          `select c.chunk_id from retrieval_chunks c where ${filter}${bot} and c.embedding is not null and c.embedding_model = $${n + 1}
-           order by cosine_sim(c.embedding, $${n + 2}::real[]) desc nulls last, c.chunk_id limit ${pool_n}`, [...base, embedder.model, qv])
+        const { rows } = native
+          ? await c.query(
+            `select c.chunk_id from retrieval_chunks c where ${filter}${bot} and c.embedding_v is not null and c.embedding_model = $${n + 1}
+             order by c.embedding_v <=> $${n + 2}::vector, c.chunk_id limit ${pool_n}`, [...base, embedder.model, vectorLiteral(qv)])
+          : await c.query(
+            `select c.chunk_id from retrieval_chunks c where ${filter}${bot} and c.embedding is not null and c.embedding_model = $${n + 1}
+             order by cosine_sim(c.embedding, $${n + 2}::real[]) desc nulls last, c.chunk_id limit ${pool_n}`, [...base, embedder.model, qv])
         rank.vector = rows.map(r => r.chunk_id)
         vectorUsed = true
       } catch { /* the lexical branch still answers: an embedding outage never fails a search */ }
@@ -60,6 +65,6 @@ export async function search(pool, { tenant, project, agent = '', principal, que
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [tenant, queryId, project, principal ?? 'unknown', createHash('sha256').update(redact(query)).digest('hex'), { from, to, botId: botId ?? null }, mode,
         JSON.stringify(results.map(r => ({ id: r.chunk_id, rank: r.rank }))), RETRIEVAL_VERSION, Date.now() - started])
-    return { queryId, mode, vectorUsed, results }
+    return { queryId, mode, vectorUsed, vectorEngine: native ? 'pgvector' : 'array', results }
   })
 }
