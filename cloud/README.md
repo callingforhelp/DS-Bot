@@ -24,7 +24,7 @@ npm run pg:stop
 | Vector search | pgvector (`embedding_v`, cosine `<=>`) when migration 002 is applied, else `real[]` + SQL cosine | Verified locally (pgvector 0.8.7) and on RDS (0.8.1); ranks agree with the array fallback. No HNSW index yet |
 | Embeddings | `openaiEmbedder` (text-embedding-3-small, 1536-d) | **Verified 19 Nov 2026** on the synthetic fixture only (`scripts/bench-remote.mjs`); consent for real transcripts still needs an explicit `yes` in `.env`. The mock remains the test default |
 | Daytona | `daytonaProvider` (SDK 0.232.0): ephemeral sandbox, no network, 10-minute TTL, one read-only job; `mockDaytona` remains for tests | **Verified 19 Nov 2026** by `scripts/daytona-demo.mjs`: signed request -> RDS -> real sandbox -> result matched the local reference -> sandbox deleted -> evidence kept (8/8). Volumes **not** exercised (no volume configured) |
-| Object storage | `r2ObjectStore` (Cloudflare R2 via the S3 API; conditional writes, digest recomputed on read, 5-minute upload tokens) and `localObjectStore` for tests | **Verified 19 Nov 2026** against the real bucket by `scripts/r2-check.mjs` (11/11: write, readback, digest, retry no-op, overwrite refused, R2 honours If-None-Match with 412, token and path guards, cleanup). Not yet wired into the Daytona demo or the deployed controller |
+| Object storage | `r2ObjectStore` (Cloudflare R2 via the S3 API; conditional writes, digest recomputed on read, 5-minute upload tokens) and `localObjectStore` for tests | **Verified 19 Nov 2026** against the real bucket by `scripts/r2-check.mjs` (11/11: write, readback, digest, retry no-op, overwrite refused, R2 honours If-None-Match with 412, token and path guards, cleanup). Wired into `scripts/daytona-demo.mjs` and picked up automatically by `src/serve.mjs` |
 | Controller | `src/serve.mjs` (API + writer lease + dispatch loop) and a `Dockerfile` | Service smoke-tested as a separate process on this Mac against local Postgres, with a standby taking over from a stopped writer. **Image not built** (Docker daemon was down); **not deployed anywhere** (no cloud host chosen). Not the official DS Bot image |
 | Signed API | HMAC, timestamp window, single-use nonce, tenant from principal | Verified by tests. WeChat callback signing **not implemented** |
 | Lineage ingestion | Adapter over the PoC `lineage.sqlite` layout | Tested on a synthetic fixture only; the real PoC output was not read |
@@ -75,3 +75,10 @@ was 65-84 s for the same reason. Run the service next to the database before dra
   subpath isolation), then deleted. No volume is kept; create one per tenant on demand.
 - **Object storage:** Cloudflare R2 (free tier: 10 GB-month, 1M Class A and 10M Class B operations per month, no egress
   fee for direct reads, per Cloudflare's pricing page; whether a card is required to enable R2 is unverified).
+
+## Verified chain (19 Nov 2026)
+
+`scripts/daytona-demo.mjs`, one run on real services, 10/10 checks: signed request -> admitted and recorded on RDS
+(pgvector database) -> single-writer lease -> real Daytona sandbox (no network, deleted afterwards) -> artifact stored
+in the real R2 bucket -> timeline and artifact digest intact after the sandbox is gone. The controller process itself
+still ran on this Mac, reaching RDS through an SSM tunnel; no cloud host runs it yet.
