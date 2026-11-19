@@ -65,3 +65,14 @@ test('a second controller stays on standby, and takes over only when the first s
   assert.ok(taken, 'the standby took over after the writer stopped')
   assert.equal(second.state.writer, true)
 })
+
+test('a tenant listed as local never sends its search queries to the external embedder', async () => {
+  const external = []
+  const spy = { model: 'external-spy', dim: 8, embed: async texts => { external.push(...texts); return texts.map(() => Array(8).fill(0.1)) } }
+  const local = { ...principals, bob: { secret: 'b', tenants: ['t-local'], scopes: ['read-only'], role: 'user' }, worker: { ...principals.worker, tenants: ['t1', 't-local'] } }
+  const ctl = await startController({ pool: db.pool, principals: local, embedder: spy, localEmbedder: mockEmbedder(), localTenants: ['t-local'], instance: 'ctl-local', intervalMs: 100, provider: mockDaytona(), bucket: 'artifacts', objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-objects-')), secret: 's' }) })
+  started.push(ctl)
+  const as = apiClient({ baseUrl: ctl.base, principal: 'bob', secret: 'b', tenant: 't-local' })
+  await as('POST', '/v1/search', { project_id: 'p', query: 'private words for the local tenant' })
+  assert.deepEqual(external, [])
+})

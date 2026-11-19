@@ -41,7 +41,8 @@ export function validatePrincipals(principals) {
 // principals: { id: { secret, tenants: [...], scopes: [...], role: 'user'|'human'|'worker'|'ingest', agent?, sources?, projects? } }
 // The API never runs a model. A rejected request therefore starts nothing: authentication,
 // replay and scope checks all happen before the task is admitted or anything is dispatched.
-export function createApi({ pool, embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore }) {
+// embedderFor(tenant) picks the embedder per tenant (some tenants may be kept off external providers).
+export function createApi({ pool, embedder, embedderFor = () => embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore }) {
   // /ready is unauthenticated: its database check runs at most once a second.
   let readyCache = { at: -Infinity, value: false }
   const readyOnce = async () => {
@@ -174,7 +175,7 @@ export function createApi({ pool, embedder, principals, now = Date.now, skewMs =
       const mode = input.mode ?? 'hybrid'
       if (!['lexical', 'vector', 'hybrid'].includes(mode)) throw new HttpError(400, 'mode must be lexical, vector or hybrid')
       for (const k of ['from', 'to']) if (input[k] !== undefined && (typeof input[k] !== 'string' || Number.isNaN(Date.parse(input[k])))) throw new HttpError(400, `${k} must be an ISO date`)
-      const result = await search(pool, { tenant: p.tenant, project, agent: p.agent ?? '', principal: p.id, query, mode, limit, from: input.from, to: input.to, botId: input.bot_id }, embedder)
+      const result = await search(pool, { tenant: p.tenant, project, agent: p.agent ?? '', principal: p.id, query, mode, limit, from: input.from, to: input.to, botId: input.bot_id }, embedderFor(p.tenant))
       return { status: 200, json: result }
     },
   }
