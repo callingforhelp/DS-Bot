@@ -1,5 +1,7 @@
 import pg from 'pg'
-import { PG_PORT } from '../scripts/pg.mjs'
+// The local throwaway Postgres's port (tests only). Kept here, not imported from scripts/, because
+// the container image ships src/ alone.
+const PG_PORT = Number(process.env.MVP_PG_PORT ?? 54329)
 
 export const adminUrl = (db = 'postgres') => `postgres://postgres@127.0.0.1:${PG_PORT}/${db}`
 export const appUrl = (db) => `postgres://dsbot_app:dsbot_app@127.0.0.1:${PG_PORT}/${db}`
