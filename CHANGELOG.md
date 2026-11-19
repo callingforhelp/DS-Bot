@@ -4,6 +4,10 @@ All notable changes to DS Bot are listed here. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Changed
+
+- Keep read continuations on the planner model in 1+1 mode and route execution continuations to Orchestrator Neon when available. Document the Planner, Coder and Reviewer setup and explicit bot handoff.
+
 ## [0.3.8] - 2026-11-16
 
 ### Added

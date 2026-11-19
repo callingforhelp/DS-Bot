@@ -315,9 +315,10 @@ export function BotSettingsForm({ bot, roster, actions, run }) {
         h('select', {
           className: 'bt-bs-input',
           'aria-label': t('Executor model'),
-          value: bot.executorModel ?? '',
+          value: bot.executorModel === undefined ? 'auto' : (bot.executorModel ?? ''),
           onChange: event => save({ executorModel: event.target.value || null }),
         },
+        h('option', { value: 'auto' }, t('Default')),
         h('option', { value: '' }, t('Same as model')),
         (roster.models ?? []).filter(entry => !entry.needsKey && !String(entry.ref).startsWith('local-')).map(entry => h('option', { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`)))) : null),
     h(Card, { title: t('Working folder') },

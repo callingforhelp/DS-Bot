@@ -26083,9 +26083,10 @@ function BotSettingsForm({ bot, roster, actions, run: run2 }) {
           {
             className: "bt-bs-input",
             "aria-label": t("Executor model"),
-            value: bot.executorModel ?? "",
+            value: bot.executorModel === void 0 ? "auto" : bot.executorModel ?? "",
             onChange: (event) => save({ executorModel: event.target.value || null })
           },
+          (0, import_react27.createElement)("option", { value: "auto" }, t("Default")),
           (0, import_react27.createElement)("option", { value: "" }, t("Same as model")),
           (roster.models ?? []).filter((entry) => !entry.needsKey && !String(entry.ref).startsWith("local-")).map((entry) => (0, import_react27.createElement)("option", { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`))
         )

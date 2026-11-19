@@ -12,8 +12,9 @@ const ROUTE_WAIT_MS = 30_000
 const ACCOUNT_RECORD = 'deepseek-account-platform/default'
 const TRANSIENT_LLM_CODES = new Set(['TRANSPORT', 'TIMEOUT'])
 const ORCHESTRATOR_MODEL = /^([^/]+)\/gemini-pro-orchestrator-/
-const ARGON_MODEL = /^([^/]+)\/(?:gemini-pro-orchestrator-g1-pro|gemini-4-argon-[^/]+)$/
+const ARGON_MODEL = /^([^/]+)\/(?:gemini-pro-orchestrator-(?:g1-pro|argon)|gemini-4-argon(?:-[^/]+)?)$/
 const NEON_ORCHESTRATOR_ID = 'gemini-pro-orchestrator-neon'
+const EXECUTION_TOOLS = new Set(['apply_patch', 'edit', 'write', 'bash', 'pwsh'])
 
 function argonFallbackRef(ref, entries) {
   const match = ARGON_MODEL.exec(ref ?? '')
@@ -24,40 +25,45 @@ function argonFallbackRef(ref, entries) {
 
 // Pure per-step 1+1 decision from the turn's messages since the last user message:
 // - Step 1 (no tool results since the last user message): 'planner'
-// - Tool continuations: 'executor', except after 2 consecutive tool batches with
-//   isError === true or when continuations since the last planner step reach
-//   reviewCadence, which routes 1 step back to 'planner' ([plan review]) and resets.
+// - Read, handoff, and unclassified results stay with the planner.
+// - Results of execution tools go to the executor unless an error or cadence
+//   review is due. A tool name is paired with its result by the call ID.
 export function stepRouteDecision(messages = [], { reviewCadence = 12 } = {}) {
-  const lastUser = messages.findLastIndex(message => message?.role === 'user')
+  const lastUser = messages.findLastIndex(message => message?.role === 'user' && !['ds-bot-time-context', 'time-context', 'runtime-context'].includes(message.source?.kind))
   const tail = lastUser === -1 ? messages : messages.slice(lastUser + 1)
   const batches = []
+  const calls = new Map()
   for (const message of tail) {
-    if (message?.role === 'tool') {
-      if (batches.length === 0 || !batches.at(-1).open) batches.push({ open: true, hasError: Boolean(message.isError) })
-      else if (message.isError) batches.at(-1).hasError = true
-    } else if (batches.length > 0) {
-      batches.at(-1).open = false
+    if (message?.role === 'assistant') {
+      for (const block of message.content ?? []) {
+        if (block.type === 'tool-call') calls.set(block.id, block.name)
+      }
+      if (batches.length > 0) batches.at(-1).open = false
     }
+    if (message?.role !== 'tool') continue
+    if (!batches.at(-1)?.open) batches.push({ open: true, hasError: false, execution: false })
+    const batch = batches.at(-1)
+    batch.hasError ||= Boolean(message.isError)
+    batch.execution ||= EXECUTION_TOOLS.has(calls.get(message.toolCallId))
   }
   if (batches.length === 0) return { role: 'planner', reason: 'initial-plan', step: 0, consecutiveErrors: 0 }
   let sincePlan = 0
   let consecutiveErrors = 0
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index]
-    sincePlan += 1
+    if (batch.execution) sincePlan += 1
     consecutiveErrors = batch.hasError ? consecutiveErrors + 1 : 0
-    const review = consecutiveErrors >= 2 || (reviewCadence > 0 && sincePlan >= reviewCadence)
+    const errorReview = consecutiveErrors >= 2
+    const cadenceReview = reviewCadence > 0 && sincePlan >= reviewCadence
     if (index === batches.length - 1) {
-      return review
-        ? { role: 'planner', reason: consecutiveErrors >= 2 ? 'error-review' : 'cadence-review', step: batches.length, consecutiveErrors }
-        : { role: 'executor', reason: 'continuation', step: batches.length, consecutiveErrors }
+      if (errorReview || cadenceReview) return { role: 'planner', reason: errorReview ? 'error-review' : 'cadence-review', step: batches.length, consecutiveErrors }
+      return batch.execution
+        ? { role: 'executor', reason: 'continuation', step: batches.length, consecutiveErrors }
+        : { role: 'planner', reason: 'inspection', step: batches.length, consecutiveErrors }
     }
-    if (review) {
-      sincePlan = 0
-      consecutiveErrors = 0
-    }
+    if (!batch.execution || errorReview || cadenceReview) sincePlan = 0
+    if (errorReview || cadenceReview) consecutiveErrors = 0
   }
-  return { role: 'executor', reason: 'continuation', step: batches.length, consecutiveErrors }
 }
 
 function retryPolicyOf(ctx, provider) {
@@ -357,11 +363,8 @@ export function install(rt) {
     }
     const match = ORCHESTRATOR_MODEL.exec(primary) ?? ARGON_MODEL.exec(primary)
     if (!match) return undefined
-    const provider = match[1]
-    for (const candidate of [`${provider}/gemini-4-hydrogen-high`, `${provider}/gemini-4-neon-high`]) {
-      if (entries.some(entry => entry.ref === candidate)) return candidate
-    }
-    return undefined
+    const neonRef = `${match[1]}/${NEON_ORCHESTRATOR_ID}`
+    return neonRef !== primary && entries.some(entry => entry.ref === neonRef) ? neonRef : undefined
   }
 
   // The thinking level a Bot asked for, when the model it runs on serves it; else the
@@ -565,7 +568,7 @@ export function install(rt) {
         if (decision.role === 'executor') {
           const execRoute = splitRef(execRef)
           if (execRoute?.provider && execRoute?.model && (options.provider !== execRoute.provider || options.model !== execRoute.model)) {
-            const rewritten = { ...options, provider: execRoute.provider, model: execRoute.model }
+            const rewritten = { ...options, provider: execRoute.provider, model: execRoute.model, reasoningEffort: await desiredEffort(bot, execRef) }
             routedSteps.add(rewritten)
             rt.carryUsageTag?.(options.messages, rewritten.messages)
             yield* ctx.llm.stream(rewritten)
@@ -601,7 +604,7 @@ export function install(rt) {
       }
       if (!fallback) return
       rt.warn?.('ds-bot: %s unavailable at runtime, falling back to %s', activeRef, neonRef)
-      const fallbackReq = { ...options, provider: neonRoute.provider, model: neonRoute.model }
+      const fallbackReq = { ...options, provider: neonRoute.provider, model: neonRoute.model, reasoningEffort: bot ? await desiredEffort(bot, neonRef) : undefined }
       routedSteps.add(fallbackReq)
       rt.carryUsageTag?.(options.messages, fallbackReq.messages)
       yield* ctx.llm.stream(fallbackReq)
