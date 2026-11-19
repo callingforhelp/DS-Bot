@@ -43,6 +43,7 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'on credentials/record-updated',
     'on settings/document-updated',
     'effect ds-bot: auxiliary llm retry',
+    'on llm/stream',
     'on subagent/start',
     'on subagent/end',
     'on session/event',

@@ -191,10 +191,15 @@ export function install(rt) {
     return holdName('bot', cleanName, () => buildBot(cleanName, options))
   }
 
-  async function buildBot(cleanName, { role = '', instructions = '', color, brief = '', createdBy, main = false, avatar, model, effort, workDir, copyOf, pickModel = false, section, sectionId, taskContext }) {
+  async function buildBot(cleanName, { role = '', instructions = '', color, brief = '', createdBy, main = false, avatar, model, executorModel, effort, workDir, copyOf, pickModel = false, section, sectionId, taskContext }) {
     const cleanAvatarValue = cleanAvatar(avatar)
     // The model is fixed at creation, so a later change of the DSH default leaves it alone.
     const modelRef = model ? await rt.resolveModel(model) : pickModel ? undefined : await rt.defaultBotModel()
+    const hasExecutor = executorModel !== undefined && executorModel !== null && executorModel !== ''
+    const executorModelRef = hasExecutor ? await rt.resolveModel(executorModel) : undefined
+    if (executorModelRef !== undefined && (rt.isLocalAgentRef?.(executorModelRef) || rt.isLocalAgentRef?.(modelRef))) {
+      throw new Error('A local agent CLI cannot use an executor model')
+    }
     // A thinking level needs a model to resolve against; with none it would be dropped
     // silently, so the create fails before a Session is made.
     if (effort && modelRef === undefined) throw new Error('Pick a model before choosing a thinking level')
@@ -218,6 +223,7 @@ export function install(rt) {
         ...(isColor(currentColor(color)) ? { color: currentColor(color) } : {}),
         ...(cleanAvatarValue ? { avatar: cleanAvatarValue } : {}),
         ...(modelRef ? { model: modelRef } : {}),
+        ...(executorModelRef ? { executorModel: executorModelRef } : {}),
         ...(effortId ? { effort: effortId } : {}),
         ...(dir ? { workDir: dir } : {}),
         ...(resolvedSecId ? { sectionId: resolvedSecId } : {}),
@@ -345,7 +351,8 @@ export function install(rt) {
     const bot = liveBot(id)
     if (bot === undefined) throw new Error('Unknown Bot')
     if (bot.private === true) throw new Error(`${bot.name} is private, so it cannot be copied`)
-    const served = (await rt.catalog()).some(entry => entry.ref === bot.model)
+    const entries = await rt.catalog()
+    const served = entries.some(entry => entry.ref === bot.model)
     // A folder that went away since leaves the copy in the team workspace.
     const workDir = bot.workDir !== undefined && await rt.isFolder(bot.workDir) ? bot.workDir : undefined
     // No await from here to createBot's check, so two copies at once get different names.
@@ -356,6 +363,7 @@ export function install(rt) {
       color: bot.color,
       avatar: bot.avatar,
       model: served ? bot.model : undefined,
+      executorModel: bot.executorModel && entries.some(entry => entry.ref === bot.executorModel) ? bot.executorModel : undefined,
       // A copy of a Bot on the model's own default stays on it (null marks the
       // explicit Default pick); else the create would inherit the profile level.
       effort: served ? (bot.effort ?? null) : undefined,
@@ -405,6 +413,12 @@ export function install(rt) {
     const engineChanged = !!modelRef && engineBefore !== undefined && rt.engineOf(modelRef) !== engineBefore
     if (engineChanged && actorId !== undefined) throw new Error(`Only the user can change what ${bot.name} runs on, in the Bot's settings`)
     if (engineChanged && patch.changeEngine !== true) throw new Error(`Changing what ${bot.name} runs on needs a confirmation in the Bot's settings`)
+    const executorModelRef = patch.executorModel === undefined ? undefined
+      : patch.executorModel === null || patch.executorModel === '' ? null
+      : await rt.resolveModel(patch.executorModel)
+    if (typeof executorModelRef === 'string' && (rt.isLocalAgentRef?.(executorModelRef) || (engineBefore !== undefined && engineBefore !== 'model' && !modelRef) || (modelRef && rt.isLocalAgentRef?.(modelRef)))) {
+      throw new Error('A local agent CLI cannot use an executor model')
+    }
     // A new level resolves against the model the Bot will run on: the new one, the
     // model it keeps, or — the model cleared — the one it last ran on.
     const effortRef = modelRef === undefined ? bot.model ?? bot.appliedModel : modelRef ?? bot.appliedModel
@@ -450,6 +464,10 @@ export function install(rt) {
       if (modelRef === null) delete bot.model
       else bot.model = modelRef
       modelChanged = true
+    }
+    if (patch.executorModel !== undefined) {
+      if (executorModelRef === null) delete bot.executorModel
+      else bot.executorModel = executorModelRef
     }
     if (patch.effort !== undefined) {
       if (effortId === null) delete bot.effort

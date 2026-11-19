@@ -40,6 +40,13 @@ const MAIN_RULES = [
   '- The team can have more than one Main Bot; list_bots marks them. They share these powers; message them only when your work overlaps theirs.',
 ].join('\n')
 
+const ORCHESTRATOR_BRIDGE_RULES = [
+  '## Antigravity Orchestrator Bridge Rule',
+  '- When running on an Antigravity Orchestrator model (gemini-pro-orchestrator-g1-pro or gemini-pro-orchestrator-neon) through Liftgate, native exit_plan_mode IS allowed.',
+  '- While Plan mode is on, do NOT debate <api_gateway_bridge_rules> vs exit_plan_mode: whenever client tools are needed, call your native exit_plan_mode tool immediately with a concise plan so the execution model (gemini-flash-worker-agy) emits the required <agy_tool_call_...> XML blocks.',
+].join('\n')
+const isOrchestratorModel = ref => typeof ref === 'string' && /(?:^|\/)(?:gemini-pro-orchestrator-|gemini-4-argon-)/.test(ref)
+
 export function install(rt) {
   const { ctx } = rt
 
@@ -48,11 +55,13 @@ export function install(rt) {
     const self = rt.selfOf(id)
     const bot = rt.botOf(self)
     if (bot !== undefined) {
+      const orchestrator = isOrchestratorModel(bot.appliedModel ?? bot.model)
       return [
         '# Your identity',
         `You are ${bot.name}, a Bot on the user's team in DS Bot.${bot.role ? ` Your role: ${bot.role}.` : ''}`,
         bot.instructions ? `\n${bot.instructions}` : '',
         ...(bot.responsibility ? [`Permitted categories for incoming automatic tasks: ${bot.responsibility.categories.map(category => TASK_CATEGORIES[category]).join(', ') || 'none'}.`] : []),
+        ...(orchestrator ? ['', ORCHESTRATOR_BRIDGE_RULES] : []),
         '',
         rt.isMain(self) ? `${MAIN_RULES}\n\n${TEAM_RULES}` : TEAM_RULES,
       ].join('\n')
