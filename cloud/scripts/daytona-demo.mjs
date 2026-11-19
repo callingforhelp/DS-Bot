@@ -40,6 +40,7 @@ const base = `http://127.0.0.1:${server.address().port}`
 const as = who => apiClient({ baseUrl: base, principal: who, secret: principals[who].secret, tenant })
 const provider = daytonaProvider({ apiKey: env.DAYTONA_API_KEY, ttlMinutes: 10 })
 const out = []
+const startedAt = new Date()
 const check = (name, ok, extra = '') => { out.push(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? `  (${extra})` : ''}`); if (!ok) process.exitCode = 1 }
 const text = 'one two three\nfour five\nsix'
 let sandboxId
@@ -84,7 +85,8 @@ try {
   await withScope(pool, { tenant, role: 'ingest' }, async (c) => {
     for (const t of ['artifacts', 'authorizations', 'tasks_admitted', 'retrieval_chunks', 'ingestion_outbox', 'events', 'runs']) await c.query(`delete from ${t} where tenant_id = $1`, [tenant])
   }).catch(() => {})
-  await pool.query("delete from request_nonces where nonce like 'alice:%' or nonce like 'worker:%'").catch(() => {})
+  // Only the replay-protection records this run created (the table is shared by every tenant).
+  await pool.query("delete from request_nonces where seen_at >= $1 and (nonce like 'alice:%' or nonce like 'worker:%')", [startedAt]).catch(() => {})
   await pool.end()
   console.log(out.join('\n'))
 }
