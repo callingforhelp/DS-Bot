@@ -9,10 +9,12 @@ import { runJob } from './worker.mjs'
 // dispatches; a standby keeps trying to take the lease, so a crashed controller is replaced without
 // anyone sending a task twice (the dispatched flag and the row lock still guard the hand-off).
 export async function startController({
-  pool, principals, embedder, objectStore, provider, workerPrincipal = 'worker', instance = `ctl-${process.pid}`,
+  pool, principals, embedder, localEmbedder, localTenants = [], objectStore, provider, workerPrincipal = 'worker', instance = `ctl-${process.pid}`,
   host = '127.0.0.1', port = 0, intervalMs = 2000, bucket, log = () => {},
 }) {
-  const api = createApi({ pool, embedder, principals, objectStore, ready: async () => { await pool.query('select 1'); return true } })
+  // Tenants in localTenants never reach an external embedding provider: not their events, not their queries.
+  const embedderFor = tenant => (localEmbedder && localTenants.includes(tenant) ? localEmbedder : embedder)
+  const api = createApi({ pool, embedder, embedderFor, principals, objectStore, ready: async () => { await pool.query('select 1'); return true } })
   const server = await api.listen(port, host)
   const base = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${server.address().port}`
   const tenants = [...new Set(Object.values(principals).flatMap(p => p.tenants))]
@@ -44,7 +46,7 @@ export async function startController({
       // Recorded events become searchable here. Only the writer indexes, so one event is never
       // embedded twice; an embedding outage leaves the event on retry and search stays lexical.
       for (const tenant of tenants) {
-        const stats = await runIndexer(pool, tenant, embedder)
+        const stats = await runIndexer(pool, tenant, embedderFor(tenant))
         if (stats.indexed > 0) { state.indexed = (state.indexed ?? 0) + stats.indexed; log('indexed', tenant, stats.indexed, stats.embedFailed ? `embed-failed=${stats.embedFailed}` : '') }
       }
     } catch (error) {

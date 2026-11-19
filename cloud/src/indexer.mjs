@@ -4,13 +4,23 @@ import { sha256 } from './ingest.mjs'
 
 // The text an event contributes to search: its kind, ids and the redacted summary it
 // carries. Prompts and reasoning never reach an event, so they never reach this.
-const textOf = e => [
-  `${e.kind}`,
-  e.agent_id ? `agent ${e.agent_id}` : '',
-  e.body?.summary ?? '',
-  e.body?.reason ? `reason: ${e.body.reason}` : '',
-  e.body?.commit ? `commit ${e.body.commit}` : '',
-].filter(Boolean).join('\n')
+const spaced = v => String(v).replace(/[._-]+/g, ' ')
+const textOf = e => {
+  const b = e.body ?? {}
+  return [
+    `${e.kind}`,
+    spaced(e.kind),
+    e.agent_id ? `agent ${e.agent_id}` : '',
+    b.summary ?? '',
+    b.reason ? `reason: ${b.reason} ${spaced(b.reason)}` : '',
+    b.action ? `action ${b.action} ${spaced(b.action)}` : '',
+    b.outcome ? `outcome ${b.outcome}` : '',
+    b.actor_name ? `from ${b.actor_name}` : '',
+    b.target_name ? `to ${b.target_name}` : '',
+    b.room_name ? `room ${b.room_name}` : '',
+    b.commit ? `commit ${b.commit}` : '',
+  ].filter(Boolean).join('\n')
+}
 
 const backoff = attempts => `${Math.min(3600, 2 ** attempts * 5)} seconds`
 

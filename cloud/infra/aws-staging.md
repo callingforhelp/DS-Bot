@@ -23,6 +23,15 @@ Verified on the instance: Docker image built from `cloud/Dockerfile`; `/ready` r
 with a matching digest; all test rows and objects removed. **Restart:** after an instance reboot the container came back
 on its own (Docker restart policy), `/ready` passed and a signed task ran end to end again.
 
+## DS Bot container (19 Nov 2026)
+
+The official DS Bot image, built on the instance from the public fork at `feat/responding-to-bots` `2ee1a772`
+(`docker/Dockerfile`, DSH 0.2.2-rc.1), runs as container `ds-bot`: DSH home `/opt/ds-bot/dsbot/data`, workspace
+`/opt/ds-bot/dsbot/workspace`, web UI on `127.0.0.1:13080` only. One provider: GMI (`deepseek-ai/deepseek-v4.1-flash-1017`),
+key from `GMI_API_KEY` in the secret, passed to this container alone. The team starts empty; nothing is imported from the Mac.
+Permission mode is the image's own `danger-full-access` (see RISKS.md R2/R3). The login token is never written to Run
+Command output; read it in an interactive Session Manager shell.
+
 ## Operating notes
 
 - **Single writer.** This controller holds the writer lock in `ds_bot` for as long as it runs, so `scripts/daytona-demo.mjs`
@@ -42,7 +51,29 @@ on its own (Docker restart policy), `/ready` passed and a signed task ran end to
 
 - TLS in front of the API and an independent security review (spec gates). The API is reachable only from the instance itself.
 - OpenAI embeddings on this host stay the mock until `OPENAI_EMBEDDINGS_CONSENT=yes` is set in the secret.
-- No automatic redeploy: code is copied by SSM and the image rebuilt on the instance.
+- No automatic redeploy: code is copied by SSM and the image rebuilt on the instance (a deploy tool is designed, not built; RISKS.md R36).
+
+## DS Bot audit pipeline (deployed 19 Nov 2026)
+
+- **Migration 003** applied to `ds_bot` on the existing RDS (additive: authorizations gain target, room, source event and
+  private-agent scoping). Remote smoke test 8/8 afterwards.
+- **Secret** `ds-bot/controller-env` gained an `ingest` principal `dsbot-shipper` (tenant `dsbot-cloud`, source
+  `ds-bot-lineage`, project `dsbot-aws-staging`), `LINEAGE_PRINCIPAL_JSON` (kept out of the controller's env and written to a
+  root-owned 0400 file for the sidecar), tenant `dsbot-cloud` for `operator`, and `EMBED_LOCAL_TENANTS=dsbot-cloud` (removed
+  the same day once the owner confirmed the OpenAI consent covers DS Bot audit data; all tenants now use text-embedding-3-small). Live principals were
+  checked against the new startup rules first (both 48-character secrets, valid roles, none shared).
+- **Controller** redeployed with the new code; the previous image is kept as `ds-bot-controller:prev`, and the swap rolls back
+  automatically if `/ready` fails. The existing end-to-end check still passes 7/7.
+- **Lineage sidecar** container `ds-bot-lineage`: controller image, `node src/lineage-sidecar.mjs`, uid 1000, `/data` read-only,
+  `/opt/ds-bot/lineage` writable, the controller's network namespace (never host networking), read-only root, all
+  capabilities dropped, 256 MB / 64 pids, restart unless stopped. After any controller swap it must be **recreated** (`docker rm -f` and run again), not restarted: it is pinned to the old controller container's network namespace. Status:
+  `/opt/ds-bot/lineage/status.json` (counts only). Live probes: the shipper authenticates (an empty batch is refused as
+  input, 400), cannot search (403); a wrong secret gets 401; `operator` can search and list refusals in `dsbot-cloud`.
+  **No DS Bot data has flowed yet**: the cloud DS Bot has no Chief and no Sessions.
+
+## Planned, not deployed
+
+- **Off-host backup of DS Bot `/data`**: designed only; see RISKS.md R11 and R37.
 
 ## Teardown (in this order)
 
