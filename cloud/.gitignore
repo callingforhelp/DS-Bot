@@ -1,0 +1,12 @@
+node_modules/
+.pg/
+.objects/
+*.log
+.env
+
+# Local secrets: any env file or backup of one, never committed
+.env*
+!env.example
+
+# Real AWS resource IDs: kept locally, never committed (the fork is public)
+*.local.md

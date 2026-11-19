@@ -1,0 +1,23 @@
+# STAGING TEMPLATE. NOT DEPLOYED, NOT VALIDATED against a real DS Bot image or AWS.
+# Pin the image by digest after WP0 verifies it (see docs/wp0-inventory.md). Do not run this
+# against the live team, and do not publish the DS Bot port: put a TLS and auth proxy in
+# front, and bind it to localhost only.
+services:
+  ds-bot:
+    image: ${DS_BOT_IMAGE:?pin a digest, e.g. ghcr.io/...@sha256:...}
+    restart: unless-stopped
+    ports: ["127.0.0.1:13080:3080"]          # never 0.0.0.0; reached only through the proxy
+    environment:
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      DSH_TRUSTED_HOST: ${DSH_TRUSTED_HOST:?set to the proxy host name}
+    volumes:
+      - /mnt/ebs/ds-bot/data:/data            # encrypted EBS; authoritative DSH sessions and team state
+      - /mnt/ebs/ds-bot/workspace:/workspace:ro   # read-only until a write path has human approval
+    secrets: [deepseek_api_key]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # No docker.sock, no host network, no cloud credentials in this container.
+secrets:
+  deepseek_api_key: { file: ./secrets/deepseek_api_key }   # from a secret manager at deploy time
