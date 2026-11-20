@@ -17,7 +17,7 @@ export async function startController({
 }) {
   // Tenants in localTenants never reach an external embedding provider: not their events, not their queries.
   const embedderFor = tenant => (localEmbedder && localTenants.includes(tenant) ? localEmbedder : embedder)
-  const api = createApi({ pool, embedder, embedderFor, principals, objectStore, ready: async () => { await pool.query('select 1'); return true } })
+  const api = createApi({ pool, embedder, embedderFor, principals, objectStore, machines, ready: async () => { await pool.query('select 1'); return true } })
   const server = await api.listen(port, host)
   const base = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${server.address().port}`
   const tenants = [...new Set(Object.values(principals).flatMap(p => p.tenants))]

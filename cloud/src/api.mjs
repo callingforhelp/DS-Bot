@@ -42,7 +42,7 @@ export function validatePrincipals(principals) {
 // The API never runs a model. A rejected request therefore starts nothing: authentication,
 // replay and scope checks all happen before the task is admitted or anything is dispatched.
 // embedderFor(tenant) picks the embedder per tenant (some tenants may be kept off external providers).
-export function createApi({ pool, embedder, embedderFor = () => embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore }) {
+export function createApi({ pool, embedder, embedderFor = () => embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore, machines }) {
   // /ready is unauthenticated: its database check runs at most once a second.
   let readyCache = { at: -Infinity, value: false }
   const readyOnce = async () => {
@@ -244,6 +244,122 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     })
   }
 
+  const machineLabels = (m) => m.labels ?? m.sandbox?.labels ?? {}
+
+  const summarizeMachine = (m) => ({
+    id: m.id,
+    name: m.name,
+    state: m.sandbox?.state ?? m.state,
+    size: m.size,
+    resources: m.resources,
+    keepAwake: m.keepAwake,
+    idleMinutes: m.idleMinutes,
+    nextScheduledAt: m.nextScheduledAt,
+    activeJobs: m.activeJobs,
+    labels: machineLabels(m),
+    lastActivityAt: m.lastActivityAt,
+    pendingResize: m.pendingResize,
+    cache: {
+      fresh: m.cache?.fresh === true,
+      capturedSeq: m.cache?.capturedSeq ?? 0,
+      capturedEpoch: m.cache?.capturedEpoch ?? 0,
+      stoppedAt: m.cache?.stoppedAt ?? null,
+    },
+  })
+
+  const requireMachines = () => {
+    if (!machines) throw new HttpError(501, 'machine manager is not configured')
+    return machines
+  }
+
+  const requireTenantMachine = (p, machineId) => {
+    const mgr = requireMachines()
+    const m = mgr.listMachines().find(item => item.id === machineId)
+    if (!m || machineLabels(m).tenant_id !== p.tenant) throw new HttpError(404, 'no such machine')
+    return m
+  }
+
+  const parseJsonBody = (raw) => {
+    try { return raw === '' ? {} : JSON.parse(raw) } catch { throw new HttpError(400, 'invalid JSON') }
+  }
+
+  async function handleMachineRoute(req, p, pathname, raw) {
+    readerOnly(p)
+    const mgr = requireMachines()
+    if (pathname === '/v1/machines') {
+      if (req.method === 'GET') {
+        const list = mgr.listMachines().filter(m => machineLabels(m).tenant_id === p.tenant).map(summarizeMachine)
+        return { status: 200, json: { machines: list } }
+      }
+      if (req.method === 'POST') {
+        const input = parseJsonBody(raw)
+        const labels = {
+          ...(input.labels && typeof input.labels === 'object' && !Array.isArray(input.labels) ? input.labels : {}),
+          tenant_id: p.tenant,
+          owner: p.id,
+        }
+        const m = await mgr.createMachine({
+          name: input.name,
+          size: input.size,
+          resources: input.resources,
+          image: input.image,
+          snapshot: input.snapshot,
+          idleMinutes: input.idleMinutes,
+          keepAwake: input.keepAwake,
+          labels,
+          envVars: input.envVars,
+        })
+        return { status: 201, json: { machine: summarizeMachine(m) } }
+      }
+      throw new HttpError(404, 'not found')
+    }
+
+    const parts = pathname.slice('/v1/machines/'.length).split('/')
+    let machineId
+    try { machineId = decodeURIComponent(parts[0]) } catch { throw new HttpError(400, 'bad machine id') }
+    const machine = requireTenantMachine(p, machineId)
+
+    if (parts.length === 1) {
+      if (req.method === 'GET') return { status: 200, json: { machine: summarizeMachine(machine) } }
+      if (req.method === 'DELETE') { await mgr.deleteMachine(machineId); return { status: 200, json: { deleted: true, id: machineId } } }
+      throw new HttpError(404, 'not found')
+    }
+    if (parts.length === 2 && req.method === 'GET' && parts[1] === 'roster') {
+      return { status: 200, json: { roster: await mgr.readRoster(machineId) } }
+    }
+    if (parts.length === 3 && req.method === 'GET' && parts[1] === 'threads') {
+      let threadId
+      try { threadId = decodeURIComponent(parts[2]) } catch { throw new HttpError(400, 'bad thread id') }
+      return { status: 200, json: { thread: await mgr.readThread(machineId, threadId) } }
+    }
+    if (parts.length === 2 && req.method === 'POST') {
+      const input = parseJsonBody(raw)
+      if (parts[1] === 'message') {
+        const text = need(input.text, 'text')
+        const result = await mgr.sendMessage(machineId, { threadId: input.threadId, botId: input.botId, text })
+        return { status: 200, json: { result } }
+      }
+      if (parts[1] === 'exec') {
+        const script = need(input.script, 'script')
+        const result = await mgr.execCommand(machineId, script, { cwd: input.cwd, env: input.env, timeoutSecs: input.timeoutSecs })
+        return { status: 200, json: { result } }
+      }
+      if (parts[1] === 'sleep') {
+        const result = await mgr.sleep(machineId, { saveSnapshot: input.saveSnapshot, snapshotName: input.snapshotName })
+        return { status: 200, json: { result } }
+      }
+      if (parts[1] === 'resize') {
+        const result = await mgr.resizeMachine(machineId, input.resources ?? {})
+        return { status: 200, json: { result } }
+      }
+      if (parts[1] === 'policy') {
+        await mgr.setIdlePolicy(machineId, { idleMinutes: input.idleMinutes, keepAwake: input.keepAwake, nextScheduledAt: input.nextScheduledAt })
+        return { status: 200, json: { machine: summarizeMachine(requireTenantMachine(p, machineId)) } }
+      }
+    }
+    throw new HttpError(404, 'not found')
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://x')
     const send = (status, json) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(json)) }
@@ -263,10 +379,13 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
         const out = await listAuthorizations(p, url.searchParams)
         return send(out.status, out.json)
       }
+      if (url.pathname === '/v1/machines' || url.pathname.startsWith('/v1/machines/')) {
+        const out = await handleMachineRoute(req, p, url.pathname, raw)
+        return send(out.status, out.json)
+      }
       const route = routes[`${req.method} ${url.pathname}`]
       if (!route) throw new HttpError(404, 'not found')
-      let input = {}
-      try { input = raw === '' ? {} : JSON.parse(raw) } catch { throw new HttpError(400, 'invalid JSON') }
+      const input = parseJsonBody(raw)
       const out = await route(p, input)
       return send(out.status, out.json)
     } catch (error) {
