@@ -15,6 +15,7 @@ import { freshDb } from './helpers.mjs'
 const principals = {
   alice: { secret: 'alice-secret-at-least-32-chars-long!', tenants: ['t1'], scopes: ['read-only'], role: 'user' },
   bob: { secret: 'bob-secret-at-least-32-chars-long-!!', tenants: ['t2'], scopes: ['read-only'], role: 'user' },
+  acme: { secret: 'acme-secret-at-least-32-chars-long!', tenants: ['acme', 'acme-prod'], scopes: ['read-only'], role: 'user' },
   worker: { secret: 'worker-secret-at-least-32-chars-long', tenants: ['t1', 't2'], scopes: [], role: 'worker' },
 }
 
@@ -67,6 +68,7 @@ test('controller exposes /v1/machines lifecycle, messaging, exec, sleep, cached 
   assert.equal(msg.body.result.seq, 2)
   assert.equal(msg.body.result.result.reply, 'bot(coder): Please summarize this repository')
   assert.equal(delivered.length, 1)
+  assert.equal(delivered[0].threadId, 'th-1')
   assert.equal(delivered[0].text, 'Please summarize this repository')
 
   const execRes = await alice('POST', `/v1/machines/${id}/exec`, { script: 'pwd' })
@@ -77,7 +79,8 @@ test('controller exposes /v1/machines lifecycle, messaging, exec, sleep, cached 
   const slept = await alice('POST', `/v1/machines/${id}/sleep`, { saveSnapshot: true, snapshotName: 'nightly' })
   assert.equal(slept.status, 200)
   assert.equal(slept.body.result.slept, true)
-  assert.equal(slept.body.result.snapshotName, 'ds-bot-tenant-t1-nightly')
+  const t1Snap = slept.body.result.snapshotName
+  assert.ok(t1Snap.endsWith('-nightly'))
 
   const roster = await alice('GET', `/v1/machines/${id}/roster`)
   assert.equal(roster.status, 200)
@@ -127,10 +130,20 @@ test('/v1/machines enforces role permissions, tenant isolation, snapshot authori
   assert.equal((await bob('DELETE', `/v1/machines/${id}`)).status, 404)
 
   // Snapshot authorization: t1 can use its own tenant-prefixed snapshot or approved base snapshot; t2 cannot.
+  const t1HexSnap = `ds-bot-t-${Buffer.from('t1', 'utf8').toString('hex')}-nightly`
   assert.equal((await alice('POST', '/v1/machines', { name: 'from-approved', snapshot: 'daytona-small' })).status, 201)
-  assert.equal((await alice('POST', '/v1/machines', { name: 'from-own-snap', snapshot: 'ds-bot-tenant-t1-nightly' })).status, 201)
-  assert.equal((await bob('POST', '/v1/machines', { name: 'steal-t1', snapshot: 'ds-bot-tenant-t1-nightly' })).status, 403)
+  assert.equal((await alice('POST', '/v1/machines', { name: 'from-own-snap', snapshot: t1HexSnap })).status, 201)
+  assert.equal((await bob('POST', '/v1/machines', { name: 'steal-t1', snapshot: t1HexSnap })).status, 403)
   assert.equal((await bob('POST', '/v1/machines', { name: 'unapproved', snapshot: 'nightly' })).status, 403)
+
+  // Hyphen-prefix collision check: acme cannot access acme-prod's saved snapshot.
+  const acmeProd = apiClient({ baseUrl: ctl.base, principal: 'acme', secret: principals.acme.secret, tenant: 'acme-prod' })
+  const acme = apiClient({ baseUrl: ctl.base, principal: 'acme', secret: principals.acme.secret, tenant: 'acme' })
+  const apBox = await acmeProd('POST', '/v1/machines', { name: 'ap-box' })
+  assert.equal(apBox.status, 201)
+  const apSlept = await acmeProd('POST', `/v1/machines/${apBox.body.machine.id}/sleep`, { saveSnapshot: true, snapshotName: 'nightly' })
+  assert.equal(apSlept.status, 200)
+  assert.equal((await acme('POST', '/v1/machines', { name: 'steal-ap', snapshot: apSlept.body.result.snapshotName })).status, 403)
 
   const bareApi = createApi({ pool: db.pool, embedder: mockEmbedder(), principals })
   const bareSrv = await bareApi.listen()

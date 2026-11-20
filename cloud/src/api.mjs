@@ -284,7 +284,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     try { return raw === '' ? {} : JSON.parse(raw) } catch { throw new HttpError(400, 'invalid JSON') }
   }
 
-  const tenantSnapshotPrefix = (tenant) => `ds-bot-tenant-${tenant}-`
+  const tenantSnapshotPrefix = (tenant) => `ds-bot-t-${Buffer.from(tenant, 'utf8').toString('hex')}-`
 
   const authorizeSnapshot = (tenant, snapshot) => {
     if (snapshot === undefined) return undefined
@@ -360,7 +360,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
           threadId: input.threadId,
           botId: input.botId,
           text,
-          handler: (sandbox, message) => messageHandler(machine, sandbox, message),
+          handler: (sandbox, message) => messageHandler(machine, sandbox, { ...message, threadId: input.threadId }),
         })
         return { status: 200, json: { result } }
       }
