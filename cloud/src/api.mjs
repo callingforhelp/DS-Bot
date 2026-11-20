@@ -42,7 +42,8 @@ export function validatePrincipals(principals) {
 // The API never runs a model. A rejected request therefore starts nothing: authentication,
 // replay and scope checks all happen before the task is admitted or anything is dispatched.
 // embedderFor(tenant) picks the embedder per tenant (some tenants may be kept off external providers).
-export function createApi({ pool, embedder, embedderFor = () => embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore, machines }) {
+export function createApi({ pool, embedder, embedderFor = () => embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore, machines, messageHandler, approvedSnapshots = [] }) {
+  const approvedSnapshotSet = new Set(approvedSnapshots)
   // /ready is unauthenticated: its database check runs at most once a second.
   let readyCache = { at: -Infinity, value: false }
   const readyOnce = async () => {
@@ -283,6 +284,23 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     try { return raw === '' ? {} : JSON.parse(raw) } catch { throw new HttpError(400, 'invalid JSON') }
   }
 
+  const tenantSnapshotPrefix = (tenant) => `ds-bot-tenant-${tenant}-`
+
+  const authorizeSnapshot = (tenant, snapshot) => {
+    if (snapshot === undefined) return undefined
+    const name = need(snapshot, 'snapshot')
+    if (approvedSnapshotSet.has(name) || name.startsWith(tenantSnapshotPrefix(tenant))) return name
+    throw new HttpError(403, 'snapshot not permitted for this tenant')
+  }
+
+  const formatTenantSnapshot = (tenant, machine, snapshotName) => {
+    const prefix = tenantSnapshotPrefix(tenant)
+    if (snapshotName === undefined) return `${prefix}${machine.name}-${machine.id}`
+    const rawName = need(snapshotName, 'snapshotName')
+    if (!/^[A-Za-z0-9._-]{1,80}$/.test(rawName)) throw new HttpError(400, 'invalid snapshotName')
+    return rawName.startsWith(prefix) ? rawName : `${prefix}${rawName}`
+  }
+
   async function handleMachineRoute(req, p, pathname, raw) {
     readerOnly(p)
     const mgr = requireMachines()
@@ -293,6 +311,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
       }
       if (req.method === 'POST') {
         const input = parseJsonBody(raw)
+        const snapshot = authorizeSnapshot(p.tenant, input.snapshot)
         const labels = {
           ...(input.labels && typeof input.labels === 'object' && !Array.isArray(input.labels) ? input.labels : {}),
           tenant_id: p.tenant,
@@ -303,7 +322,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
           size: input.size,
           resources: input.resources,
           image: input.image,
-          snapshot: input.snapshot,
+          snapshot,
           idleMinutes: input.idleMinutes,
           keepAwake: input.keepAwake,
           labels,
@@ -335,8 +354,14 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     if (parts.length === 2 && req.method === 'POST') {
       const input = parseJsonBody(raw)
       if (parts[1] === 'message') {
+        if (typeof messageHandler !== 'function') throw new HttpError(501, 'machine message handler is not configured')
         const text = need(input.text, 'text')
-        const result = await mgr.sendMessage(machineId, { threadId: input.threadId, botId: input.botId, text })
+        const result = await mgr.sendMessage(machineId, {
+          threadId: input.threadId,
+          botId: input.botId,
+          text,
+          handler: (sandbox, message) => messageHandler(machine, sandbox, message),
+        })
         return { status: 200, json: { result } }
       }
       if (parts[1] === 'exec') {
@@ -345,7 +370,9 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
         return { status: 200, json: { result } }
       }
       if (parts[1] === 'sleep') {
-        const result = await mgr.sleep(machineId, { saveSnapshot: input.saveSnapshot, snapshotName: input.snapshotName })
+        const saveSnapshot = Boolean(input.saveSnapshot)
+        const snapshotName = saveSnapshot ? formatTenantSnapshot(p.tenant, machine, input.snapshotName) : undefined
+        const result = await mgr.sleep(machineId, { saveSnapshot, snapshotName })
         return { status: 200, json: { result } }
       }
       if (parts[1] === 'resize') {

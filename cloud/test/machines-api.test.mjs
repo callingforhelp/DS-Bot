@@ -26,6 +26,7 @@ after(async () => { for (const c of started) await c.stop(); await db.drop() })
 test('controller exposes /v1/machines lifecycle, messaging, exec, sleep, cached reads, resize, policy, and delete', async () => {
   const client = mockDaytonaClient()
   const machines = createDaytonaMachineManager({ client, defaultIdleMinutes: 10 })
+  const delivered = []
   const ctl = await startController({
     pool: db.pool,
     principals,
@@ -34,6 +35,11 @@ test('controller exposes /v1/machines lifecycle, messaging, exec, sleep, cached 
     intervalMs: 60_000,
     provider: mockDaytona(),
     machines,
+    approvedSnapshots: ['daytona-small'],
+    machineMessageHandler: async (machine, _sandbox, message) => {
+      delivered.push({ machineId: machine.id, ...message })
+      return { reply: `bot(${message.botId}): ${message.text}` }
+    },
     bucket: 'artifacts',
     objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-machines-api-')), secret: 's' }),
   })
@@ -56,18 +62,22 @@ test('controller exposes /v1/machines lifecycle, messaging, exec, sleep, cached 
   assert.equal(fetched.status, 200)
   assert.equal(fetched.body.machine.id, id)
 
-  const msg = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'th-1', botId: 'coder', text: 'echo hello' })
+  const msg = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'th-1', botId: 'coder', text: 'Please summarize this repository' })
   assert.equal(msg.status, 200)
-  assert.equal(msg.body.result.seq, 1)
+  assert.equal(msg.body.result.seq, 2)
+  assert.equal(msg.body.result.result.reply, 'bot(coder): Please summarize this repository')
+  assert.equal(delivered.length, 1)
+  assert.equal(delivered[0].text, 'Please summarize this repository')
 
   const execRes = await alice('POST', `/v1/machines/${id}/exec`, { script: 'pwd' })
   assert.equal(execRes.status, 200)
   assert.equal(execRes.body.result.exitCode, 0)
 
   await machines.captureState(id, { roster: { coder: 'neon' } })
-  const slept = await alice('POST', `/v1/machines/${id}/sleep`, {})
+  const slept = await alice('POST', `/v1/machines/${id}/sleep`, { saveSnapshot: true, snapshotName: 'nightly' })
   assert.equal(slept.status, 200)
   assert.equal(slept.body.result.slept, true)
+  assert.equal(slept.body.result.snapshotName, 'ds-bot-tenant-t1-nightly')
 
   const roster = await alice('GET', `/v1/machines/${id}/roster`)
   assert.equal(roster.status, 200)
@@ -78,7 +88,7 @@ test('controller exposes /v1/machines lifecycle, messaging, exec, sleep, cached 
   const thread = await alice('GET', `/v1/machines/${id}/threads/th-1`)
   assert.equal(thread.status, 200)
   assert.equal(thread.body.thread.fromCache, true)
-  assert.equal(thread.body.thread.value.messages[0].text, 'echo hello')
+  assert.equal(thread.body.thread.value.messages[0].text, 'Please summarize this repository')
 
   const policy = await alice('POST', `/v1/machines/${id}/policy`, { keepAwake: true, idleMinutes: 15 })
   assert.equal(policy.status, 200)
@@ -95,7 +105,7 @@ test('controller exposes /v1/machines lifecycle, messaging, exec, sleep, cached 
   assert.equal((await alice('GET', '/v1/machines')).body.machines.length, 0)
 })
 
-test('/v1/machines enforces role permissions, tenant isolation, and 501 when unconfigured', async () => {
+test('/v1/machines enforces role permissions, tenant isolation, snapshot authorization, and 501 when unconfigured', async () => {
   const ctl = started[0]
   const alice = apiClient({ baseUrl: ctl.base, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
   const bob = apiClient({ baseUrl: ctl.base, principal: 'bob', secret: principals.bob.secret, tenant: 't2' })
@@ -116,10 +126,27 @@ test('/v1/machines enforces role permissions, tenant isolation, and 501 when unc
   assert.equal((await bob('POST', `/v1/machines/${id}/message`, { threadId: 't', text: 'hi' })).status, 404)
   assert.equal((await bob('DELETE', `/v1/machines/${id}`)).status, 404)
 
+  // Snapshot authorization: t1 can use its own tenant-prefixed snapshot or approved base snapshot; t2 cannot.
+  assert.equal((await alice('POST', '/v1/machines', { name: 'from-approved', snapshot: 'daytona-small' })).status, 201)
+  assert.equal((await alice('POST', '/v1/machines', { name: 'from-own-snap', snapshot: 'ds-bot-tenant-t1-nightly' })).status, 201)
+  assert.equal((await bob('POST', '/v1/machines', { name: 'steal-t1', snapshot: 'ds-bot-tenant-t1-nightly' })).status, 403)
+  assert.equal((await bob('POST', '/v1/machines', { name: 'unapproved', snapshot: 'nightly' })).status, 403)
+
   const bareApi = createApi({ pool: db.pool, embedder: mockEmbedder(), principals })
   const bareSrv = await bareApi.listen()
   const bareUrl = `http://127.0.0.1:${bareSrv.address().port}`
   const bareAlice = apiClient({ baseUrl: bareUrl, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
   assert.equal((await bareAlice('GET', '/v1/machines')).status, 501)
   bareSrv.close()
+
+  // Without messageHandler, POST /v1/machines/:id/message must return 501 instead of executing shell commands.
+  const noHandlerMgr = createDaytonaMachineManager({ client: mockDaytonaClient() })
+  const noHandlerApi = createApi({ pool: db.pool, embedder: mockEmbedder(), principals, machines: noHandlerMgr })
+  const noHandlerSrv = await noHandlerApi.listen()
+  const noHandlerUrl = `http://127.0.0.1:${noHandlerSrv.address().port}`
+  const nhAlice = apiClient({ baseUrl: noHandlerUrl, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
+  const nhMachine = await nhAlice('POST', '/v1/machines', { name: 'no-handler-box' })
+  assert.equal(nhMachine.status, 201)
+  assert.equal((await nhAlice('POST', `/v1/machines/${nhMachine.body.machine.id}/message`, { threadId: 't1', text: 'echo pwned' })).status, 501)
+  noHandlerSrv.close()
 })
