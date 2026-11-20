@@ -317,9 +317,11 @@ export function createDaytonaMachineManager({
 
   async function syncFromStore(machine) {
     if (!store?.loadOne) return machine
+    const busy = () => machine.activeMutations > 0 || machine.activeJobs > 0 || machine.sleepLock || machine.startLock
+    if (busy()) return machine
     const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
     const latest = await store.loadOne(machine.id, tenantId)
-    if (!latest || latest.version === machine.version) return machine
+    if (busy() || !latest || latest.version === machine.version) return machine
     machine.name = latest.name
     machine.size = latest.size ?? machine.size
     machine.state = latest.state ?? machine.state

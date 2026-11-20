@@ -249,3 +249,46 @@ test('machine registry persists in Postgres across controller restarts, prevents
   assert.match(downSql, /delete from schema_migrations where id = '004_machines\.sql'/)
   assert.equal((await alice2('DELETE', `/v1/machines/${id}`)).status, 200)
 })
+
+test('concurrent store refresh never overwrites in-flight machine mutations', async () => {
+  const client = mockDaytonaClient()
+  const store = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+  const mgrA = createDaytonaMachineManager({ client, store, defaultIdleMinutes: 10 })
+  const mgrB = createDaytonaMachineManager({ client, store, defaultIdleMinutes: 10 })
+
+  const box = await mgrA.createMachine({ name: 'race-box', labels: { tenant_id: 't1' } })
+  await mgrB.rehydrate()
+
+  let releaseHandler
+  const handlerGate = new Promise(r => { releaseHandler = r })
+  const pendingSend = mgrA.sendMessage(box.id, {
+    threadId: 'th-race',
+    botId: 'coder',
+    text: 'in-flight message',
+    handler: async () => {
+      await handlerGate
+      return { reply: 'done' }
+    },
+  })
+
+  // Wait until sendMessage is inside the active mutation.
+  for (let i = 0; i < 100 && mgrA.getMachine(box.id).activeMutations === 0; i++) {
+    await new Promise(r => setTimeout(r, 10))
+  }
+  assert.equal(mgrA.getMachine(box.id).activeMutations, 1)
+
+  // Controller B updates policy (advancing DB version), then Controller A runs a thread read.
+  await mgrB.setIdlePolicy(box.id, { keepAwake: true })
+  const midRead = await mgrA.readThread(box.id, 'th-race')
+  assert.equal(midRead.value.messages[0].text, 'in-flight message', 'refresh must not clobber in-flight thread cache')
+  assert.equal(mgrA.getMachine(box.id).seq, 1, 'refresh must not regress in-flight seq')
+
+  releaseHandler()
+  await assert.rejects(pendingSend, err => err.code === 'MACHINE_VERSION_CONFLICT')
+
+  // DB still holds Controller B's valid version without any corrupted/regressed state from A.
+  const stored = await store.loadOne(box.id, 't1')
+  assert.equal(stored.keepAwake, true)
+  assert.equal(stored.seq, 0)
+  await mgrB.deleteMachine(box.id)
+})
