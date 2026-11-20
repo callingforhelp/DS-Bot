@@ -12,12 +12,13 @@ import { runJob } from './worker.mjs'
 export async function startController({
   pool, principals, embedder, localEmbedder, localTenants = [], objectStore, provider,
   machines = createDaytonaMachineManager({ client: mockDaytonaClient() }),
+  machineMessageHandler, approvedSnapshots,
   workerPrincipal = 'worker', instance = `ctl-${process.pid}`,
   host = '127.0.0.1', port = 0, intervalMs = 2000, bucket, log = () => {},
 }) {
   // Tenants in localTenants never reach an external embedding provider: not their events, not their queries.
   const embedderFor = tenant => (localEmbedder && localTenants.includes(tenant) ? localEmbedder : embedder)
-  const api = createApi({ pool, embedder, embedderFor, principals, objectStore, ready: async () => { await pool.query('select 1'); return true } })
+  const api = createApi({ pool, embedder, embedderFor, principals, objectStore, machines, messageHandler: machineMessageHandler, approvedSnapshots, ready: async () => { await pool.query('select 1'); return true } })
   const server = await api.listen(port, host)
   const base = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${server.address().port}`
   const tenants = [...new Set(Object.values(principals).flatMap(p => p.tenants))]
