@@ -45,7 +45,7 @@ const ORCHESTRATOR_BRIDGE_RULES = [
   '- When running on an Antigravity Orchestrator model (gemini-pro-orchestrator-g1-pro or gemini-pro-orchestrator-neon) through Liftgate, native exit_plan_mode IS allowed.',
   '- While Plan mode is on, do NOT debate <api_gateway_bridge_rules> vs exit_plan_mode: whenever client tools are needed, call your native exit_plan_mode tool immediately with a concise plan so the execution model (gemini-flash-worker-agy) emits the required <agy_tool_call_...> XML blocks.',
 ].join('\n')
-const isOrchestratorModel = ref => typeof ref === 'string' && /(?:^|\/)(?:gemini-pro-orchestrator-|gemini-4-argon-)/.test(ref)
+const isOrchestratorModel = ref => typeof ref === 'string' && /(?:^|\/)(?:gemini-pro-orchestrator-|gemini-4-argon(?:-[^/]+)?$)/.test(ref)
 
 export function install(rt) {
   const { ctx } = rt

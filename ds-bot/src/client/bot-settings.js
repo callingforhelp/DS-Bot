@@ -167,6 +167,12 @@ function modelHint(bot, roster) {
   return t('Applies from the next message.')
 }
 
+function executorLabel(entry) {
+  const provider = entry.providerName ?? entry.provider
+  const name = entry.name ?? entry.id
+  return provider && name ? `${provider} / ${name}` : entry.ref
+}
+
 // The selection ring of a picker cell follows the shape: a 1px line 3px outside it.
 function ShapeRing({ shape, size }) {
   const maskId = useRef('')
@@ -294,6 +300,17 @@ export function BotSettingsForm({ bot, roster, actions, run }) {
   const remove = () => { if (confirming) void run(actions.deleteBot(bot.id)); else setConfirming(true) }
   // DSH settings can change the model list at any time; the hint should match it.
   useEffect(() => { void actions.refreshModels?.() }, [bot.id])
+  const executorModels = modelsFor(roster.models).filter(entry => !entry.needsKey)
+  const savedExecutor = typeof bot.executorModel === 'string' && bot.executorModel !== '' && bot.executorModel !== 'auto'
+    ? bot.executorModel
+    : undefined
+  const unavailableExecutor = savedExecutor !== undefined && !executorModels.some(entry => entry.ref === savedExecutor)
+  const unavailableExecutorEntry = unavailableExecutor
+    ? (roster.models ?? []).find(entry => entry.ref === savedExecutor)
+    : undefined
+  const executorHint = unavailableExecutor && (roster.models ?? []).length > 0
+    ? t('This model is not available now. Pick another one.')
+    : t('Optional fast model for tool steps after planning (1+1 mode).')
   return h('div', { className: 'bt-bs' },
     h('div', { className: 'bt-bs-hero' },
       h('div', { className: 'bt-avatar-anchor' },
@@ -312,7 +329,7 @@ export function BotSettingsForm({ bot, roster, actions, run }) {
       h('div', { className: 'bt-set-row bt-bs-row' },
         h('span', { className: 'bt-set-copy' }, h('span', { className: 'bt-bs-label' }, t('Model')), h('span', { className: 'bt-set-hint' }, modelHint(bot, roster))),
         h(ModelMenu, { bot, roster, actions, run })),
-      !bot.engine ? h(Row, { label: t('Executor model'), hint: t('Optional fast model for tool steps after planning (1+1 mode).') },
+      !bot.engine ? h(Row, { label: t('Executor model'), hint: executorHint },
         h('select', {
           className: 'bt-bs-input',
           'aria-label': t('Executor model'),
@@ -321,7 +338,10 @@ export function BotSettingsForm({ bot, roster, actions, run }) {
         },
         h('option', { value: 'auto' }, t('Default')),
         h('option', { value: '' }, t('Same as model')),
-        modelsFor(roster.models).filter(entry => !entry.needsKey).map(entry => h('option', { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`)))) : null),
+        unavailableExecutor
+          ? h('option', { value: savedExecutor, disabled: true }, t('{model} (not available)', { model: unavailableExecutorEntry ? executorLabel(unavailableExecutorEntry) : savedExecutor }))
+          : null,
+        executorModels.map(entry => h('option', { key: entry.ref, value: entry.ref }, executorLabel(entry))))) : null),
     h(Card, { title: t('Working folder') },
       h('div', { className: 'bt-set-row bt-bs-row' },
         h('span', { className: 'bt-set-copy' }, h('span', { className: 'bt-bs-label' }, t('Folder'))),

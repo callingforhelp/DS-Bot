@@ -395,13 +395,17 @@ export function install(rt) {
     return neonRef !== primary && entries.some(entry => entry.ref === neonRef) ? neonRef : undefined
   }
 
-  // The thinking level a Bot asked for, when the model it runs on serves it; else the
-  // model's own default applies. A level the model does not have is ignored, never
-  // sent: an explicit effort a provider does not know is a hard refusal there.
-  async function desiredEffort(bot, ref) {
-    if (bot.effort === undefined || ref === undefined) return undefined
+  // The thinking level a Bot or request asked for, when the model it runs on serves it;
+  // else the model's own default applies. A level the model does not have is ignored,
+  // never sent: an explicit effort a provider does not know is a hard refusal there.
+  async function supportedEffort(wanted, ref) {
+    if (wanted === undefined || ref === undefined) return undefined
     const reasoning = await reasoningOf(ref)
-    return reasoning?.efforts?.some(effort => effort.id === bot.effort) ? bot.effort : undefined
+    return reasoning?.efforts?.some(effort => effort.id === wanted) ? wanted : undefined
+  }
+
+  function desiredEffort(bot, ref) {
+    return supportedEffort(bot?.effort, ref)
   }
 
   // A thinking level id, or a name only one level of the model has, like resolveModel.
@@ -589,7 +593,9 @@ export function install(rt) {
   }
   async function* streamReroutedStep(options, route, bot) {
     const ref = `${route.provider}/${route.model}`
-    const reasoningEffort = bot === undefined ? undefined : await desiredEffort(bot, ref)
+    const reasoningEffort = bot === undefined
+      ? await supportedEffort(options.reasoningEffort, ref)
+      : await desiredEffort(bot, ref)
     const rewritten = { ...options, provider: route.provider, model: route.model, reasoningEffort }
     routedSteps.add(rewritten)
     rt.carryUsageTag?.(options.messages, rewritten.messages)

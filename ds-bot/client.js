@@ -25856,6 +25856,11 @@ function modelHint(bot, roster) {
   if (bot.appliedModel && bot.appliedModel === bot.model) return t("Every message of this Bot runs on it.");
   return t("Applies from the next message.");
 }
+function executorLabel(entry) {
+  const provider = entry.providerName ?? entry.provider;
+  const name = entry.name ?? entry.id;
+  return provider && name ? `${provider} / ${name}` : entry.ref;
+}
 function ShapeRing({ shape, size }) {
   const maskId = (0, import_react27.useRef)("");
   if (maskId.current === "") maskId.current = `bt-ring-${nextMarkSerial()}`;
@@ -26035,6 +26040,11 @@ function BotSettingsForm({ bot, roster, actions, run: run2 }) {
   (0, import_react27.useEffect)(() => {
     void actions.refreshModels?.();
   }, [bot.id]);
+  const executorModels = modelsFor(roster.models).filter((entry) => !entry.needsKey);
+  const savedExecutor = typeof bot.executorModel === "string" && bot.executorModel !== "" && bot.executorModel !== "auto" ? bot.executorModel : void 0;
+  const unavailableExecutor = savedExecutor !== void 0 && !executorModels.some((entry) => entry.ref === savedExecutor);
+  const unavailableExecutorEntry = unavailableExecutor ? (roster.models ?? []).find((entry) => entry.ref === savedExecutor) : void 0;
+  const executorHint = unavailableExecutor && (roster.models ?? []).length > 0 ? t("This model is not available now. Pick another one.") : t("Optional fast model for tool steps after planning (1+1 mode).");
   return (0, import_react27.createElement)(
     "div",
     { className: "bt-bs" },
@@ -26077,7 +26087,7 @@ function BotSettingsForm({ bot, roster, actions, run: run2 }) {
       ),
       !bot.engine ? (0, import_react27.createElement)(
         Row,
-        { label: t("Executor model"), hint: t("Optional fast model for tool steps after planning (1+1 mode).") },
+        { label: t("Executor model"), hint: executorHint },
         (0, import_react27.createElement)(
           "select",
           {
@@ -26088,7 +26098,8 @@ function BotSettingsForm({ bot, roster, actions, run: run2 }) {
           },
           (0, import_react27.createElement)("option", { value: "auto" }, t("Default")),
           (0, import_react27.createElement)("option", { value: "" }, t("Same as model")),
-          modelsFor(roster.models).filter((entry) => !entry.needsKey).map((entry) => (0, import_react27.createElement)("option", { key: entry.ref, value: entry.ref }, `${entry.providerName ?? entry.provider} / ${entry.name ?? entry.id}`))
+          unavailableExecutor ? (0, import_react27.createElement)("option", { value: savedExecutor, disabled: true }, t("{model} (not available)", { model: unavailableExecutorEntry ? executorLabel(unavailableExecutorEntry) : savedExecutor })) : null,
+          executorModels.map((entry) => (0, import_react27.createElement)("option", { key: entry.ref, value: entry.ref }, executorLabel(entry)))
         )
       ) : null
     ),
