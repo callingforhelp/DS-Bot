@@ -304,13 +304,51 @@ export function createDaytonaMachineManager({
       },
       epoch: machine.epoch,
       seq: machine.seq,
+      version: machine.version ?? null,
       lastActivityAt: machine.lastActivityAt,
     }
   }
 
   async function persist(machine) {
     if (!store) return
-    await store.save(serializeMachine(machine))
+    const saved = await store.save(serializeMachine(machine))
+    if (saved?.version !== undefined) machine.version = saved.version
+  }
+
+  async function syncFromStore(machine) {
+    if (!store?.loadOne) return machine
+    const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
+    const latest = await store.loadOne(machine.id, tenantId)
+    if (!latest || latest.version === machine.version) return machine
+    machine.name = latest.name
+    machine.size = latest.size ?? machine.size
+    machine.state = latest.state ?? machine.state
+    machine.idleMinutes = latest.idleMinutes ?? machine.idleMinutes
+    machine.keepAwake = Boolean(latest.keepAwake)
+    machine.nextScheduledAt = latest.nextScheduledAt ?? null
+    machine.pendingResize = latest.pendingResize ?? null
+    machine.epoch = latest.epoch ?? machine.epoch
+    machine.seq = latest.seq ?? machine.seq
+    machine.version = latest.version
+    machine.lastActivityAt = latest.lastActivityAt ?? machine.lastActivityAt
+    machine.cache.fresh = Boolean(latest.cache?.fresh)
+    machine.cache.capturedSeq = latest.cache?.capturedSeq ?? 0
+    machine.cache.capturedEpoch = latest.cache?.capturedEpoch ?? 0
+    machine.cache.stoppedAt = latest.cache?.stoppedAt ?? null
+    machine.cache.roster = latest.cache?.roster ?? null
+    machine.cache.threads = new Map(Object.entries(latest.cache?.threads ?? {}))
+    machine.cache.readings = new Map(Object.entries(latest.cache?.readings ?? {}))
+    machine.cache.projects = Array.isArray(latest.cache?.projects) ? latest.cache.projects : []
+    return machine
+  }
+
+  async function resolveSandbox(machine) {
+    if (machine.sandbox) return machine.sandbox
+    const sandbox = await client.get(machine.id)
+    if (!sandbox) throw new Error(`sandbox ${machine.id} not found`)
+    machine.sandbox = sandbox
+    machine.state = sandbox.state ?? machine.state
+    return sandbox
   }
 
   function requireMachine(machineId) {
@@ -357,6 +395,7 @@ export function createDaytonaMachineManager({
 
   async function ensureAwake(machineId, reason = 'write') {
     const machine = requireMachine(machineId)
+    await syncFromStore(machine)
     let woke = false
     while (true) {
       if (machine.sleepLock) {
@@ -369,6 +408,7 @@ export function createDaytonaMachineManager({
         woke = true
         continue
       }
+      await resolveSandbox(machine)
       const state = currentState(machine)
       if (state !== 'stopped') {
         machine.state = state
@@ -388,6 +428,7 @@ export function createDaytonaMachineManager({
           machine.state = 'started'
           machine.cache.fresh = false
           machine.lastActivityAt = now()
+          await persist(machine)
         } finally {
           if (machine.startLock === startPromise) machine.startLock = null
         }
@@ -400,6 +441,7 @@ export function createDaytonaMachineManager({
 
   async function beginActiveJob(machineId, reason) {
     const machine = requireMachine(machineId)
+    await syncFromStore(machine)
     let woke = false
     while (true) {
       if (machine.sleepLock) {
@@ -407,6 +449,7 @@ export function createDaytonaMachineManager({
         await machine.sleepLock
         continue
       }
+      await resolveSandbox(machine)
       if (currentState(machine) === 'stopped' || machine.startLock) {
         const res = await ensureAwake(machineId, reason)
         woke ||= res.woke
@@ -475,6 +518,7 @@ export function createDaytonaMachineManager({
   async function readCachedOrWake(machine, reason, { cacheHit, readCache, readLive }) {
     if (machine.sleepLock) await machine.sleepLock
     if (machine.startLock) await machine.startLock
+    await syncFromStore(machine)
     if (currentState(machine) === 'stopped' && machine.cache.fresh && cacheHit()) {
       return { value: structuredClone(readCache()), fromCache: true, woke: false, epoch: machine.cache.capturedEpoch }
     }
@@ -795,6 +839,8 @@ export function createDaytonaMachineManager({
 
     async setIdlePolicy(machineId, { idleMinutes, keepAwake, nextScheduledAt } = {}) {
       const machine = requireMachine(machineId)
+      await syncFromStore(machine)
+      await resolveSandbox(machine)
       if (idleMinutes !== undefined && (!Number.isInteger(idleMinutes) || idleMinutes < 0)) {
         throw new Error('idleMinutes must be a non-negative integer')
       }
@@ -814,6 +860,8 @@ export function createDaytonaMachineManager({
 
     async resizeMachine(machineId, resources = {}) {
       const machine = requireMachine(machineId)
+      await syncFromStore(machine)
+      await resolveSandbox(machine)
       const { size, ...hw } = resources
       if (machine.activeJobs > 0 || machine.sleepLock || (hw.disk !== undefined && currentState(machine) === 'started')) {
         machine.pendingResize = { ...resources }
@@ -897,6 +945,7 @@ export function createDaytonaMachineManager({
         return { action: 'none', state: 'stopped' }
       }
       if (machine.keepAwake) {
+        await resolveSandbox(machine)
         await machine.sandbox.refreshActivity?.()
         return { action: 'none', reason: 'keep-awake' }
       }
@@ -916,6 +965,7 @@ export function createDaytonaMachineManager({
     async deleteMachine(machineId) {
       const machine = requireMachine(machineId)
       const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
+      await resolveSandbox(machine)
       await client.delete(machine.sandbox)
       machines.delete(machineId)
       if (store) await store.remove(machineId, tenantId)
@@ -926,7 +976,18 @@ export function createDaytonaMachineManager({
       const rows = await store.loadAll()
       const loaded = []
       for (const row of rows) {
-        if (machines.has(row.id)) continue
+        const existing = machines.get(row.id)
+        if (existing) {
+          if (!existing.sandbox) {
+            try {
+              existing.sandbox = await client.get(row.id)
+              existing.state = existing.sandbox?.state ?? existing.state
+            } catch {
+              // Keep sandbox null so the next operation retries client.get().
+            }
+          }
+          continue
+        }
         let sandbox = null
         try {
           sandbox = await client.get(row.id)
@@ -938,7 +999,7 @@ export function createDaytonaMachineManager({
           name: row.name,
           size: row.size ?? 'small',
           state: sandbox?.state ?? row.state ?? 'stopped',
-          sandbox: sandbox ?? { id: row.id, name: row.name, state: row.state ?? 'stopped', labels: row.labels ?? {} },
+          sandbox,
           labels: row.labels ?? {},
           idleMinutes: row.idleMinutes ?? defaultIdleMinutes,
           keepAwake: Boolean(row.keepAwake),
@@ -948,6 +1009,7 @@ export function createDaytonaMachineManager({
           lastActivityAt: row.lastActivityAt ?? now(),
           epoch: row.epoch ?? 1,
           seq: row.seq ?? 0,
+          version: row.version ?? 1,
           nextScheduledAt: row.nextScheduledAt ?? null,
           pendingResize: row.pendingResize ?? null,
           sleepLock: null,

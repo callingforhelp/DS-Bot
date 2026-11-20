@@ -417,6 +417,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
       return send(out.status, out.json)
     } catch (error) {
       if (error instanceof HttpError) return send(error.status, { error: error.message })
+      if (error?.code === 'MACHINE_VERSION_CONFLICT') return send(409, { error: error.message })
       return send(500, { error: 'internal error' })
     }
   }

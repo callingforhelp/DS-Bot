@@ -7,7 +7,6 @@ import { validatePrincipals } from './api.mjs'
 import { startController } from './controller-service.mjs'
 import { createDaytonaMachineManager, mockDaytonaClient } from './daytona-machine.mjs'
 import { mockEmbedder, openaiEmbedder } from './embed.mjs'
-import { createSandboxMessageHandler } from './machine-handler.mjs'
 import { pgMachineStore } from './machine-store.mjs'
 import { localObjectStore } from './objectstore.mjs'
 import { r2ClientFromEnv, r2ObjectStore } from './r2store.mjs'
@@ -50,7 +49,6 @@ if (localTenants.length) say(`embeddings for ${localTenants.join(', ')}: local o
 
 const ctl = await startController({
   pool, principals, embedder, localEmbedder: mockEmbedder(), localTenants, objectStore, provider, machines,
-  machineMessageHandler: createSandboxMessageHandler(),
   host: env.HOST ?? '127.0.0.1', port: Number(env.PORT ?? 8080),
   bucket: haveR2 ? env.R2_BUCKET : 'artifacts', instance: env.INSTANCE_ID ?? `ctl-${process.pid}`, log: (...a) => say(...a),
 })

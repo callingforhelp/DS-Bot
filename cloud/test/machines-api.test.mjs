@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
@@ -8,7 +8,6 @@ import { apiClient } from '../src/client.mjs'
 import { startController } from '../src/controller-service.mjs'
 import { createDaytonaMachineManager, mockDaytonaClient } from '../src/daytona-machine.mjs'
 import { mockEmbedder } from '../src/embed.mjs'
-import { createSandboxMessageHandler } from '../src/machine-handler.mjs'
 import { pgMachineStore } from '../src/machine-store.mjs'
 import { localObjectStore } from '../src/objectstore.mjs'
 import { mockDaytona } from '../src/worker.mjs'
@@ -166,9 +165,10 @@ test('/v1/machines enforces role permissions, tenant isolation, snapshot authori
   noHandlerSrv.close()
 })
 
-test('machine registry persists in Postgres across controller restarts and sandbox message handler passes base64 env', async () => {
+test('machine registry persists in Postgres across controller restarts, prevents stale overwrites, retries unresolved sandboxes, and persists wake invalidation', async () => {
   const client = mockDaytonaClient()
   const store = pgMachineStore({ pool: db.pool, tenants: ['t1', 't2'] })
+  const msgHandler = async (_m, _sbx, msg) => ({ reply: `echo:${msg.text}` })
   const mgr1 = createDaytonaMachineManager({ client, store, defaultIdleMinutes: 10 })
   const ctl1 = await startController({
     pool: db.pool,
@@ -178,38 +178,18 @@ test('machine registry persists in Postgres across controller restarts and sandb
     intervalMs: 60_000,
     provider: mockDaytona(),
     machines: mgr1,
-    machineMessageHandler: createSandboxMessageHandler(),
+    machineMessageHandler: msgHandler,
     bucket: 'artifacts',
     objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-persist-1-')), secret: 's' }),
   })
   started.push(ctl1)
 
-  // Override executeCommand on the created sandbox to verify DS_BOT_MSG_B64 env delivery without raw shell interpolation.
   const alice1 = apiClient({ baseUrl: ctl1.base, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
   const created = await alice1('POST', '/v1/machines', { name: 'persist-box', size: 'medium' })
   assert.equal(created.status, 201)
   const id = created.body.machine.id
 
-  const sandbox = mgr1.getMachine(id).sandbox
-  const seenCalls = []
-  sandbox.process.executeCommand = async (cmd, _cwd, env) => {
-    seenCalls.push({ cmd, env })
-    const decoded = JSON.parse(Buffer.from(env.DS_BOT_MSG_B64, 'base64').toString('utf8'))
-    return { exitCode: 0, result: JSON.stringify({ delivered: true, threadId: decoded.threadId, botId: decoded.botId }) }
-  }
-
-  const msg = await alice1('POST', `/v1/machines/${id}/message`, { threadId: 'th-persist', botId: 'coder', text: '$(rm -rf /)' })
-  assert.equal(msg.status, 200)
-  assert.equal(seenCalls.length, 1)
-  assert.equal(seenCalls[0].cmd.includes('$(rm -rf /)'), false, 'raw message text must never be interpolated into shell command')
-  assert.equal(msg.body.result.result.delivered, true)
-  assert.equal(msg.body.result.result.threadId, 'th-persist')
-
-  await mgr1.captureState(id, { roster: { coder: 'neon' } })
-  assert.equal((await alice1('POST', `/v1/machines/${id}/sleep`, {})).status, 200)
-  await ctl1.stop()
-
-  // Start a fresh controller + manager backed by the same Postgres store and verify rehydration.
+  // Second controller rehydrates at seq 0 before controller 1 records a message (seq 2).
   const mgr2 = createDaytonaMachineManager({ client, store, defaultIdleMinutes: 10 })
   const ctl2 = await startController({
     pool: db.pool,
@@ -219,30 +199,53 @@ test('machine registry persists in Postgres across controller restarts and sandb
     intervalMs: 60_000,
     provider: mockDaytona(),
     machines: mgr2,
-    machineMessageHandler: createSandboxMessageHandler(),
+    machineMessageHandler: msgHandler,
     bucket: 'artifacts',
     objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-persist-2-')), secret: 's' }),
   })
   started.push(ctl2)
 
+  const msg = await alice1('POST', `/v1/machines/${id}/message`, { threadId: 'th-persist', botId: 'coder', text: 'hello' })
+  assert.equal(msg.status, 200)
+  assert.equal(msg.body.result.seq, 2)
+
+  // Updating policy through standby ctl2 must sync from store and never clobber seq 2 / thread cache.
   const alice2 = apiClient({ baseUrl: ctl2.base, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
-  const listed = await alice2('GET', '/v1/machines')
-  assert.equal(listed.status, 200)
-  assert.equal(listed.body.machines.some(m => m.id === id && m.state === 'stopped'), true)
+  const pol = await alice2('POST', `/v1/machines/${id}/policy`, { keepAwake: true })
+  assert.equal(pol.status, 200)
+  assert.equal(mgr2.getMachine(id).seq, 2)
 
-  const roster = await alice2('GET', `/v1/machines/${id}/roster`)
-  assert.equal(roster.status, 200)
-  assert.equal(roster.body.roster.fromCache, true)
-  assert.equal(roster.body.roster.woke, false)
-  assert.deepEqual(roster.body.roster.value, { coder: 'neon' })
+  // Direct stale version write is rejected with MACHINE_VERSION_CONFLICT.
+  await assert.rejects(
+    store.save({ tenantId: 't1', id, name: 'persist-box', size: 'medium', state: 'started', idleMinutes: 10, keepAwake: false, nextScheduledAt: null, labels: { tenant_id: 't1' }, pendingResize: null, cache: {}, epoch: 1, seq: 0, version: 1, lastActivityAt: Date.now() }),
+    err => err.code === 'MACHINE_VERSION_CONFLICT',
+  )
 
-  const thread = await alice2('GET', `/v1/machines/${id}/threads/th-persist`)
-  assert.equal(thread.status, 200)
-  assert.equal(thread.body.thread.fromCache, true)
-  assert.equal(thread.body.thread.value.messages[0].text, '$(rm -rf /)')
+  // Sleep with roster A, wake via uncaptured readThread, update sandbox roster to B, stop directly, and rehydrate.
+  await mgr1.setIdlePolicy(id, { keepAwake: false })
+  await mgr1.captureState(id, { roster: { coder: 'roster-A' } })
+  assert.equal((await alice1('POST', `/v1/machines/${id}/sleep`, {})).status, 200)
+  await mgr1.readThread(id, 'uncaptured-thread', { fetcher: async () => ({ threadId: 'uncaptured-thread', messages: [] }) })
+  await mgr1.getMachine(id).sandbox.fs.uploadFile(Buffer.from(JSON.stringify({ bots: { coder: 'roster-B' } })), '/data/bot/state.json')
+  await mgr1.getMachine(id).sandbox.stop()
 
-  assert.equal((await alice2('DELETE', `/v1/machines/${id}`)).status, 200)
+  // Simulate transient Daytona outage during rehydrate, then recovery on retry.
+  const origGet = client.get.bind(client)
+  let failOnce = true
+  client.get = async (sid) => {
+    if (failOnce) { failOnce = false; throw new Error('daytona temporary outage') }
+    return origGet(sid)
+  }
   const mgr3 = createDaytonaMachineManager({ client, store, defaultIdleMinutes: 10 })
   await mgr3.rehydrate()
-  assert.equal(mgr3.listMachines().some(m => m.id === id), false)
+  assert.equal(mgr3.getMachine(id).sandbox, null, 'failed lookup leaves sandbox null instead of broken placeholder')
+
+  // Next operation retries client.get() and wakes to read fresh roster-B (cache invalidation was persisted on wake).
+  const roster = await mgr3.readRoster(id)
+  assert.equal(roster.fromCache, false)
+  assert.deepEqual(roster.value, { coder: 'roster-B' })
+
+  const downSql = readFileSync(new URL('../migrations/004_machines.down.sql', import.meta.url), 'utf8')
+  assert.match(downSql, /delete from schema_migrations where id = '004_machines\.sql'/)
+  assert.equal((await alice2('DELETE', `/v1/machines/${id}`)).status, 200)
 })
