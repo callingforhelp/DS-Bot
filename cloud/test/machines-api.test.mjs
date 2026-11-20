@@ -7,6 +7,7 @@ import { createApi } from '../src/api.mjs'
 import { apiClient } from '../src/client.mjs'
 import { startController } from '../src/controller-service.mjs'
 import { createDaytonaMachineManager, mockDaytonaClient } from '../src/daytona-machine.mjs'
+import { createDshMessageHandler } from '../src/dsh-handler.mjs'
 import { mockEmbedder } from '../src/embed.mjs'
 import { pgMachineStore } from '../src/machine-store.mjs'
 import { localObjectStore } from '../src/objectstore.mjs'
@@ -594,4 +595,62 @@ test('syncFromStore refreshes stale independent sandbox handle state after remot
   assert.equal(execRes.woke, true)
   assert.equal(execRes.exitCode, 0)
   await mgrA.deleteMachine(box.id)
+})
+
+test('createDshMessageHandler delivers messages via sandbox preview /api/bot send and propagates DSH errors', async () => {
+  assert.throws(() => createDshMessageHandler({ port: 0 }), /invalid DSH port/)
+
+  const seenRequests = []
+  let nextResponse = { status: 200, body: { ok: true, value: true } }
+  const fakeFetch = async (url, init) => {
+    seenRequests.push({ url, method: init.method, headers: init.headers, body: JSON.parse(init.body) })
+    return {
+      ok: nextResponse.status >= 200 && nextResponse.status < 300,
+      status: nextResponse.status,
+      json: async () => nextResponse.body,
+    }
+  }
+
+  const client = mockDaytonaClient()
+  const store = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+  const mgr = createDaytonaMachineManager({ client, store })
+  const ctl = await startController({
+    pool: db.pool,
+    principals,
+    embedder: mockEmbedder(),
+    instance: 'ctl-dsh-handler',
+    intervalMs: 60_000,
+    provider: mockDaytona(),
+    machines: mgr,
+    machineMessageHandler: createDshMessageHandler({ port: 3000, authToken: 'dsh-tok', fetchImpl: fakeFetch }),
+    bucket: 'artifacts',
+    objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-dsh-')), secret: 's' }),
+  })
+  started.push(ctl)
+
+  const alice = apiClient({ baseUrl: ctl.base, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
+  const created = await alice('POST', '/v1/machines', { name: 'dsh-box' })
+  assert.equal(created.status, 201)
+  const id = created.body.machine.id
+
+  const sent = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'sess-1', botId: 'coder', text: 'Please review PR' })
+  assert.equal(sent.status, 200)
+  assert.equal(sent.body.result.result.delivered, true)
+  assert.equal(sent.body.result.result.sessionId, 'sess-1')
+  assert.equal(seenRequests.length, 1)
+  assert.match(seenRequests[0].url, /\/api\/bot$/)
+  assert.equal(seenRequests[0].headers['x-daytona-preview-token'], `tok-${id}-3000`)
+  assert.equal(seenRequests[0].headers.authorization, 'Bearer dsh-tok')
+  assert.deepEqual(seenRequests[0].body, { endpoint: 'send', payload: { sessionId: 'sess-1', text: 'Please review PR' } })
+
+  // DSH error response must fail instead of falsely reporting delivery.
+  nextResponse = { status: 200, body: { ok: false, error: { message: 'bot/read-only' } } }
+  const failed = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'sess-1', text: 'should fail' })
+  assert.equal(failed.status, 500)
+
+  // Missing threadId and botId must be rejected.
+  const missingSession = await alice('POST', `/v1/machines/${id}/message`, { text: 'no session' })
+  assert.equal(missingSession.status, 500)
+
+  await alice('DELETE', `/v1/machines/${id}`)
 })

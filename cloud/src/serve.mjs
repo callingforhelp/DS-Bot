@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { validatePrincipals } from './api.mjs'
 import { startController } from './controller-service.mjs'
 import { createDaytonaMachineManager, mockDaytonaClient } from './daytona-machine.mjs'
+import { createDshMessageHandler } from './dsh-handler.mjs'
 import { mockEmbedder, openaiEmbedder } from './embed.mjs'
 import { pgMachineStore } from './machine-store.mjs'
 import { localObjectStore } from './objectstore.mjs'
@@ -39,16 +40,21 @@ const machines = env.DAYTONA_API_KEY
   ? createDaytonaMachineManager({ apiKey: env.DAYTONA_API_KEY, store: machineStore })
   : createDaytonaMachineManager({ client: mockDaytonaClient(), store: machineStore })
 
+const machineMessageHandler = env.DS_BOT_DSH_PORT
+  ? createDshMessageHandler({ port: Number(env.DS_BOT_DSH_PORT), authToken: env.DS_BOT_DSH_TOKEN })
+  : undefined
+
 say(`object store: ${haveR2 ? 'Cloudflare R2' : 'LOCAL stand-in (not durable)'}`)
 say(`embeddings: ${embedder.model}${embedder.model.startsWith('mock') ? ' (mock; no consent or key)' : ''}`)
 say(`sandboxes: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock (no isolation)'}`)
 say(`persistent machines: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock'}`)
+say(`machine messages: ${machineMessageHandler ? `DSH preview port ${env.DS_BOT_DSH_PORT}` : 'disabled (set DS_BOT_DSH_PORT to enable)'}`)
 
 const localTenants = (env.EMBED_LOCAL_TENANTS ?? '').split(',').map(t => t.trim()).filter(Boolean)
 if (localTenants.length) say(`embeddings for ${localTenants.join(', ')}: local only (EMBED_LOCAL_TENANTS)`)
 
 const ctl = await startController({
-  pool, principals, embedder, localEmbedder: mockEmbedder(), localTenants, objectStore, provider, machines,
+  pool, principals, embedder, localEmbedder: mockEmbedder(), localTenants, objectStore, provider, machines, machineMessageHandler,
   host: env.HOST ?? '127.0.0.1', port: Number(env.PORT ?? 8080),
   bucket: haveR2 ? env.R2_BUCKET : 'artifacts', instance: env.INSTANCE_ID ?? `ctl-${process.pid}`, log: (...a) => say(...a),
 })
