@@ -264,6 +264,20 @@ test('acp: full access allows and read-only refuses a change without a card', as
   assert.match(refused.text, /denied/)
 })
 
+// 17 Nov: a Bot with no preset ran on DSH's full-access default (approval policy
+// `never`), the bridge assumed workspace-write, and every ask of the CLI was rejected.
+// The preset now comes from DSH, possibly asynchronously: full access picks the bypass
+// mode and answers an ask itself instead of raising an approval that `never` rejects.
+test('acp: a preset that resolves later from DSH still picks bypass and answers asks itself', async (t) => {
+  const adapter = makeAdapter({ preset: async () => 'danger-full-access' })
+  const cursor = makeAdapter({ preset: async () => 'danger-full-access', acpArgs: ['--cursor-modes'] })
+  t.after(() => Promise.all([adapter, cursor].map(a => a.dispose())))
+  assert.match((await collect(adapter.stream(options('s1', [user('m1', 'show-mode')])))).text, /mode: bypass; refused: 0/)
+  const allowed = await collect(cursor.stream(options('s1', [user('m1', 'ask-permission')])))
+  assert.equal(allowed.calls.length, 0, 'no approval card is raised')
+  assert.match(allowed.text, /allowed via allow-once/)
+})
+
 test('devin: a call to the dsbot server is allowed once without asking; other servers still ask', async (t) => {
   const adapter = makeAdapter()
   t.after(() => adapter.dispose())

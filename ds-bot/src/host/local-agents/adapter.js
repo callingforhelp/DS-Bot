@@ -58,7 +58,7 @@ const RESUME_RETRIED = Symbol('resume retried')
 
 export class LocalAgentAdapter extends LlmAdapter {
   // deps: {rt, findExecutable, spawnEngine(kind,route,engine), record(sessionId),
-  //        saveRecord, dropRecord, presetFor(sessionId), toolsFor(options), signInHint(route),
+  //        saveRecord, dropRecord, presetFor(sessionId) (may return a promise), toolsFor(options), signInHint(route),
   //        usedModels(route)}
   constructor(deps) {
     super()
@@ -383,7 +383,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     }
     const sessionId = options.sessionId
     if (sessionId === undefined) throw new LlmError('a local agent request needs a session', 'INVALID_REQUEST')
-    const preset = this.deps.presetFor(sessionId)
+    const preset = await this.deps.presetFor(sessionId)
     const live = await this.liveFor(options, preset)
 
     // What the request carries past the last handed message. When the marker is
@@ -768,7 +768,7 @@ export class LocalAgentAdapter extends LlmAdapter {
         case 'permission': {
           // The preset answers what it already decides, also on an agent with no
           // matching mode of its own: full access allows, read-only refuses a change.
-          const answer = presetAnswer(this.deps.presetFor(live.sessionId), event)
+          const answer = presetAnswer(await this.deps.presetFor(live.sessionId), event)
           if (answer !== undefined) { event.reply(answer); break }
           yield* closeBlocks()
           live.state = 'suspended'
@@ -854,7 +854,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     if (live === undefined && record?.cliSessionId === undefined) throw new LlmError('this conversation has no session of its local agent yet', 'LOCAL_AGENT_ERROR')
     let opened = false
     if (live === undefined || live.engineSession === undefined || live.engineSession.dead === true) {
-      live ??= await this.liveFor({ sessionId, provider: record.route, model: record.model }, this.deps.presetFor(sessionId))
+      live ??= await this.liveFor({ sessionId, provider: record.route, model: record.model }, await this.deps.presetFor(sessionId))
       await this.openFor(live, sessionId)
       opened = true
     }
