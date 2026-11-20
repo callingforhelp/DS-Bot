@@ -326,7 +326,17 @@ export function createDaytonaMachineManager({
     if (busy()) return machine
     const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
     const latest = await store.loadOne(machine.id, tenantId)
-    if (busy() || !latest || latest.version === machine.version) return machine
+    if (busy()) return machine
+    if (!latest) {
+      if (machine.version !== undefined && machine.version !== null && !machine.persisting) {
+        machines.delete(machine.id)
+        return null
+      }
+      return machine
+    }
+    machine.remoteActiveJobs = latest.activeJobs ?? 0
+    machine.lastActivityAt = Math.max(machine.lastActivityAt, latest.lastActivityAt ?? 0)
+    if (latest.version === machine.version) return machine
     machine.name = latest.name
     machine.size = latest.size ?? machine.size
     machine.state = latest.state ?? machine.state
@@ -337,7 +347,6 @@ export function createDaytonaMachineManager({
     machine.epoch = latest.epoch ?? machine.epoch
     machine.seq = latest.seq ?? machine.seq
     machine.version = latest.version
-    machine.lastActivityAt = latest.lastActivityAt ?? machine.lastActivityAt
     machine.cache.fresh = Boolean(latest.cache?.fresh)
     machine.cache.capturedSeq = latest.cache?.capturedSeq ?? 0
     machine.cache.capturedEpoch = latest.cache?.capturedEpoch ?? 0
@@ -402,9 +411,13 @@ export function createDaytonaMachineManager({
 
   async function ensureAwake(machineId, reason = 'write') {
     const machine = requireMachine(machineId)
-    await syncFromStore(machine)
+    if ((await syncFromStore(machine)) === null) throw new Error(`unknown machine: ${machineId}`)
     let woke = false
     while (true) {
+      if (!machine.sandbox) {
+        await resolveSandbox(machine)
+        continue
+      }
       if (machine.sleepLock) {
         machine.sleepAborted = true
         await machine.sleepLock
@@ -415,7 +428,6 @@ export function createDaytonaMachineManager({
         woke = true
         continue
       }
-      await resolveSandbox(machine)
       const state = currentState(machine)
       if (state !== 'stopped') {
         machine.state = state
@@ -448,15 +460,18 @@ export function createDaytonaMachineManager({
 
   async function beginActiveJob(machineId, reason) {
     const machine = requireMachine(machineId)
-    await syncFromStore(machine)
+    if ((await syncFromStore(machine)) === null) throw new Error(`unknown machine: ${machineId}`)
     let woke = false
     while (true) {
+      if (!machine.sandbox) {
+        await resolveSandbox(machine)
+        continue
+      }
       if (machine.sleepLock) {
         machine.sleepAborted = true
         await machine.sleepLock
         continue
       }
-      await resolveSandbox(machine)
       if (currentState(machine) === 'stopped' || machine.startLock) {
         const res = await ensureAwake(machineId, reason)
         woke ||= res.woke
@@ -464,6 +479,15 @@ export function createDaytonaMachineManager({
       }
       machine.activeJobs += 1
       machine.lastActivityAt = now()
+      if (store?.beginJob) {
+        const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
+        try {
+          await store.beginJob(machine.id, tenantId, machine.lastActivityAt)
+        } catch (err) {
+          machine.activeJobs -= 1
+          throw err
+        }
+      }
       return { machine, woke }
     }
   }
@@ -544,6 +568,10 @@ export function createDaytonaMachineManager({
     } finally {
       machine.activeJobs -= 1
       machine.lastActivityAt = now()
+      if (store?.endJob) {
+        const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
+        await store.endJob(machine.id, tenantId, machine.lastActivityAt).catch(() => {})
+      }
     }
   }
 
@@ -594,6 +622,7 @@ export function createDaytonaMachineManager({
         size,
         state: sandbox.state ?? 'started',
         sandbox,
+        labels: sandbox.labels ?? labels,
         idleMinutes,
         keepAwake: Boolean(keepAwake),
         activeJobs: 0,
@@ -624,8 +653,15 @@ export function createDaytonaMachineManager({
           liftgate: { signedIn: false },
         },
       }
+      record.persisting = true
+      record.saveQueue = Promise.resolve()
+      record.remoteActiveJobs = 0
       machines.set(record.id, record)
-      await persist(record)
+      try {
+        await persist(record)
+      } finally {
+        record.persisting = false
+      }
       return record
     },
 
@@ -889,9 +925,10 @@ export function createDaytonaMachineManager({
 
     async sleep(machineId, { saveSnapshot = false, snapshotName } = {}) {
       const machine = requireMachine(machineId)
+      if ((await syncFromStore(machine)) === null) return { slept: false, reason: 'deleted' }
       if (machine.sleepLock) return machine.sleepLock
-      if (machine.activeJobs > 0 || machine.startLock) {
-        return { slept: false, reason: 'busy', activeJobs: machine.activeJobs }
+      if (machine.activeJobs > 0 || (machine.remoteActiveJobs ?? 0) > 0 || machine.startLock) {
+        return { slept: false, reason: 'busy', activeJobs: machine.activeJobs + (machine.remoteActiveJobs ?? 0) }
       }
       if (currentState(machine) === 'stopped') {
         return {
@@ -943,7 +980,7 @@ export function createDaytonaMachineManager({
 
     async checkIdleAndSchedule(machineId) {
       const machine = requireMachine(machineId)
-      await syncFromStore(machine)
+      if ((await syncFromStore(machine)) === null) return { action: 'none', reason: 'deleted' }
       const state = currentState(machine)
       if (state === 'stopped') {
         if (machine.nextScheduledAt !== null && machine.nextScheduledAt - now() <= preWakeLeadMs) {
@@ -957,7 +994,7 @@ export function createDaytonaMachineManager({
         await machine.sandbox.refreshActivity?.()
         return { action: 'none', reason: 'keep-awake' }
       }
-      if (machine.activeJobs > 0) return { action: 'none', reason: 'active-jobs' }
+      if (machine.activeJobs > 0 || (machine.remoteActiveJobs ?? 0) > 0) return { action: 'none', reason: 'active-jobs' }
       if (machine.nextScheduledAt !== null && machine.nextScheduledAt - now() <= scheduleHorizonMs) {
         return { action: 'none', reason: 'schedule-due-soon' }
       }
@@ -982,6 +1019,12 @@ export function createDaytonaMachineManager({
     async rehydrate() {
       if (!store) return []
       const rows = await store.loadAll()
+      const seenIds = new Set(rows.map(r => r.id))
+      for (const [id, existing] of machines.entries()) {
+        if (!seenIds.has(id) && !existing.persisting && existing.activeJobs === 0) {
+          machines.delete(id)
+        }
+      }
       const loaded = []
       for (const row of rows) {
         const existing = machines.get(row.id)
@@ -1012,6 +1055,8 @@ export function createDaytonaMachineManager({
           idleMinutes: row.idleMinutes ?? defaultIdleMinutes,
           keepAwake: Boolean(row.keepAwake),
           activeJobs: 0,
+          remoteActiveJobs: row.activeJobs ?? 0,
+          saveQueue: Promise.resolve(),
           activeMutations: 0,
           mutationSeq: 0,
           lastActivityAt: row.lastActivityAt ?? now(),

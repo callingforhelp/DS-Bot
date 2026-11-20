@@ -336,5 +336,43 @@ test('controllers discover newly created machines, scheduler syncs standby polic
   assert.equal((await alice2('POST', `/v1/machines/${id}/policy`, { nextScheduledAt: now + 60_000 })).status, 200)
   const sched = await mgr1.checkIdleAndSchedule(id)
   assert.equal(sched.action, 'pre-woke')
-  assert.equal((await alice1('DELETE', `/v1/machines/${id}`)).status, 200)
+
+  // Standby active job prevents writer from auto-sleeping even after idle threshold passes.
+  let releaseStandbyJob
+  const standbyGate = new Promise(r => { releaseStandbyJob = r })
+  const standbyJob = mgr2.sendMessage(id, {
+    threadId: 'th-busy',
+    botId: 'coder',
+    text: 'working',
+    handler: async () => { await standbyGate; return { reply: 'ok' } },
+  })
+  for (let i = 0; i < 100 && mgr2.getMachine(id).activeJobs === 0; i++) {
+    await new Promise(r => setTimeout(r, 10))
+  }
+  now += 10 * 60_000
+  const idleDuringJob = await mgr1.checkIdleAndSchedule(id)
+  assert.equal(idleDuringJob.action, 'none')
+  assert.equal(idleDuringJob.reason, 'active-jobs')
+  releaseStandbyJob()
+  await standbyJob
+
+  // Concurrent ensureAwake calls after unresolved sandbox still issue only one start().
+  assert.equal((await alice1('POST', `/v1/machines/${id}/sleep`, {})).status, 200)
+  const sbx = mgr1.getMachine(id).sandbox
+  let startCount = 0
+  const origStart = sbx.start.bind(sbx)
+  sbx.start = async () => {
+    startCount += 1
+    await new Promise(r => setTimeout(r, 20))
+    return origStart()
+  }
+  mgr1.getMachine(id).sandbox = null
+  await Promise.all([mgr1.ensureAwake(id, 'a'), mgr1.ensureAwake(id, 'b')])
+  assert.equal(startCount, 1)
+
+  // Deleting on ctl2 prunes the machine from ctl1 on rehydrate/tick.
+  assert.equal((await alice2('DELETE', `/v1/machines/${id}`)).status, 200)
+  await mgr1.rehydrate()
+  assert.equal(mgr1.listMachines().some(m => m.id === id), false)
+  assert.equal((await alice1('GET', `/v1/machines/${id}`)).status, 404)
 })
