@@ -17,6 +17,7 @@ export async function startController({
   host = '127.0.0.1', port = 0, intervalMs = 2000, bucket, log = () => {},
 }) {
   // Tenants in localTenants never reach an external embedding provider: not their events, not their queries.
+  await machines.rehydrate?.()
   const embedderFor = tenant => (localEmbedder && localTenants.includes(tenant) ? localEmbedder : embedder)
   const api = createApi({ pool, embedder, embedderFor, principals, objectStore, machines, messageHandler: machineMessageHandler, approvedSnapshots, ready: async () => { await pool.query('select 1'); return true } })
   const server = await api.listen(port, host)
@@ -53,6 +54,7 @@ export async function startController({
         const stats = await runIndexer(pool, tenant, embedderFor(tenant))
         if (stats.indexed > 0) { state.indexed = (state.indexed ?? 0) + stats.indexed; log('indexed', tenant, stats.indexed, stats.embedFailed ? `embed-failed=${stats.embedFailed}` : '') }
       }
+      await machines.rehydrate?.()
       for (const machine of machines.listMachines()) {
         const idle = await machines.checkIdleAndSchedule(machine.id)
         if (idle.action === 'slept') {
