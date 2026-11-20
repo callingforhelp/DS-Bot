@@ -40,7 +40,7 @@ const machines = env.DAYTONA_API_KEY
   ? createDaytonaMachineManager({ apiKey: env.DAYTONA_API_KEY, store: machineStore })
   : createDaytonaMachineManager({ client: mockDaytonaClient(), store: machineStore })
 
-const machineMessageHandler = env.DS_BOT_DSH_PORT
+const machineMessageHandler = env.DS_BOT_DSH_PORT && env.DS_BOT_DSH_TOKEN
   ? createDshMessageHandler({ port: Number(env.DS_BOT_DSH_PORT), authToken: env.DS_BOT_DSH_TOKEN })
   : undefined
 
@@ -48,7 +48,7 @@ say(`object store: ${haveR2 ? 'Cloudflare R2' : 'LOCAL stand-in (not durable)'}`
 say(`embeddings: ${embedder.model}${embedder.model.startsWith('mock') ? ' (mock; no consent or key)' : ''}`)
 say(`sandboxes: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock (no isolation)'}`)
 say(`persistent machines: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock'}`)
-say(`machine messages: ${machineMessageHandler ? `DSH preview port ${env.DS_BOT_DSH_PORT}` : 'disabled (set DS_BOT_DSH_PORT to enable)'}`)
+say(`machine messages: ${machineMessageHandler ? `DSH preview port ${env.DS_BOT_DSH_PORT}` : 'disabled (set DS_BOT_DSH_PORT and DS_BOT_DSH_TOKEN to enable)'}`)
 
 const localTenants = (env.EMBED_LOCAL_TENANTS ?? '').split(',').map(t => t.trim()).filter(Boolean)
 if (localTenants.length) say(`embeddings for ${localTenants.join(', ')}: local only (EMBED_LOCAL_TENANTS)`)

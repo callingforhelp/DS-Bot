@@ -1,14 +1,39 @@
 // Delivers a user message to the DS-Bot host plugin running inside a Daytona sandbox via DSH's
 // `POST /api/bot` route (`{ endpoint: 'send', payload: { sessionId, text } }`).
-// Uses Daytona's authenticated preview link (`sandbox.getPreviewLink(port)`) so raw chat text is
-// never passed to a shell command.
+// Authenticates through Daytona's preview link (`x-daytona-preview-token`) and obtains a DSH
+// session cookie via `GET /?token=<authToken>` (matching `ds-bot/dev/smoke.mjs`).
 export function createDshMessageHandler({ port, authToken, timeoutMs = 30_000, fetchImpl = fetch } = {}) {
   const portNum = Number(port)
   if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
     throw new Error(`invalid DSH port: ${port}`)
   }
+  if (typeof authToken !== 'string' || authToken.trim() === '') {
+    throw new Error('DSH authToken is required to obtain a session cookie')
+  }
 
-  return async (_machine, sandbox, message) => {
+  const cookieCache = new Map()
+
+  async function loginForCookie(baseUrl, previewToken) {
+    const loginUrl = `${baseUrl}/?token=${encodeURIComponent(authToken)}`
+    const headers = {}
+    if (previewToken) headers['x-daytona-preview-token'] = previewToken
+    const res = await fetchImpl(loginUrl, {
+      method: 'GET',
+      headers,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const rawCookies = typeof res.headers?.getSetCookie === 'function'
+      ? res.headers.getSetCookie()
+      : (res.headers?.get?.('set-cookie') ? [res.headers.get('set-cookie')] : [])
+    const cookies = rawCookies.map(c => String(c).split(';')[0].trim()).filter(Boolean)
+    if (cookies.length === 0) {
+      throw new Error(`DSH login returned no session cookie (HTTP ${res.status})`)
+    }
+    return cookies.join('; ')
+  }
+
+  return async (machine, sandbox, message) => {
     const sessionId = typeof message.threadId === 'string' && message.threadId !== ''
       ? message.threadId
       : (typeof message.botId === 'string' && message.botId !== '' ? message.botId : '')
@@ -22,20 +47,36 @@ export function createDshMessageHandler({ port, authToken, timeoutMs = 30_000, f
     const preview = await sandbox.getPreviewLink(portNum)
     if (!preview?.url) throw new Error(`sandbox did not return a preview URL for port ${portNum}`)
 
-    const url = `${String(preview.url).replace(/\/+$/, '')}/api/bot`
-    const headers = { 'content-type': 'application/json' }
-    if (preview.token) headers['x-daytona-preview-token'] = preview.token
-    if (authToken) headers.authorization = `Bearer ${authToken}`
+    const baseUrl = String(preview.url).replace(/\/+$/, '')
+    const cacheKey = `${machine?.id ?? ''}:${baseUrl}`
 
-    const res = await fetchImpl(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        endpoint: 'send',
-        payload: { sessionId, text },
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    })
+    const postSend = async (cookie) => {
+      const headers = { 'content-type': 'application/json', cookie }
+      if (preview.token) headers['x-daytona-preview-token'] = preview.token
+      return fetchImpl(`${baseUrl}/api/bot`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          endpoint: 'send',
+          payload: { sessionId, text },
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+    }
+
+    let cookie = cookieCache.get(cacheKey)
+    if (!cookie) {
+      cookie = await loginForCookie(baseUrl, preview.token)
+      cookieCache.set(cacheKey, cookie)
+    }
+
+    let res = await postSend(cookie)
+    if (res.status === 401 || res.status === 403) {
+      cookieCache.delete(cacheKey)
+      cookie = await loginForCookie(baseUrl, preview.token)
+      cookieCache.set(cacheKey, cookie)
+      res = await postSend(cookie)
+    }
 
     let json
     try {

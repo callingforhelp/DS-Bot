@@ -597,18 +597,38 @@ test('syncFromStore refreshes stale independent sandbox handle state after remot
   await mgrA.deleteMachine(box.id)
 })
 
-test('createDshMessageHandler delivers messages via sandbox preview /api/bot send and propagates DSH errors', async () => {
-  assert.throws(() => createDshMessageHandler({ port: 0 }), /invalid DSH port/)
+test('createDshMessageHandler authenticates via DSH session cookie, delivers /api/bot send, re-logins on 401, and propagates DSH errors', async () => {
+  assert.throws(() => createDshMessageHandler({ port: 0, authToken: 't' }), /invalid DSH port/)
+  assert.throws(() => createDshMessageHandler({ port: 3000 }), /authToken is required/)
 
   const seenRequests = []
-  let nextResponse = { status: 200, body: { ok: true, value: true } }
+  let activeCookie = 'dsh_session=s1'
+  let loginCount = 0
+  let nextApiResponse = null
   const fakeFetch = async (url, init) => {
-    seenRequests.push({ url, method: init.method, headers: init.headers, body: JSON.parse(init.body) })
-    return {
-      ok: nextResponse.status >= 200 && nextResponse.status < 300,
-      status: nextResponse.status,
-      json: async () => nextResponse.body,
+    const parsedUrl = new URL(url)
+    seenRequests.push({ url, method: init.method, headers: init.headers, body: init.body ? JSON.parse(init.body) : undefined })
+    if (init.method === 'GET' && parsedUrl.pathname === '/' && parsedUrl.searchParams.get('token') === 'dsh-tok') {
+      loginCount += 1
+      activeCookie = `dsh_session=s${loginCount}`
+      return {
+        ok: false,
+        status: 302,
+        headers: { getSetCookie: () => [`${activeCookie}; HttpOnly; Path=/`] },
+      }
     }
+    if (init.method === 'POST' && parsedUrl.pathname === '/api/bot') {
+      if (init.headers.cookie !== activeCookie) {
+        return { ok: false, status: 401, json: async () => ({ ok: false, error: 'unauthorized' }) }
+      }
+      if (nextApiResponse) {
+        const res = nextApiResponse
+        nextApiResponse = null
+        return { ok: res.status >= 200 && res.status < 300, status: res.status, json: async () => res.body }
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, value: true }) }
+    }
+    return { ok: false, status: 404, json: async () => ({ ok: false, error: 'not found' }) }
   }
 
   const client = mockDaytonaClient()
@@ -637,14 +657,21 @@ test('createDshMessageHandler delivers messages via sandbox preview /api/bot sen
   assert.equal(sent.status, 200)
   assert.equal(sent.body.result.result.delivered, true)
   assert.equal(sent.body.result.result.sessionId, 'sess-1')
-  assert.equal(seenRequests.length, 1)
-  assert.match(seenRequests[0].url, /\/api\/bot$/)
-  assert.equal(seenRequests[0].headers['x-daytona-preview-token'], `tok-${id}-3000`)
-  assert.equal(seenRequests[0].headers.authorization, 'Bearer dsh-tok')
-  assert.deepEqual(seenRequests[0].body, { endpoint: 'send', payload: { sessionId: 'sess-1', text: 'Please review PR' } })
+  assert.equal(loginCount, 1)
+  const postReq = seenRequests.find(r => r.method === 'POST')
+  assert.match(postReq.url, /\/api\/bot$/)
+  assert.equal(postReq.headers['x-daytona-preview-token'], `tok-${id}-3000`)
+  assert.equal(postReq.headers.cookie, 'dsh_session=s1')
+  assert.deepEqual(postReq.body, { endpoint: 'send', payload: { sessionId: 'sess-1', text: 'Please review PR' } })
+
+  // Simulate session cookie expiration (401): handler must re-login and retry cleanly.
+  activeCookie = 'dsh_session=expired'
+  const retried = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'sess-1', text: 'after restart' })
+  assert.equal(retried.status, 200)
+  assert.equal(loginCount, 2)
 
   // DSH error response must fail instead of falsely reporting delivery.
-  nextResponse = { status: 200, body: { ok: false, error: { message: 'bot/read-only' } } }
+  nextApiResponse = { status: 200, body: { ok: false, error: { message: 'bot/read-only' } } }
   const failed = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'sess-1', text: 'should fail' })
   assert.equal(failed.status, 500)
 
