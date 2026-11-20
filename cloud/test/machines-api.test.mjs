@@ -517,3 +517,61 @@ test('rehydrate preserves machines created mid-refresh and failed mutations pers
   assert.ok(afterRow.epoch > beforeRow.epoch)
   await mgr.deleteMachine(createdDuringRefresh.id)
 })
+
+test('sleep aborts when standby starts a job during captureState and concurrent rehydrate calls coalesce', async () => {
+  const client = mockDaytonaClient()
+  const store = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+  const writer = createDaytonaMachineManager({ client, store })
+  const standby = createDaytonaMachineManager({ client, store })
+
+  const box = await writer.createMachine({ name: 'sleep-race', labels: { tenant_id: 't1' } })
+  await standby.rehydrate()
+
+  // Pause captureState inside writer.sleep() by delaying downloadFile.
+  const sbx = writer.getMachine(box.id).sandbox
+  const origDownload = sbx.fs.downloadFile.bind(sbx.fs)
+  let enteredDownload
+  const downloadStarted = new Promise(r => { enteredDownload = r })
+  let releaseDownload
+  const downloadGate = new Promise(r => { releaseDownload = r })
+  sbx.fs.downloadFile = async (p) => {
+    enteredDownload()
+    await downloadGate
+    return origDownload(p)
+  }
+
+  const sleepPromise = writer.sleep(box.id)
+  await downloadStarted
+
+  // Standby starts a job while writer is mid-captureState.
+  const msgPromise = standby.sendMessage(box.id, {
+    threadId: 'th-cap',
+    botId: 'coder',
+    text: 'hi',
+    handler: async () => ({ reply: 'ok' }),
+  })
+  const msgRes = await msgPromise
+  assert.equal(msgRes.seq, 2)
+
+  releaseDownload()
+  const sleepRes = await sleepPromise
+  assert.equal(sleepRes.slept, false)
+  assert.equal(sleepRes.reason, 'aborted')
+  assert.equal(sbx.state, 'started')
+  sbx.fs.downloadFile = origDownload
+
+  // Concurrent rehydrate() calls on a fresh manager coalesce into one client.get().
+  let getCalls = 0
+  const origGet = client.get.bind(client)
+  client.get = async (sid) => {
+    getCalls += 1
+    await new Promise(r => setTimeout(r, 20))
+    return origGet(sid)
+  }
+  const fresh = createDaytonaMachineManager({ client, store })
+  await Promise.all([fresh.rehydrate(), fresh.rehydrate()])
+  assert.equal(getCalls, 1)
+
+  client.get = origGet
+  await standby.deleteMachine(box.id)
+})

@@ -280,6 +280,7 @@ export function createDaytonaMachineManager({
 
   const machines = new Map()
   let createOrder = 0
+  let rehydrateInFlight = null
 
   function serializeMachine(machine) {
     const labels = machine.sandbox?.labels ?? machine.labels ?? {}
@@ -488,6 +489,11 @@ export function createDaytonaMachineManager({
           await store.beginJob(machine.id, tenantId, jobId, machine.lastActivityAt, jobLeaseMs)
         } catch (err) {
           machine.activeJobs -= 1
+          if (err?.code === 'MACHINE_SLEEPING') {
+            await new Promise(r => setTimeout(r, 20))
+            await syncFromStore(machine)
+            continue
+          }
           throw err
         }
       }
@@ -515,7 +521,7 @@ export function createDaytonaMachineManager({
     return readBotStateFile(sandbox, pathPosix.join(home, '.ds-bot', 'bot', 'state.json'))
   }
 
-  async function captureState(machineId, { roster, threads, projects } = {}) {
+  async function captureState(machineId, { roster, threads, projects, skipPersist = false } = {}) {
     const machine = requireMachine(machineId)
     if (currentState(machine) !== 'started') {
       throw new Error(`cannot capture live state while machine ${machineId} is ${currentState(machine)}`)
@@ -541,7 +547,7 @@ export function createDaytonaMachineManager({
     }
     machine.cache.capturedSeq = machine.seq
     machine.cache.capturedEpoch = machine.epoch
-    await persist(machine)
+    if (!skipPersist) await persist(machine)
     return {
       capturedSeq: machine.cache.capturedSeq,
       capturedEpoch: machine.cache.capturedEpoch,
@@ -962,10 +968,16 @@ export function createDaytonaMachineManager({
       }
       machine.sleepAborted = false
       const aborted = () => ({ slept: false, reason: 'aborted' })
+      const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
+      const sleepToken = randomUUID()
       let sleepPromise
       sleepPromise = (async () => {
         try {
-          await captureState(machineId)
+          if (store?.beginSleep) {
+            const started = await store.beginSleep(machineId, tenantId, sleepToken, now())
+            if (!started.ok) return { slept: false, reason: started.reason }
+          }
+          await captureState(machineId, { skipPersist: true })
           if (machine.sleepAborted || machine.activeJobs > 0) {
             machine.cache.fresh = false
             return aborted()
@@ -976,6 +988,13 @@ export function createDaytonaMachineManager({
             if (machine.sleepAborted || machine.activeJobs > 0) {
               machine.cache.fresh = false
               return aborted()
+            }
+          }
+          if (store?.commitSleep) {
+            const committed = await store.commitSleep(machineId, tenantId, sleepToken, now())
+            if (!committed.ok) {
+              machine.cache.fresh = false
+              return { slept: false, reason: committed.reason }
             }
           }
           await safeStop(machine.sandbox)
@@ -990,6 +1009,7 @@ export function createDaytonaMachineManager({
             ...(resolvedSnap ? { snapshotName: resolvedSnap } : {}),
           }
         } finally {
+          if (store?.endSleep) await store.endSleep(machineId, tenantId, sleepToken).catch(() => {})
           if (machine.sleepLock === sleepPromise) {
             machine.sleepLock = null
             machine.sleepAborted = false
@@ -1047,78 +1067,98 @@ export function createDaytonaMachineManager({
 
     async rehydrate() {
       if (!store) return []
-      const startOrder = createOrder
-      const rows = await store.loadAll()
-      const seenIds = new Set(rows.map(r => r.id))
-      for (const [id, existing] of machines.entries()) {
-        if (!seenIds.has(id) && !existing.persisting && existing.activeJobs === 0 && (existing.createOrder ?? 0) <= startOrder) {
-          machines.delete(id)
-        }
-      }
-      const loaded = []
-      for (const row of rows) {
-        const existing = machines.get(row.id)
-        if (existing) {
-          if (!existing.sandbox) {
-            try {
-              existing.sandbox = await client.get(row.id)
-              existing.state = existing.sandbox?.state ?? existing.state
-            } catch {
-              // Keep sandbox null so the next operation retries client.get().
+      if (rehydrateInFlight) return rehydrateInFlight
+      rehydrateInFlight = (async () => {
+        try {
+          const startOrder = createOrder
+          const rows = await store.loadAll()
+          const seenIds = new Set(rows.map(r => r.id))
+          for (const [id, existing] of machines.entries()) {
+            if (!seenIds.has(id) && !existing.persisting && existing.activeJobs === 0 && (existing.createOrder ?? 0) <= startOrder) {
+              machines.delete(id)
             }
           }
-          continue
+          const loaded = []
+          for (const row of rows) {
+            const existing = machines.get(row.id)
+            if (existing) {
+              if (!existing.sandbox) {
+                try {
+                  const fetched = await client.get(row.id)
+                  const cur = machines.get(row.id)
+                  if (cur && !cur.sandbox) {
+                    cur.sandbox = fetched
+                    cur.state = fetched?.state ?? cur.state
+                  }
+                } catch {
+                  // Keep sandbox null so the next operation retries client.get().
+                }
+              }
+              continue
+            }
+            let sandbox = null
+            try {
+              sandbox = await client.get(row.id)
+            } catch {
+              sandbox = null
+            }
+            const concurrent = machines.get(row.id)
+            if (concurrent) {
+              if (!concurrent.sandbox && sandbox) {
+                concurrent.sandbox = sandbox
+                concurrent.state = sandbox.state ?? concurrent.state
+              }
+              continue
+            }
+            const record = {
+              id: row.id,
+              name: row.name,
+              size: row.size ?? 'small',
+              state: sandbox?.state ?? row.state ?? 'stopped',
+              sandbox,
+              labels: row.labels ?? {},
+              idleMinutes: row.idleMinutes ?? defaultIdleMinutes,
+              keepAwake: Boolean(row.keepAwake),
+              activeJobs: 0,
+              remoteBusyUntil: row.busyUntil ?? null,
+              saveQueue: Promise.resolve(),
+              activeMutations: 0,
+              mutationSeq: 0,
+              lastActivityAt: row.lastActivityAt ?? now(),
+              epoch: row.epoch ?? 1,
+              seq: row.seq ?? 0,
+              version: row.version ?? 1,
+              nextScheduledAt: row.nextScheduledAt ?? null,
+              pendingResize: row.pendingResize ?? null,
+              sleepLock: null,
+              sleepAborted: false,
+              startLock: null,
+              cache: {
+                fresh: Boolean(row.cache?.fresh),
+                capturedSeq: row.cache?.capturedSeq ?? 0,
+                capturedEpoch: row.cache?.capturedEpoch ?? 0,
+                stoppedAt: row.cache?.stoppedAt ?? null,
+                roster: row.cache?.roster ?? null,
+                threads: new Map(Object.entries(row.cache?.threads ?? {})),
+                readings: new Map(Object.entries(row.cache?.readings ?? {})),
+                projects: Array.isArray(row.cache?.projects) ? row.cache.projects : [],
+              },
+              clis: {
+                codex: { signedIn: false },
+                claude: { signedIn: false },
+                agy: { signedIn: false },
+                liftgate: { signedIn: false },
+              },
+            }
+            machines.set(record.id, record)
+            loaded.push(record)
+          }
+          return loaded
+        } finally {
+          rehydrateInFlight = null
         }
-        let sandbox = null
-        try {
-          sandbox = await client.get(row.id)
-        } catch {
-          sandbox = null
-        }
-        const record = {
-          id: row.id,
-          name: row.name,
-          size: row.size ?? 'small',
-          state: sandbox?.state ?? row.state ?? 'stopped',
-          sandbox,
-          labels: row.labels ?? {},
-          idleMinutes: row.idleMinutes ?? defaultIdleMinutes,
-          keepAwake: Boolean(row.keepAwake),
-          activeJobs: 0,
-          remoteBusyUntil: row.busyUntil ?? null,
-          saveQueue: Promise.resolve(),
-          activeMutations: 0,
-          mutationSeq: 0,
-          lastActivityAt: row.lastActivityAt ?? now(),
-          epoch: row.epoch ?? 1,
-          seq: row.seq ?? 0,
-          version: row.version ?? 1,
-          nextScheduledAt: row.nextScheduledAt ?? null,
-          pendingResize: row.pendingResize ?? null,
-          sleepLock: null,
-          sleepAborted: false,
-          startLock: null,
-          cache: {
-            fresh: Boolean(row.cache?.fresh),
-            capturedSeq: row.cache?.capturedSeq ?? 0,
-            capturedEpoch: row.cache?.capturedEpoch ?? 0,
-            stoppedAt: row.cache?.stoppedAt ?? null,
-            roster: row.cache?.roster ?? null,
-            threads: new Map(Object.entries(row.cache?.threads ?? {})),
-            readings: new Map(Object.entries(row.cache?.readings ?? {})),
-            projects: Array.isArray(row.cache?.projects) ? row.cache.projects : [],
-          },
-          clis: {
-            codex: { signedIn: false },
-            claude: { signedIn: false },
-            agy: { signedIn: false },
-            liftgate: { signedIn: false },
-          },
-        }
-        machines.set(record.id, record)
-        loaded.push(record)
-      }
-      return loaded
+      })()
+      return rehydrateInFlight
     },
   }
 }

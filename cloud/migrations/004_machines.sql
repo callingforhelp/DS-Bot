@@ -15,6 +15,7 @@ create table machines (
   seq integer not null default 0,
   version bigint not null default 1,
   job_leases jsonb not null default '{}'::jsonb,
+  sleep_lease jsonb,
   last_activity_at bigint not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()

@@ -164,17 +164,74 @@ export function pgMachineStore({ pool, tenants = [] }) {
       const nowAt = Number(at)
       const expiresAt = nowAt + Number(leaseMs)
       await withScope(pool, { tenant }, async (c) => {
-        const cur = await c.query('select job_leases from machines where tenant_id = $1 and machine_id = $2 for update', [tenant, machineId])
+        const cur = await c.query('select job_leases, sleep_lease from machines where tenant_id = $1 and machine_id = $2 for update', [tenant, machineId])
         if (cur.rowCount === 0) return
+        const sl = cur.rows[0].sleep_lease
+        if (sl && Number(sl.expiresAt) > nowAt && sl.phase === 'stopping') {
+          const err = new Error(`machine ${machineId} is currently stopping`)
+          err.code = 'MACHINE_SLEEPING'
+          throw err
+        }
         const leases = pruneLeases(cur.rows[0].job_leases, nowAt)
         leases[jobId] = expiresAt
         await c.query(
           `update machines
               set job_leases = $3::jsonb,
+                  sleep_lease = null,
                   last_activity_at = greatest(last_activity_at, $4::bigint),
                   updated_at = now()
             where tenant_id = $1 and machine_id = $2`,
           [tenant, machineId, JSON.stringify(leases), nowAt],
+        )
+      })
+    },
+
+    async beginSleep(machineId, tenantId, token, at, ttlMs = 60_000) {
+      const tenant = tenantId ?? 'default'
+      const nowAt = Number(at)
+      return withScope(pool, { tenant }, async (c) => {
+        const cur = await c.query('select job_leases, sleep_lease from machines where tenant_id = $1 and machine_id = $2 for update', [tenant, machineId])
+        if (cur.rowCount === 0) return { ok: false, reason: 'deleted' }
+        const leases = pruneLeases(cur.rows[0].job_leases, nowAt)
+        if (Object.keys(leases).length > 0) return { ok: false, reason: 'busy' }
+        const sl = cur.rows[0].sleep_lease
+        if (sl && Number(sl.expiresAt) > nowAt && sl.token !== token) return { ok: false, reason: 'busy' }
+        await c.query(
+          `update machines set sleep_lease = $3::jsonb, updated_at = now() where tenant_id = $1 and machine_id = $2`,
+          [tenant, machineId, JSON.stringify({ token, phase: 'capturing', expiresAt: nowAt + Number(ttlMs) })],
+        )
+        return { ok: true }
+      })
+    },
+
+    async commitSleep(machineId, tenantId, token, at, ttlMs = 60_000) {
+      const tenant = tenantId ?? 'default'
+      const nowAt = Number(at)
+      return withScope(pool, { tenant }, async (c) => {
+        const cur = await c.query('select job_leases, sleep_lease from machines where tenant_id = $1 and machine_id = $2 for update', [tenant, machineId])
+        if (cur.rowCount === 0) return { ok: false, reason: 'deleted' }
+        const leases = pruneLeases(cur.rows[0].job_leases, nowAt)
+        const sl = cur.rows[0].sleep_lease
+        if (Object.keys(leases).length > 0 || !sl || sl.token !== token || Number(sl.expiresAt) <= nowAt) {
+          return { ok: false, reason: 'aborted' }
+        }
+        await c.query(
+          `update machines set sleep_lease = $3::jsonb, updated_at = now() where tenant_id = $1 and machine_id = $2`,
+          [tenant, machineId, JSON.stringify({ token, phase: 'stopping', expiresAt: nowAt + Number(ttlMs) })],
+        )
+        return { ok: true }
+      })
+    },
+
+    async endSleep(machineId, tenantId, token) {
+      const tenant = tenantId ?? 'default'
+      await withScope(pool, { tenant }, async (c) => {
+        await c.query(
+          `update machines
+              set sleep_lease = case when sleep_lease->>'token' = $3 then null else sleep_lease end,
+                  updated_at = now()
+            where tenant_id = $1 and machine_id = $2`,
+          [tenant, machineId, token],
         )
       })
     },
