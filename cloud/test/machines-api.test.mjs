@@ -575,3 +575,23 @@ test('sleep aborts when standby starts a job during captureState and concurrent 
   client.get = origGet
   await standby.deleteMachine(box.id)
 })
+
+test('syncFromStore refreshes stale independent sandbox handle state after remote sleep', async () => {
+  const client = mockDaytonaClient()
+  const store = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+  const mgrA = createDaytonaMachineManager({ client, store })
+  const mgrB = createDaytonaMachineManager({ client, store })
+
+  const box = await mgrA.createMachine({ name: 'handle-sync', labels: { tenant_id: 't1' } })
+  await mgrB.rehydrate()
+
+  // Give mgrB an independent snapshot handle whose .state stays stale ('started') after mgrA sleeps.
+  const realSbx = client.sandboxes.get(box.id).sandbox
+  mgrB.getMachine(box.id).sandbox = { ...realSbx, state: 'started' }
+
+  await mgrA.sleep(box.id)
+  const execRes = await mgrB.execCommand(box.id, 'echo awake')
+  assert.equal(execRes.woke, true)
+  assert.equal(execRes.exitCode, 0)
+  await mgrA.deleteMachine(box.id)
+})

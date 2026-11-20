@@ -343,6 +343,9 @@ export function createDaytonaMachineManager({
     machine.name = latest.name
     machine.size = latest.size ?? machine.size
     machine.state = latest.state ?? machine.state
+    if (machine.sandbox && latest.state && machine.sandbox.state !== latest.state) {
+      machine.sandbox = null
+    }
     machine.idleMinutes = latest.idleMinutes ?? machine.idleMinutes
     machine.keepAwake = Boolean(latest.keepAwake)
     machine.nextScheduledAt = latest.nextScheduledAt ?? null
