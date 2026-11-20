@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { after, before, test } from 'node:test'
 import { apiClient } from '../src/client.mjs'
 import { startController } from '../src/controller-service.mjs'
+import { createDaytonaMachineManager, mockDaytonaClient } from '../src/daytona-machine.mjs'
 import { mockEmbedder } from '../src/embed.mjs'
 import { localObjectStore } from '../src/objectstore.mjs'
 import { mockDaytona } from '../src/worker.mjs'
@@ -75,4 +76,54 @@ test('a tenant listed as local never sends its search queries to the external em
   const as = apiClient({ baseUrl: ctl.base, principal: 'bob', secret: 'b', tenant: 't-local' })
   await as('POST', '/v1/search', { project_id: 'p', query: 'private words for the local tenant' })
   assert.deepEqual(external, [])
+})
+
+test('the writer controller sleeps idle persistent machines and pre-wakes them before scheduled work', async () => {
+  while (started.length > 0) await started.pop().stop()
+  let now = 2_000_000
+  const clock = () => now
+  const machines = createDaytonaMachineManager({
+    client: mockDaytonaClient({ now: clock }),
+    now: clock,
+    defaultIdleMinutes: 5,
+    scheduleHorizonMs: 5 * 60_000,
+    preWakeLeadMs: 2 * 60_000,
+  })
+  const ctl = await startController({
+    pool: db.pool,
+    principals,
+    embedder: mockEmbedder(),
+    instance: 'ctl-machines',
+    intervalMs: 60_000,
+    provider: mockDaytona(),
+    machines,
+    bucket: 'artifacts',
+    objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-objects-')), secret: 's' }),
+  })
+  started.push(ctl)
+
+  await waitFor(() => ctl.state.writer === true)
+  const machine = await ctl.machines.createMachine({ name: 'ctl-sleep-box', idleMinutes: 5 })
+  await ctl.machines.captureState(machine.id, { roster: { planner: 'argon', reviewer: 'gpt-6.2-sol' } })
+  await ctl.machines.setIdlePolicy(machine.id, { nextScheduledAt: now + 15 * 60_000 })
+
+  // Idle for 6 minutes while scheduled work is still 9 minutes out (> 5m horizon): drains and sleeps.
+  now += 6 * 60_000
+  await waitFor(async () => { await ctl.tick(); return ctl.state.machinesSlept === 1 })
+  assert.equal(ctl.state.writer, true)
+  assert.equal(ctl.state.machinesSlept, 1)
+  assert.equal(machine.sandbox.state, 'stopped')
+
+  // Serving roster while asleep does not wake the sandbox.
+  const cached = await ctl.machines.readRoster(machine.id)
+  assert.equal(cached.fromCache, true)
+  assert.equal(cached.woke, false)
+  assert.equal(cached.value.reviewer, 'gpt-6.2-sol')
+  assert.equal(machine.sandbox.state, 'stopped')
+
+  // Advancing 8 more minutes puts scheduled work 1 minute away (<= 2m pre-wake lead): wakes on tick.
+  now += 8 * 60_000
+  await waitFor(async () => { await ctl.tick(); return ctl.state.machinesPreWoke === 1 })
+  assert.equal(ctl.state.machinesPreWoke, 1)
+  assert.equal(machine.sandbox.state, 'started')
 })
