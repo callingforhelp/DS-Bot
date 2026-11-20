@@ -273,9 +273,13 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     return machines
   }
 
-  const requireTenantMachine = (p, machineId) => {
+  const requireTenantMachine = async (p, machineId) => {
     const mgr = requireMachines()
-    const m = mgr.listMachines().find(item => item.id === machineId)
+    let m = mgr.listMachines().find(item => item.id === machineId)
+    if (!m && mgr.rehydrate) {
+      await mgr.rehydrate()
+      m = mgr.listMachines().find(item => item.id === machineId)
+    }
     if (!m || machineLabels(m).tenant_id !== p.tenant) throw new HttpError(404, 'no such machine')
     return m
   }
@@ -306,6 +310,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     const mgr = requireMachines()
     if (pathname === '/v1/machines') {
       if (req.method === 'GET') {
+        await mgr.rehydrate?.()
         const list = mgr.listMachines().filter(m => machineLabels(m).tenant_id === p.tenant).map(summarizeMachine)
         return { status: 200, json: { machines: list } }
       }
@@ -336,7 +341,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     const parts = pathname.slice('/v1/machines/'.length).split('/')
     let machineId
     try { machineId = decodeURIComponent(parts[0]) } catch { throw new HttpError(400, 'bad machine id') }
-    const machine = requireTenantMachine(p, machineId)
+    const machine = await requireTenantMachine(p, machineId)
 
     if (parts.length === 1) {
       if (req.method === 'GET') return { status: 200, json: { machine: summarizeMachine(machine) } }
@@ -381,7 +386,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
       }
       if (parts[1] === 'policy') {
         await mgr.setIdlePolicy(machineId, { idleMinutes: input.idleMinutes, keepAwake: input.keepAwake, nextScheduledAt: input.nextScheduledAt })
-        return { status: 200, json: { machine: summarizeMachine(requireTenantMachine(p, machineId)) } }
+        return { status: 200, json: { machine: summarizeMachine(await requireTenantMachine(p, machineId)) } }
       }
     }
     throw new HttpError(404, 'not found')

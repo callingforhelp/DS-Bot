@@ -54,6 +54,7 @@ export async function startController({
         const stats = await runIndexer(pool, tenant, embedderFor(tenant))
         if (stats.indexed > 0) { state.indexed = (state.indexed ?? 0) + stats.indexed; log('indexed', tenant, stats.indexed, stats.embedFailed ? `embed-failed=${stats.embedFailed}` : '') }
       }
+      await machines.rehydrate?.()
       for (const machine of machines.listMachines()) {
         const idle = await machines.checkIdleAndSchedule(machine.id)
         if (idle.action === 'slept') {

@@ -311,8 +311,13 @@ export function createDaytonaMachineManager({
 
   async function persist(machine) {
     if (!store) return
-    const saved = await store.save(serializeMachine(machine))
-    if (saved?.version !== undefined) machine.version = saved.version
+    const queue = machine.saveQueue ?? Promise.resolve()
+    const run = queue.then(async () => {
+      const saved = await store.save(serializeMachine(machine))
+      if (saved?.version !== undefined) machine.version = saved.version
+    })
+    machine.saveQueue = run.catch(() => {})
+    return run
   }
 
   async function syncFromStore(machine) {
@@ -938,6 +943,7 @@ export function createDaytonaMachineManager({
 
     async checkIdleAndSchedule(machineId) {
       const machine = requireMachine(machineId)
+      await syncFromStore(machine)
       const state = currentState(machine)
       if (state === 'stopped') {
         if (machine.nextScheduledAt !== null && machine.nextScheduledAt - now() <= preWakeLeadMs) {

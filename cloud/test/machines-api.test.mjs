@@ -292,3 +292,49 @@ test('concurrent store refresh never overwrites in-flight machine mutations', as
   assert.equal(stored.seq, 0)
   await mgrB.deleteMachine(box.id)
 })
+
+test('controllers discover newly created machines, scheduler syncs standby policy changes, and concurrent same-controller saves serialize cleanly', async () => {
+  let now = 3_000_000
+  const clock = () => now
+  const client = mockDaytonaClient({ now: clock })
+  const store = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+
+  const mgr1 = createDaytonaMachineManager({ client, store, now: clock, defaultIdleMinutes: 5, preWakeLeadMs: 2 * 60_000 })
+  const mgr2 = createDaytonaMachineManager({ client, store, now: clock, defaultIdleMinutes: 5, preWakeLeadMs: 2 * 60_000 })
+  const ctl1 = await startController({
+    pool: db.pool, principals, embedder: mockEmbedder(), instance: 'ctl-sync-1', intervalMs: 60_000,
+    provider: mockDaytona(), machines: mgr1, bucket: 'artifacts',
+    objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-sync-1-')), secret: 's' }),
+  })
+  const ctl2 = await startController({
+    pool: db.pool, principals, embedder: mockEmbedder(), instance: 'ctl-sync-2', intervalMs: 60_000,
+    provider: mockDaytona(), machines: mgr2, bucket: 'artifacts',
+    objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-sync-2-')), secret: 's' }),
+  })
+  started.push(ctl1, ctl2)
+
+  // Machine created on ctl1 AFTER ctl2 started is immediately discoverable on ctl2.
+  const alice1 = apiClient({ baseUrl: ctl1.base, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
+  const alice2 = apiClient({ baseUrl: ctl2.base, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
+  const created = await alice1('POST', '/v1/machines', { name: 'cross-ctl-box' })
+  assert.equal(created.status, 201)
+  const id = created.body.machine.id
+
+  assert.equal((await alice2('GET', '/v1/machines')).body.machines.some(m => m.id === id), true)
+  assert.equal((await alice2('GET', `/v1/machines/${id}`)).status, 200)
+
+  // Concurrent exec calls on ctl1 serialize their Postgres saves instead of colliding with 409.
+  const [execA, execB] = await Promise.all([
+    alice1('POST', `/v1/machines/${id}/exec`, { script: 'echo a' }),
+    alice1('POST', `/v1/machines/${id}/exec`, { script: 'echo b' }),
+  ])
+  assert.equal(execA.status, 200)
+  assert.equal(execB.status, 200)
+
+  // Put machine to sleep, update nextScheduledAt via ctl2, and verify ctl1's checkIdleAndSchedule pre-wakes it.
+  assert.equal((await alice1('POST', `/v1/machines/${id}/sleep`, {})).status, 200)
+  assert.equal((await alice2('POST', `/v1/machines/${id}/policy`, { nextScheduledAt: now + 60_000 })).status, 200)
+  const sched = await mgr1.checkIdleAndSchedule(id)
+  assert.equal(sched.action, 'pre-woke')
+  assert.equal((await alice1('DELETE', `/v1/machines/${id}`)).status, 200)
+})
