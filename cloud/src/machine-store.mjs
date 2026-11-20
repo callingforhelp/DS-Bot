@@ -16,7 +16,7 @@ function rowToRecord(r) {
     epoch: r.epoch,
     seq: r.seq,
     version: Number(r.version ?? 1),
-    activeJobs: Number(r.active_jobs ?? 0),
+    busyUntil: r.busy_until === null ? null : Number(r.busy_until),
     lastActivityAt: Number(r.last_activity_at),
   }
 }
@@ -32,7 +32,7 @@ export function pgMachineStore({ pool, tenants = [] }) {
         await withScope(pool, { tenant }, async (c) => {
           const res = await c.query(
             `select tenant_id, machine_id, name, size, state, idle_minutes, keep_awake,
-                    next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, active_jobs, last_activity_at
+                    next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, busy_until, last_activity_at
                from machines
               where tenant_id = $1
               order by created_at asc`,
@@ -49,7 +49,7 @@ export function pgMachineStore({ pool, tenants = [] }) {
       return withScope(pool, { tenant }, async (c) => {
         const res = await c.query(
           `select tenant_id, machine_id, name, size, state, idle_minutes, keep_awake,
-                  next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, active_jobs, last_activity_at
+                  next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, busy_until, last_activity_at
              from machines
             where tenant_id = $1 and machine_id = $2`,
           [tenant, machineId],
@@ -139,16 +139,17 @@ export function pgMachineStore({ pool, tenants = [] }) {
       })
     },
 
-    async beginJob(machineId, tenantId, at) {
+    async beginJob(machineId, tenantId, at, leaseMs = 5 * 60_000) {
       const tenant = tenantId ?? 'default'
+      const busyUntil = Number(at) + Number(leaseMs)
       await withScope(pool, { tenant }, async (c) => {
         await c.query(
           `update machines
-              set active_jobs = active_jobs + 1,
-                  last_activity_at = greatest(last_activity_at, $3),
+              set busy_until = greatest(coalesce(busy_until, 0), $4::bigint),
+                  last_activity_at = greatest(last_activity_at, $3::bigint),
                   updated_at = now()
             where tenant_id = $1 and machine_id = $2`,
-          [tenant, machineId, at],
+          [tenant, machineId, at, busyUntil],
         )
       })
     },
@@ -158,7 +159,7 @@ export function pgMachineStore({ pool, tenants = [] }) {
       await withScope(pool, { tenant }, async (c) => {
         await c.query(
           `update machines
-              set active_jobs = greatest(0, active_jobs - 1),
+              set busy_until = null,
                   last_activity_at = greatest(last_activity_at, $3),
                   updated_at = now()
             where tenant_id = $1 and machine_id = $2`,

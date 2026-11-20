@@ -14,7 +14,7 @@ create table machines (
   epoch integer not null default 1,
   seq integer not null default 0,
   version bigint not null default 1,
-  active_jobs integer not null default 0,
+  busy_until bigint,
   last_activity_at bigint not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()

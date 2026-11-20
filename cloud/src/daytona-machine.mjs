@@ -334,7 +334,7 @@ export function createDaytonaMachineManager({
       }
       return machine
     }
-    machine.remoteActiveJobs = latest.activeJobs ?? 0
+    machine.remoteBusyUntil = latest.busyUntil ?? null
     machine.lastActivityAt = Math.max(machine.lastActivityAt, latest.lastActivityAt ?? 0)
     if (latest.version === machine.version) return machine
     machine.name = latest.name
@@ -655,10 +655,14 @@ export function createDaytonaMachineManager({
       }
       record.persisting = true
       record.saveQueue = Promise.resolve()
-      record.remoteActiveJobs = 0
+      record.remoteBusyUntil = null
       machines.set(record.id, record)
       try {
         await persist(record)
+      } catch (err) {
+        machines.delete(record.id)
+        await client.delete(sandbox).catch(() => {})
+        throw err
       } finally {
         record.persisting = false
       }
@@ -926,9 +930,11 @@ export function createDaytonaMachineManager({
     async sleep(machineId, { saveSnapshot = false, snapshotName } = {}) {
       const machine = requireMachine(machineId)
       if ((await syncFromStore(machine)) === null) return { slept: false, reason: 'deleted' }
+      await resolveSandbox(machine)
       if (machine.sleepLock) return machine.sleepLock
-      if (machine.activeJobs > 0 || (machine.remoteActiveJobs ?? 0) > 0 || machine.startLock) {
-        return { slept: false, reason: 'busy', activeJobs: machine.activeJobs + (machine.remoteActiveJobs ?? 0) }
+      const remoteBusy = (machine.remoteBusyUntil ?? 0) > now()
+      if (machine.activeJobs > 0 || remoteBusy || machine.startLock) {
+        return { slept: false, reason: 'busy', activeJobs: machine.activeJobs + (remoteBusy ? 1 : 0) }
       }
       if (currentState(machine) === 'stopped') {
         return {
@@ -994,7 +1000,7 @@ export function createDaytonaMachineManager({
         await machine.sandbox.refreshActivity?.()
         return { action: 'none', reason: 'keep-awake' }
       }
-      if (machine.activeJobs > 0 || (machine.remoteActiveJobs ?? 0) > 0) return { action: 'none', reason: 'active-jobs' }
+      if (machine.activeJobs > 0 || (machine.remoteBusyUntil ?? 0) > now()) return { action: 'none', reason: 'active-jobs' }
       if (machine.nextScheduledAt !== null && machine.nextScheduledAt - now() <= scheduleHorizonMs) {
         return { action: 'none', reason: 'schedule-due-soon' }
       }
@@ -1055,7 +1061,7 @@ export function createDaytonaMachineManager({
           idleMinutes: row.idleMinutes ?? defaultIdleMinutes,
           keepAwake: Boolean(row.keepAwake),
           activeJobs: 0,
-          remoteActiveJobs: row.activeJobs ?? 0,
+          remoteBusyUntil: row.busyUntil ?? null,
           saveQueue: Promise.resolve(),
           activeMutations: 0,
           mutationSeq: 0,

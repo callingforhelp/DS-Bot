@@ -338,6 +338,7 @@ test('controllers discover newly created machines, scheduler syncs standby polic
   assert.equal(sched.action, 'pre-woke')
 
   // Standby active job prevents writer from auto-sleeping even after idle threshold passes.
+  assert.equal((await alice2('POST', `/v1/machines/${id}/policy`, { idleMinutes: 1, nextScheduledAt: null })).status, 200)
   let releaseStandbyJob
   const standbyGate = new Promise(r => { releaseStandbyJob = r })
   const standbyJob = mgr2.sendMessage(id, {
@@ -349,7 +350,7 @@ test('controllers discover newly created machines, scheduler syncs standby polic
   for (let i = 0; i < 100 && mgr2.getMachine(id).activeJobs === 0; i++) {
     await new Promise(r => setTimeout(r, 10))
   }
-  now += 10 * 60_000
+  now += 2 * 60_000
   const idleDuringJob = await mgr1.checkIdleAndSchedule(id)
   assert.equal(idleDuringJob.action, 'none')
   assert.equal(idleDuringJob.reason, 'active-jobs')
@@ -375,4 +376,39 @@ test('controllers discover newly created machines, scheduler syncs standby polic
   await mgr1.rehydrate()
   assert.equal(mgr1.listMachines().some(m => m.id === id), false)
   assert.equal((await alice1('GET', `/v1/machines/${id}`)).status, 404)
+})
+
+test('expired job lease allows auto-sleep, sleep resolves unresolved sandbox, and failed initial save cleans up sandbox', async () => {
+  let now = 4_000_000
+  const clock = () => now
+  const client = mockDaytonaClient({ now: clock })
+  const store = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+  const mgr = createDaytonaMachineManager({ client, store, now: clock, defaultIdleMinutes: 5 })
+
+  const box = await mgr.createMachine({ name: 'lease-box', labels: { tenant_id: 't1' } })
+
+  // Simulate a crashed controller that called beginJob without endJob (60s lease).
+  await store.beginJob(box.id, 't1', now, 60_000)
+  now += 30_000
+  assert.deepEqual(await mgr.checkIdleAndSchedule(box.id), { action: 'none', reason: 'active-jobs' })
+
+  // Once the 60s job lease AND 5m idle interval expire, auto-sleep proceeds cleanly.
+  now += 6 * 60_000
+  const slept = await mgr.checkIdleAndSchedule(box.id)
+  assert.equal(slept.action, 'slept')
+
+  // Wake, clear sandbox reference, and verify sleep() resolves it instead of throwing.
+  await mgr.ensureAwake(box.id)
+  mgr.getMachine(box.id).sandbox = null
+  const explicitSleep = await mgr.sleep(box.id)
+  assert.equal(explicitSleep.slept, true)
+  await mgr.deleteMachine(box.id)
+
+  // Failed initial store.save() must clean up the allocated Daytona sandbox.
+  const beforeCount = client.sandboxes.size
+  const failingStore = { ...store, save: async () => { throw new Error('db down') } }
+  const failMgr = createDaytonaMachineManager({ client, store: failingStore, now: clock })
+  await assert.rejects(failMgr.createMachine({ name: 'orphan-check', labels: { tenant_id: 't1' } }), /db down/)
+  assert.equal(client.sandboxes.size, beforeCount)
+  assert.equal(failMgr.listMachines().length, 0)
 })
