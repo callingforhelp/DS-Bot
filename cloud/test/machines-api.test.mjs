@@ -7,6 +7,7 @@ import { createApi } from '../src/api.mjs'
 import { apiClient } from '../src/client.mjs'
 import { startController } from '../src/controller-service.mjs'
 import { createDaytonaMachineManager, mockDaytonaClient } from '../src/daytona-machine.mjs'
+import { createDshMessageHandler } from '../src/dsh-handler.mjs'
 import { mockEmbedder } from '../src/embed.mjs'
 import { pgMachineStore } from '../src/machine-store.mjs'
 import { localObjectStore } from '../src/objectstore.mjs'
@@ -594,4 +595,89 @@ test('syncFromStore refreshes stale independent sandbox handle state after remot
   assert.equal(execRes.woke, true)
   assert.equal(execRes.exitCode, 0)
   await mgrA.deleteMachine(box.id)
+})
+
+test('createDshMessageHandler authenticates via DSH session cookie, delivers /api/bot send, re-logins on 401, and propagates DSH errors', async () => {
+  assert.throws(() => createDshMessageHandler({ port: 0, authToken: 't' }), /invalid DSH port/)
+  assert.throws(() => createDshMessageHandler({ port: 3000 }), /authToken is required/)
+
+  const seenRequests = []
+  let activeCookie = 'dsh_session=s1'
+  let loginCount = 0
+  let nextApiResponse = null
+  const fakeFetch = async (url, init) => {
+    const parsedUrl = new URL(url)
+    seenRequests.push({ url, method: init.method, headers: init.headers, body: init.body ? JSON.parse(init.body) : undefined })
+    if (init.method === 'GET' && parsedUrl.pathname === '/' && parsedUrl.searchParams.get('token') === 'dsh-tok') {
+      loginCount += 1
+      activeCookie = `dsh_session=s${loginCount}`
+      return {
+        ok: false,
+        status: 302,
+        headers: { getSetCookie: () => [`${activeCookie}; HttpOnly; Path=/`] },
+      }
+    }
+    if (init.method === 'POST' && parsedUrl.pathname === '/api/bot') {
+      if (init.headers.cookie !== activeCookie) {
+        return { ok: false, status: 401, json: async () => ({ ok: false, error: 'unauthorized' }) }
+      }
+      if (nextApiResponse) {
+        const res = nextApiResponse
+        nextApiResponse = null
+        return { ok: res.status >= 200 && res.status < 300, status: res.status, json: async () => res.body }
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, value: true }) }
+    }
+    return { ok: false, status: 404, json: async () => ({ ok: false, error: 'not found' }) }
+  }
+
+  const client = mockDaytonaClient()
+  const store = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+  const mgr = createDaytonaMachineManager({ client, store })
+  const ctl = await startController({
+    pool: db.pool,
+    principals,
+    embedder: mockEmbedder(),
+    instance: 'ctl-dsh-handler',
+    intervalMs: 60_000,
+    provider: mockDaytona(),
+    machines: mgr,
+    machineMessageHandler: createDshMessageHandler({ port: 3000, authToken: 'dsh-tok', fetchImpl: fakeFetch }),
+    bucket: 'artifacts',
+    objectStore: localObjectStore({ root: mkdtempSync(join(tmpdir(), 'ctl-dsh-')), secret: 's' }),
+  })
+  started.push(ctl)
+
+  const alice = apiClient({ baseUrl: ctl.base, principal: 'alice', secret: principals.alice.secret, tenant: 't1' })
+  const created = await alice('POST', '/v1/machines', { name: 'dsh-box' })
+  assert.equal(created.status, 201)
+  const id = created.body.machine.id
+
+  const sent = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'sess-1', botId: 'coder', text: 'Please review PR' })
+  assert.equal(sent.status, 200)
+  assert.equal(sent.body.result.result.delivered, true)
+  assert.equal(sent.body.result.result.sessionId, 'sess-1')
+  assert.equal(loginCount, 1)
+  const postReq = seenRequests.find(r => r.method === 'POST')
+  assert.match(postReq.url, /\/api\/bot$/)
+  assert.equal(postReq.headers['x-daytona-preview-token'], `tok-${id}-3000`)
+  assert.equal(postReq.headers.cookie, 'dsh_session=s1')
+  assert.deepEqual(postReq.body, { endpoint: 'send', payload: { sessionId: 'sess-1', text: 'Please review PR' } })
+
+  // Simulate session cookie expiration (401): handler must re-login and retry cleanly.
+  activeCookie = 'dsh_session=expired'
+  const retried = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'sess-1', text: 'after restart' })
+  assert.equal(retried.status, 200)
+  assert.equal(loginCount, 2)
+
+  // DSH error response must fail instead of falsely reporting delivery.
+  nextApiResponse = { status: 200, body: { ok: false, error: { message: 'bot/read-only' } } }
+  const failed = await alice('POST', `/v1/machines/${id}/message`, { threadId: 'sess-1', text: 'should fail' })
+  assert.equal(failed.status, 500)
+
+  // Missing threadId and botId must be rejected.
+  const missingSession = await alice('POST', `/v1/machines/${id}/message`, { text: 'no session' })
+  assert.equal(missingSession.status, 500)
+
+  await alice('DELETE', `/v1/machines/${id}`)
 })
