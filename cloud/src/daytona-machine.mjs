@@ -439,16 +439,13 @@ export function createDaytonaMachineManager({
   async function readCachedOrWake(machine, reason, { cacheHit, readCache, readLive }) {
     if (machine.sleepLock) await machine.sleepLock
     if (machine.startLock) await machine.startLock
-    if (currentState(machine) === 'stopped') {
-      if (machine.cache.fresh && cacheHit()) {
-        return { value: structuredClone(readCache()), fromCache: true, woke: false, epoch: machine.cache.capturedEpoch }
-      }
-      await ensureAwake(machine.id, reason)
-      const value = await readLive(machine.sandbox)
-      return { value: structuredClone(value), fromCache: false, woke: true, epoch: machine.epoch }
+    if (currentState(machine) === 'stopped' && machine.cache.fresh && cacheHit()) {
+      return { value: structuredClone(readCache()), fromCache: true, woke: false, epoch: machine.cache.capturedEpoch }
     }
-    const value = await readLive(machine.sandbox)
-    return { value: structuredClone(value), fromCache: false, woke: false, epoch: machine.epoch }
+    return withActiveJob(machine.id, reason, async (activeMachine, woke) => {
+      const value = await readLive(activeMachine.sandbox)
+      return { value: structuredClone(value), fromCache: false, woke, epoch: activeMachine.epoch }
+    })
   }
 
   const fetcherOf = opt => (typeof opt === 'function' ? opt : opt?.fetcher)
@@ -461,6 +458,18 @@ export function createDaytonaMachineManager({
       machine.activeJobs -= 1
       machine.lastActivityAt = now()
     }
+  }
+
+  async function withMutation(machineId, reason, fn) {
+    return withActiveJob(machineId, reason, async (machine, woke) => {
+      machine.activeMutations += 1
+      machine.mutationSeq += 1
+      try {
+        return await fn(machine, woke)
+      } finally {
+        machine.activeMutations -= 1
+      }
+    })
   }
 
   return {
@@ -499,6 +508,8 @@ export function createDaytonaMachineManager({
         idleMinutes,
         keepAwake: Boolean(keepAwake),
         activeJobs: 0,
+        activeMutations: 0,
+        mutationSeq: 0,
         lastActivityAt: now(),
         epoch: 1,
         seq: 0,
@@ -590,15 +601,20 @@ export function createDaytonaMachineManager({
         },
         readCache: () => machine.cache.readings.get(key).value,
         readLive: async (sandbox) => {
+          const hadActiveMutation = machine.activeMutations > 0
+          const startMutationSeq = machine.mutationSeq
+          const startEpoch = machine.epoch
           const value = await fetcher(sandbox)
-          machine.cache.readings.set(key, { value: structuredClone(value), epoch: machine.epoch })
+          if (!hadActiveMutation && machine.activeMutations === 0 && machine.mutationSeq === startMutationSeq && machine.epoch === startEpoch) {
+            machine.cache.readings.set(key, { value: structuredClone(value), epoch: startEpoch })
+          }
           return value
         },
       })
     },
 
     async sendMessage(machineId, { threadId, botId, text, handler } = {}) {
-      return withActiveJob(machineId, 'send-message', async (machine, woke) => {
+      return withMutation(machineId, 'send-message', async (machine, woke) => {
         machine.epoch += 1
         machine.seq += 1
         const message = { role: 'user', botId, text, seq: machine.seq, at: now() }
@@ -620,7 +636,7 @@ export function createDaytonaMachineManager({
     },
 
     async execCommand(machineId, script, { cwd, env, timeoutSecs = 120 } = {}) {
-      return withActiveJob(machineId, 'exec-command', async (machine, woke) => {
+      return withMutation(machineId, 'exec-command', async (machine, woke) => {
         machine.epoch += 1
         const res = await machine.sandbox.process.executeCommand(script, cwd, env, timeoutSecs)
         return { woke, exitCode: res.exitCode, stdout: res.result, epoch: machine.epoch }
@@ -636,7 +652,7 @@ export function createDaytonaMachineManager({
           resolveUnder(`/home/placeholder/${cliDir}`, rawPath)
         }
       }
-      return withActiveJob(machineId, `sync-cli-${cli}`, async (machine, woke) => {
+      return withMutation(machineId, `sync-cli-${cli}`, async (machine, woke) => {
         const homeDir = await homeDirOf(machine.sandbox)
         const cliRoot = pathPosix.join(homeDir, ALLOWED_CLI_DIRS[cli])
         const targets = entries.map(([rawPath, content]) => [resolveUnder(cliRoot, rawPath), content])
@@ -707,7 +723,7 @@ export function createDaytonaMachineManager({
         }
       }
 
-      return withActiveJob(machineId, 'sync-project-env', async (machine, woke) => {
+      return withMutation(machineId, 'sync-project-env', async (machine, woke) => {
         const homeDir = await homeDirOf(machine.sandbox)
         const targetDir = workDir.startsWith('/') ? pathPosix.resolve(workDir) : resolveUnder(homeDir, workDir)
         const targets = envEntries.map(([relPath, content]) => [relPath, resolveUnder(targetDir, relPath), content])
@@ -765,6 +781,12 @@ export function createDaytonaMachineManager({
       }
       if (Object.keys(hw).length > 0) await machine.sandbox.resize(hw)
       if (size) machine.size = size
+      if (machine.pendingResize) {
+        for (const key of Object.keys(resources)) {
+          if (resources[key] !== undefined) delete machine.pendingResize[key]
+        }
+        if (Object.keys(machine.pendingResize).length === 0) machine.pendingResize = null
+      }
       return { applied: true, pending: false }
     },
 

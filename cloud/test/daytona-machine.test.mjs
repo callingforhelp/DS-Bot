@@ -496,3 +496,158 @@ test('Review P2: syncCliCredentials advances epoch before mutating disk, includi
   assert.match(freshAfterPartial.value, /gpt-6\.3-sol/)
   assert.equal(reads, 3)
 })
+
+test('Review P2: readFileOrDiff rejects cache entries that overlap a write (before or during active mutation)', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'overlap-cache-box' })
+
+  await machine.sandbox.fs.uploadFile(Buffer.from('old'), '/home/daytona/file.txt')
+
+  // 1) Read starts before write, reads 'old', pauses; write updates disk to 'new' and completes; read finishes.
+  const readStarted = deferred()
+  const readRelease = deferred()
+  const overlappingRead = mgr.readFileOrDiff(machine.id, 'file', async (sb) => {
+    const val = (await sb.fs.downloadFile('/home/daytona/file.txt')).toString('utf8')
+    readStarted.resolve()
+    await readRelease.promise
+    return val
+  })
+  await readStarted.promise
+
+  await mgr.sendMessage(machine.id, {
+    threadId: 't-overlap-1',
+    botId: 'coder',
+    text: 'write new',
+    handler: async (sb) => {
+      await sb.fs.uploadFile(Buffer.from('new'), '/home/daytona/file.txt')
+      return { reply: 'wrote new' }
+    },
+  })
+  readRelease.resolve()
+  const firstRes = await overlappingRead
+  assert.equal(firstRes.value, 'old')
+
+  await mgr.sleep(machine.id)
+  assert.equal(machine.sandbox.state, 'stopped')
+  const afterSleep1 = await mgr.readFileOrDiff(machine.id, 'file', async sb =>
+    (await sb.fs.downloadFile('/home/daytona/file.txt')).toString('utf8'),
+  )
+  assert.equal(afterSleep1.fromCache, false)
+  assert.equal(afterSleep1.woke, true)
+  assert.equal(afterSleep1.value, 'new')
+
+  // 2) Read starts while a write is already active, reads 'old' before write updates disk to 'newest'.
+  await machine.sandbox.fs.uploadFile(Buffer.from('old'), '/home/daytona/file2.txt')
+  const writeActive = deferred()
+  const writeRelease = deferred()
+  const activeWrite = mgr.sendMessage(machine.id, {
+    threadId: 't-overlap-2',
+    botId: 'coder',
+    text: 'write newest',
+    handler: async (sb) => {
+      writeActive.resolve()
+      await writeRelease.promise
+      await sb.fs.uploadFile(Buffer.from('newest'), '/home/daytona/file2.txt')
+      return { reply: 'wrote newest' }
+    },
+  })
+  await writeActive.promise
+
+  const readDuringWrite = await mgr.readFileOrDiff(machine.id, 'file2', async sb =>
+    (await sb.fs.downloadFile('/home/daytona/file2.txt')).toString('utf8'),
+  )
+  assert.equal(readDuringWrite.value, 'old')
+  writeRelease.resolve()
+  await activeWrite
+
+  await mgr.sleep(machine.id)
+  const afterSleep2 = await mgr.readFileOrDiff(machine.id, 'file2', async sb =>
+    (await sb.fs.downloadFile('/home/daytona/file2.txt')).toString('utf8'),
+  )
+  assert.equal(afterSleep2.fromCache, false)
+  assert.equal(afterSleep2.woke, true)
+  assert.equal(afterSleep2.value, 'newest')
+})
+
+test('Review P2: live reads are protected from concurrent idle sleep while stopped cache hits stay asleep', async () => {
+  const clock = makeClock(1_000_000)
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now, defaultIdleMinutes: 5 })
+  const machine = await mgr.createMachine({ name: 'live-read-guard', idleMinutes: 5 })
+
+  await mgr.captureState(machine.id, { roster: { coder: 'neon' } })
+  const readGate = deferred()
+  const readEntered = deferred()
+
+  const liveReadPromise = mgr.readFileOrDiff(machine.id, 'cmd-read', async (sb) => {
+    readEntered.resolve()
+    await readGate.promise
+    const res = await sb.process.executeCommand('echo ok')
+    return res.result
+  })
+  await readEntered.promise
+
+  // Advance past idleMinutes while live read is in flight; sleep and watchdog must both refuse.
+  clock.advance(10 * 60_000)
+  const sleepAttempt = await mgr.sleep(machine.id)
+  assert.deepEqual(sleepAttempt, { slept: false, reason: 'busy', activeJobs: 1 })
+  const watchdogAttempt = await mgr.checkIdleAndSchedule(machine.id)
+  assert.deepEqual(watchdogAttempt, { action: 'none', reason: 'active-jobs' })
+  assert.equal(machine.sandbox.state, 'started')
+
+  readGate.resolve()
+  const liveRead = await liveReadPromise
+  assert.equal(liveRead.fromCache, false)
+  assert.equal(liveRead.woke, false)
+  assert.equal(machine.activeJobs, 0)
+
+  // Stopped-machine cache hits remain unguarded and do not wake the sandbox.
+  await mgr.sleep(machine.id)
+  assert.equal(machine.sandbox.state, 'stopped')
+  const startsBefore = machine.sandbox.startCount
+  const cachedRoster = await mgr.readRoster(machine.id)
+  assert.equal(cachedRoster.fromCache, true)
+  assert.equal(cachedRoster.woke, false)
+  assert.equal(machine.sandbox.state, 'stopped')
+  assert.equal(machine.sandbox.startCount, startsBefore)
+})
+
+test('Review P2: immediate resize reconciles superseded pendingResize fields so wake never replays stale resize', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'resize-reconcile' })
+
+  // 1) Queue disk resize while running, sleep, then apply larger disk directly while stopped.
+  const queued = await mgr.resizeMachine(machine.id, { disk: 40 })
+  assert.deepEqual(queued, { applied: false, pending: true })
+
+  await mgr.sleep(machine.id)
+  const immediate = await mgr.resizeMachine(machine.id, { disk: 50 })
+  assert.deepEqual(immediate, { applied: true, pending: false })
+  assert.equal(machine.sandbox.disk, 50)
+  assert.equal(machine.pendingResize, null)
+
+  // Waking must succeed without replaying stale { disk: 40 }.
+  const wokeRes = await mgr.execCommand(machine.id, 'echo awake')
+  assert.equal(wokeRes.woke, true)
+  assert.equal(machine.sandbox.disk, 50)
+
+  // 2) Partial overlap: queued { size, cpu, memory, disk }, immediate { disk: 60 } keeps cpu/memory/size pending.
+  const queued2 = await mgr.resizeMachine(machine.id, { size: 'large', cpu: 4, memory: 8, disk: 55 })
+  assert.deepEqual(queued2, { applied: false, pending: true })
+  await mgr.sleep(machine.id)
+  const immediate2 = await mgr.resizeMachine(machine.id, { disk: 60 })
+  assert.deepEqual(immediate2, { applied: true, pending: false })
+  assert.deepEqual(machine.pendingResize, { size: 'large', cpu: 4, memory: 8 })
+
+  const wokeRes2 = await mgr.execCommand(machine.id, 'echo awake-2')
+  assert.equal(wokeRes2.woke, true)
+  assert.equal(machine.sandbox.cpu, 4)
+  assert.equal(machine.sandbox.memory, 8)
+  assert.equal(machine.sandbox.disk, 60)
+  assert.equal(machine.size, 'large')
+  assert.equal(machine.pendingResize, null)
+})
