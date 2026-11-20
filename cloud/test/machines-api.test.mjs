@@ -388,7 +388,7 @@ test('expired job lease allows auto-sleep, sleep resolves unresolved sandbox, an
   const box = await mgr.createMachine({ name: 'lease-box', labels: { tenant_id: 't1' } })
 
   // Simulate a crashed controller that called beginJob without endJob (60s lease).
-  await store.beginJob(box.id, 't1', now, 60_000)
+  await store.beginJob(box.id, 't1', 'crashed-job', now, 60_000)
   now += 30_000
   assert.deepEqual(await mgr.checkIdleAndSchedule(box.id), { action: 'none', reason: 'active-jobs' })
 
@@ -402,7 +402,66 @@ test('expired job lease allows auto-sleep, sleep resolves unresolved sandbox, an
   mgr.getMachine(box.id).sandbox = null
   const explicitSleep = await mgr.sleep(box.id)
   assert.equal(explicitSleep.slept, true)
-  await mgr.deleteMachine(box.id)
+
+  // Overlapping jobs: finishing a quick read must not clear a concurrent long job's lease.
+  await mgr.ensureAwake(box.id)
+  await mgr.setIdlePolicy(box.id, { idleMinutes: 1 })
+  let releaseLong
+  const longGate = new Promise(r => { releaseLong = r })
+  const longJob = mgr.sendMessage(box.id, {
+    threadId: 'th-overlap',
+    botId: 'coder',
+    text: 'long',
+    handler: async () => { await longGate; return { reply: 'done' } },
+  })
+  for (let i = 0; i < 100 && mgr.getMachine(box.id).activeJobs === 0; i++) {
+    await new Promise(r => setTimeout(r, 10))
+  }
+  await mgr.readThread(box.id, 'th-overlap')
+  now += 2 * 60_000
+  const writerMgr = createDaytonaMachineManager({ client, store, now: clock, defaultIdleMinutes: 1 })
+  await writerMgr.rehydrate()
+  assert.deepEqual(await writerMgr.checkIdleAndSchedule(box.id), { action: 'none', reason: 'active-jobs' })
+  releaseLong()
+  await longJob
+
+  // Retryable delete after store.remove() fails once Daytona already deleted the sandbox.
+  let failRemove = true
+  const flakyStore = {
+    ...store,
+    async remove(mid, tid) {
+      if (failRemove) { failRemove = false; throw new Error('db blip') }
+      return store.remove(mid, tid)
+    },
+  }
+  const flakyMgr = createDaytonaMachineManager({ client, store: flakyStore, now: clock })
+  await flakyMgr.rehydrate()
+  await assert.rejects(flakyMgr.deleteMachine(box.id), /db blip/)
+  const retryMgr = createDaytonaMachineManager({ client, store: flakyStore, now: clock })
+  await retryMgr.rehydrate()
+  await retryMgr.deleteMachine(box.id)
+  assert.equal(await store.loadOne(box.id, 't1'), null)
+
+  // Long-running job renews its lease while active.
+  const renewClient = mockDaytonaClient()
+  const renewMgr = createDaytonaMachineManager({ client: renewClient, store, jobLeaseMs: 120, defaultIdleMinutes: 1 })
+  const renewBox = await renewMgr.createMachine({ name: 'renew-box', labels: { tenant_id: 't1' } })
+  const beforeRenew = Date.now()
+  await renewMgr.execCommand(renewBox.id, 'sleep 1')
+  let sawRenewed = false
+  await renewMgr.sendMessage(renewBox.id, {
+    threadId: 'th-renew',
+    botId: 'coder',
+    text: 'hold',
+    handler: async () => {
+      await new Promise(r => setTimeout(r, 200))
+      const row = await store.loadOne(renewBox.id, 't1')
+      sawRenewed = row.busyUntil > beforeRenew + 150
+      return { reply: 'ok' }
+    },
+  })
+  assert.equal(sawRenewed, true)
+  await renewMgr.deleteMachine(renewBox.id)
 
   // Failed initial store.save() must clean up the allocated Daytona sandbox.
   const beforeCount = client.sandboxes.size

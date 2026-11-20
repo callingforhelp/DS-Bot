@@ -1,5 +1,25 @@
 import { withScope } from './db.mjs'
 
+function maxLeaseUntil(leases) {
+  if (!leases || typeof leases !== 'object') return null
+  let max = null
+  for (const v of Object.values(leases)) {
+    const n = Number(v)
+    if (Number.isFinite(n) && (max === null || n > max)) max = n
+  }
+  return max
+}
+
+function pruneLeases(leases, at) {
+  const next = {}
+  if (!leases || typeof leases !== 'object') return next
+  for (const [k, v] of Object.entries(leases)) {
+    const n = Number(v)
+    if (Number.isFinite(n) && n > at) next[k] = n
+  }
+  return next
+}
+
 function rowToRecord(r) {
   return {
     tenantId: r.tenant_id,
@@ -16,7 +36,7 @@ function rowToRecord(r) {
     epoch: r.epoch,
     seq: r.seq,
     version: Number(r.version ?? 1),
-    busyUntil: r.busy_until === null ? null : Number(r.busy_until),
+    busyUntil: maxLeaseUntil(r.job_leases),
     lastActivityAt: Number(r.last_activity_at),
   }
 }
@@ -32,7 +52,7 @@ export function pgMachineStore({ pool, tenants = [] }) {
         await withScope(pool, { tenant }, async (c) => {
           const res = await c.query(
             `select tenant_id, machine_id, name, size, state, idle_minutes, keep_awake,
-                    next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, busy_until, last_activity_at
+                    next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, job_leases, last_activity_at
                from machines
               where tenant_id = $1
               order by created_at asc`,
@@ -49,7 +69,7 @@ export function pgMachineStore({ pool, tenants = [] }) {
       return withScope(pool, { tenant }, async (c) => {
         const res = await c.query(
           `select tenant_id, machine_id, name, size, state, idle_minutes, keep_awake,
-                  next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, busy_until, last_activity_at
+                  next_scheduled_at, labels, pending_resize, cache, epoch, seq, version, job_leases, last_activity_at
              from machines
             where tenant_id = $1 and machine_id = $2`,
           [tenant, machineId],
@@ -139,31 +159,61 @@ export function pgMachineStore({ pool, tenants = [] }) {
       })
     },
 
-    async beginJob(machineId, tenantId, at, leaseMs = 5 * 60_000) {
+    async beginJob(machineId, tenantId, jobId, at, leaseMs = 5 * 60_000) {
       const tenant = tenantId ?? 'default'
-      const busyUntil = Number(at) + Number(leaseMs)
+      const nowAt = Number(at)
+      const expiresAt = nowAt + Number(leaseMs)
       await withScope(pool, { tenant }, async (c) => {
+        const cur = await c.query('select job_leases from machines where tenant_id = $1 and machine_id = $2 for update', [tenant, machineId])
+        if (cur.rowCount === 0) return
+        const leases = pruneLeases(cur.rows[0].job_leases, nowAt)
+        leases[jobId] = expiresAt
         await c.query(
           `update machines
-              set busy_until = greatest(coalesce(busy_until, 0), $4::bigint),
-                  last_activity_at = greatest(last_activity_at, $3::bigint),
+              set job_leases = $3::jsonb,
+                  last_activity_at = greatest(last_activity_at, $4::bigint),
                   updated_at = now()
             where tenant_id = $1 and machine_id = $2`,
-          [tenant, machineId, at, busyUntil],
+          [tenant, machineId, JSON.stringify(leases), nowAt],
         )
       })
     },
 
-    async endJob(machineId, tenantId, at) {
+    async renewJob(machineId, tenantId, jobId, at, leaseMs = 5 * 60_000) {
       const tenant = tenantId ?? 'default'
+      const nowAt = Number(at)
+      const expiresAt = nowAt + Number(leaseMs)
       await withScope(pool, { tenant }, async (c) => {
+        const cur = await c.query('select job_leases from machines where tenant_id = $1 and machine_id = $2 for update', [tenant, machineId])
+        if (cur.rowCount === 0) return
+        const leases = pruneLeases(cur.rows[0].job_leases, nowAt)
+        leases[jobId] = expiresAt
         await c.query(
           `update machines
-              set busy_until = null,
-                  last_activity_at = greatest(last_activity_at, $3),
+              set job_leases = $3::jsonb,
+                  last_activity_at = greatest(last_activity_at, $4::bigint),
                   updated_at = now()
             where tenant_id = $1 and machine_id = $2`,
-          [tenant, machineId, at],
+          [tenant, machineId, JSON.stringify(leases), nowAt],
+        )
+      })
+    },
+
+    async endJob(machineId, tenantId, jobId, at) {
+      const tenant = tenantId ?? 'default'
+      const nowAt = Number(at)
+      await withScope(pool, { tenant }, async (c) => {
+        const cur = await c.query('select job_leases from machines where tenant_id = $1 and machine_id = $2 for update', [tenant, machineId])
+        if (cur.rowCount === 0) return
+        const leases = pruneLeases(cur.rows[0].job_leases, nowAt)
+        delete leases[jobId]
+        await c.query(
+          `update machines
+              set job_leases = $3::jsonb,
+                  last_activity_at = greatest(last_activity_at, $4::bigint),
+                  updated_at = now()
+            where tenant_id = $1 and machine_id = $2`,
+          [tenant, machineId, JSON.stringify(leases), nowAt],
         )
       })
     },

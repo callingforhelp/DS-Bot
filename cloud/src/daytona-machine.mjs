@@ -268,6 +268,7 @@ export function createDaytonaMachineManager({
   defaultIdleMinutes = 15,
   scheduleHorizonMs = 5 * 60_000,
   preWakeLeadMs = 2 * 60_000,
+  jobLeaseMs = 5 * 60_000,
   botStatePath,
   store,
   now = Date.now,
@@ -479,16 +480,17 @@ export function createDaytonaMachineManager({
       }
       machine.activeJobs += 1
       machine.lastActivityAt = now()
+      const jobId = randomUUID()
       if (store?.beginJob) {
         const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
         try {
-          await store.beginJob(machine.id, tenantId, machine.lastActivityAt)
+          await store.beginJob(machine.id, tenantId, jobId, machine.lastActivityAt, jobLeaseMs)
         } catch (err) {
           machine.activeJobs -= 1
           throw err
         }
       }
-      return { machine, woke }
+      return { machine, woke, jobId }
     }
   }
 
@@ -562,15 +564,24 @@ export function createDaytonaMachineManager({
   const fetcherOf = opt => (typeof opt === 'function' ? opt : opt?.fetcher)
 
   async function withActiveJob(machineId, reason, fn) {
-    const { machine, woke } = await beginActiveJob(machineId, reason)
+    const { machine, woke, jobId } = await beginActiveJob(machineId, reason)
+    const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
+    let renewTimer = null
+    if (store?.renewJob && jobLeaseMs > 0) {
+      const intervalMs = Math.max(50, Math.floor(jobLeaseMs / 2))
+      renewTimer = setInterval(() => {
+        void store.renewJob(machine.id, tenantId, jobId, now(), jobLeaseMs).catch(() => {})
+      }, intervalMs)
+      renewTimer.unref?.()
+    }
     try {
       return await fn(machine, woke)
     } finally {
+      if (renewTimer) clearInterval(renewTimer)
       machine.activeJobs -= 1
       machine.lastActivityAt = now()
       if (store?.endJob) {
-        const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
-        await store.endJob(machine.id, tenantId, machine.lastActivityAt).catch(() => {})
+        await store.endJob(machine.id, tenantId, jobId, machine.lastActivityAt).catch(() => {})
       }
     }
   }
@@ -1016,10 +1027,17 @@ export function createDaytonaMachineManager({
     async deleteMachine(machineId) {
       const machine = requireMachine(machineId)
       const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
-      await resolveSandbox(machine)
-      await client.delete(machine.sandbox)
-      machines.delete(machineId)
+      try {
+        await resolveSandbox(machine)
+        await client.delete(machine.sandbox)
+        machine.sandbox = null
+      } catch (err) {
+        const isNotFound = err?.status === 404 || err?.statusCode === 404 || /not found|404|does not exist/i.test(String(err?.message ?? ''))
+        if (!isNotFound) throw err
+        machine.sandbox = null
+      }
       if (store) await store.remove(machineId, tenantId)
+      machines.delete(machineId)
     },
 
     async rehydrate() {

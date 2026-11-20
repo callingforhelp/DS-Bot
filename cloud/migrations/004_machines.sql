@@ -14,7 +14,7 @@ create table machines (
   epoch integer not null default 1,
   seq integer not null default 0,
   version bigint not null default 1,
-  busy_until bigint,
+  job_leases jsonb not null default '{}'::jsonb,
   last_activity_at bigint not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
