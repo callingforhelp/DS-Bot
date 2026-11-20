@@ -269,6 +269,7 @@ export function createDaytonaMachineManager({
   scheduleHorizonMs = 5 * 60_000,
   preWakeLeadMs = 2 * 60_000,
   botStatePath,
+  store,
   now = Date.now,
 } = {}) {
   const client = providedClient ?? (() => {
@@ -277,6 +278,40 @@ export function createDaytonaMachineManager({
   })()
 
   const machines = new Map()
+
+  function serializeMachine(machine) {
+    const labels = machine.sandbox?.labels ?? machine.labels ?? {}
+    return {
+      tenantId: labels.tenant_id ?? 'default',
+      id: machine.id,
+      name: machine.name,
+      size: machine.size,
+      state: machine.sandbox?.state ?? machine.state,
+      idleMinutes: machine.idleMinutes,
+      keepAwake: Boolean(machine.keepAwake),
+      nextScheduledAt: machine.nextScheduledAt,
+      labels,
+      pendingResize: machine.pendingResize,
+      cache: {
+        fresh: machine.cache.fresh,
+        capturedSeq: machine.cache.capturedSeq,
+        capturedEpoch: machine.cache.capturedEpoch,
+        stoppedAt: machine.cache.stoppedAt,
+        roster: machine.cache.roster,
+        projects: machine.cache.projects,
+        threads: Object.fromEntries(machine.cache.threads.entries()),
+        readings: Object.fromEntries(machine.cache.readings.entries()),
+      },
+      epoch: machine.epoch,
+      seq: machine.seq,
+      lastActivityAt: machine.lastActivityAt,
+    }
+  }
+
+  async function persist(machine) {
+    if (!store) return
+    await store.save(serializeMachine(machine))
+  }
 
   function requireMachine(machineId) {
     const machine = machines.get(machineId)
@@ -429,6 +464,7 @@ export function createDaytonaMachineManager({
     }
     machine.cache.capturedSeq = machine.seq
     machine.cache.capturedEpoch = machine.epoch
+    await persist(machine)
     return {
       capturedSeq: machine.cache.capturedSeq,
       capturedEpoch: machine.cache.capturedEpoch,
@@ -465,7 +501,9 @@ export function createDaytonaMachineManager({
       machine.activeMutations += 1
       machine.mutationSeq += 1
       try {
-        return await fn(machine, woke)
+        const res = await fn(machine, woke)
+        await persist(machine)
+        return res
       } finally {
         machine.activeMutations -= 1
       }
@@ -536,6 +574,7 @@ export function createDaytonaMachineManager({
         },
       }
       machines.set(record.id, record)
+      await persist(record)
       return record
     },
 
@@ -769,6 +808,7 @@ export function createDaytonaMachineManager({
       machine.idleMinutes = nextIdle
       machine.keepAwake = nextPin
       if (nextScheduledAt !== undefined) machine.nextScheduledAt = nextScheduledAt
+      await persist(machine)
       return { idleMinutes: machine.idleMinutes, keepAwake: machine.keepAwake, nextScheduledAt: machine.nextScheduledAt }
     },
 
@@ -777,6 +817,7 @@ export function createDaytonaMachineManager({
       const { size, ...hw } = resources
       if (machine.activeJobs > 0 || machine.sleepLock || (hw.disk !== undefined && currentState(machine) === 'started')) {
         machine.pendingResize = { ...resources }
+        await persist(machine)
         return { applied: false, pending: true }
       }
       if (Object.keys(hw).length > 0) await machine.sandbox.resize(hw)
@@ -787,6 +828,7 @@ export function createDaytonaMachineManager({
         }
         if (Object.keys(machine.pendingResize).length === 0) machine.pendingResize = null
       }
+      await persist(machine)
       return { applied: true, pending: false }
     },
 
@@ -826,6 +868,7 @@ export function createDaytonaMachineManager({
           machine.state = 'stopped'
           machine.cache.fresh = true
           machine.cache.stoppedAt = now()
+          await persist(machine)
           return {
             slept: true,
             capturedSeq: machine.cache.capturedSeq,
@@ -872,8 +915,65 @@ export function createDaytonaMachineManager({
 
     async deleteMachine(machineId) {
       const machine = requireMachine(machineId)
+      const tenantId = machine.sandbox?.labels?.tenant_id ?? machine.labels?.tenant_id ?? 'default'
       await client.delete(machine.sandbox)
       machines.delete(machineId)
+      if (store) await store.remove(machineId, tenantId)
+    },
+
+    async rehydrate() {
+      if (!store) return []
+      const rows = await store.loadAll()
+      const loaded = []
+      for (const row of rows) {
+        if (machines.has(row.id)) continue
+        let sandbox = null
+        try {
+          sandbox = await client.get(row.id)
+        } catch {
+          sandbox = null
+        }
+        const record = {
+          id: row.id,
+          name: row.name,
+          size: row.size ?? 'small',
+          state: sandbox?.state ?? row.state ?? 'stopped',
+          sandbox: sandbox ?? { id: row.id, name: row.name, state: row.state ?? 'stopped', labels: row.labels ?? {} },
+          labels: row.labels ?? {},
+          idleMinutes: row.idleMinutes ?? defaultIdleMinutes,
+          keepAwake: Boolean(row.keepAwake),
+          activeJobs: 0,
+          activeMutations: 0,
+          mutationSeq: 0,
+          lastActivityAt: row.lastActivityAt ?? now(),
+          epoch: row.epoch ?? 1,
+          seq: row.seq ?? 0,
+          nextScheduledAt: row.nextScheduledAt ?? null,
+          pendingResize: row.pendingResize ?? null,
+          sleepLock: null,
+          sleepAborted: false,
+          startLock: null,
+          cache: {
+            fresh: Boolean(row.cache?.fresh),
+            capturedSeq: row.cache?.capturedSeq ?? 0,
+            capturedEpoch: row.cache?.capturedEpoch ?? 0,
+            stoppedAt: row.cache?.stoppedAt ?? null,
+            roster: row.cache?.roster ?? null,
+            threads: new Map(Object.entries(row.cache?.threads ?? {})),
+            readings: new Map(Object.entries(row.cache?.readings ?? {})),
+            projects: Array.isArray(row.cache?.projects) ? row.cache.projects : [],
+          },
+          clis: {
+            codex: { signedIn: false },
+            claude: { signedIn: false },
+            agy: { signedIn: false },
+            liftgate: { signedIn: false },
+          },
+        }
+        machines.set(record.id, record)
+        loaded.push(record)
+      }
+      return loaded
     },
   }
 }

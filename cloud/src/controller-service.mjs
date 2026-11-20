@@ -17,6 +17,7 @@ export async function startController({
   host = '127.0.0.1', port = 0, intervalMs = 2000, bucket, log = () => {},
 }) {
   // Tenants in localTenants never reach an external embedding provider: not their events, not their queries.
+  await machines.rehydrate?.()
   const embedderFor = tenant => (localEmbedder && localTenants.includes(tenant) ? localEmbedder : embedder)
   const api = createApi({ pool, embedder, embedderFor, principals, objectStore, machines, messageHandler: machineMessageHandler, approvedSnapshots, ready: async () => { await pool.query('select 1'); return true } })
   const server = await api.listen(port, host)
