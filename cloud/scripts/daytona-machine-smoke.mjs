@@ -29,12 +29,12 @@ const check = (label, ok, extra = '') => {
 let machine
 let sandboxId
 try {
-  machine = await mgr.createMachine({ name, idleMinutes: 15 })
+  machine = await mgr.createMachine({ name, size: 'medium', idleMinutes: 15 })
   sandboxId = machine.id
   check(
-    'persistent sandbox created',
-    Boolean(sandboxId) && machine.sandbox.autoDeleteInterval !== 0 && machine.sandbox.autoStopInterval === 15 && machine.sandbox.networkBlockAll === false,
-    `${name} (${sandboxId}, autoDelete=${machine.sandbox.autoDeleteInterval}, autoStop=${machine.sandbox.autoStopInterval})`,
+    'persistent sandbox created with medium size snapshot resources',
+    Boolean(sandboxId) && machine.sandbox.autoDeleteInterval !== 0 && machine.sandbox.autoStopInterval === 15 && machine.sandbox.networkBlockAll === false && machine.sandbox.cpu === 2 && machine.sandbox.memory === 4 && machine.sandbox.disk === 8,
+    `${name} (${sandboxId}, cpu=${machine.sandbox.cpu}, mem=${machine.sandbox.memory}, disk=${machine.sandbox.disk}, autoDelete=${machine.sandbox.autoDeleteInterval})`,
   )
 
   await mgr.syncCliCredentials(sandboxId, {
@@ -50,21 +50,28 @@ try {
   })
   check('project .env synced', synced.envFileNames.join(',') === '.env', synced.workDir)
 
+  const homeDir = (await machine.sandbox.getUserHomeDir?.()) ?? '/home/daytona'
+  const stateDir = `${homeDir}/.ds-bot/bot`
+  const mk = await machine.sandbox.process.executeCommand(`mkdir -p '${stateDir.replace(/'/g, "'\\''")}'`, undefined, undefined, 30)
+  if (mk.exitCode !== 0) throw new Error(`mkdir ${stateDir} failed (exit ${mk.exitCode}): ${mk.result}`)
+  await machine.sandbox.fs.uploadFile(
+    Buffer.from(JSON.stringify({ version: 1, bots: { planner: { name: 'Planner', model: 'argon' }, reviewer: { name: 'Reviewer', model: 'gpt-6.2-sol' } } })),
+    `${stateDir}/state.json`,
+  )
   await mgr.captureState(sandboxId, {
-    roster: { planner: 'argon', coder: 'neon', reviewer: 'gpt-6.2-sol' },
     threads: { 't-smoke': { threadId: 't-smoke', seq: 1, messages: [{ role: 'user', text: 'smoke check' }] } },
   })
 
   const slept = await mgr.sleep(sandboxId)
-  check('sandbox slept after drain', slept.slept === true && machine.sandbox.state === 'stopped', `state=${machine.sandbox.state}`)
+  check('sandbox slept after automatic bot state drain', slept.slept === true && machine.sandbox.state === 'stopped', `state=${machine.sandbox.state}`)
 
   const rRoster = await mgr.readRoster(sandboxId)
   const rThread = await mgr.readThread(sandboxId, 't-smoke')
   const rProjects = await mgr.readProjects(sandboxId)
   check(
     'asleep reads served from cache without waking',
-    rRoster.fromCache && !rRoster.woke && rThread.fromCache && !rThread.woke && rProjects.fromCache && !rProjects.woke && machine.sandbox.state === 'stopped',
-    rRoster.value?.reviewer,
+    rRoster.fromCache && !rRoster.woke && rRoster.value?.reviewer?.model === 'gpt-6.2-sol' && rThread.fromCache && !rThread.woke && rProjects.fromCache && !rProjects.woke && machine.sandbox.state === 'stopped',
+    rRoster.value?.reviewer?.model,
   )
 
   const wokeExec = await mgr.execCommand(sandboxId, 'cat ~/.codex/config.toml ~/smoke-work/.env')

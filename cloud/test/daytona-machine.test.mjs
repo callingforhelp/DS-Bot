@@ -20,7 +20,7 @@ test('Idea 1: read-while-asleep serves fresh captured state and wakes on writes,
   assert.equal(machine.sandbox.networkBlockAll, false)
   assert.equal(machine.sandbox.autoStopInterval, 15)
   assert.equal(machine.sandbox.autoDeleteInterval, -1)
-  assert.equal(machine.sandbox.startCount, 1)
+  const initialStarts = machine.sandbox.startCount
 
   await mgr.captureState(machine.id, {
     roster: { planner: 'argon', coder: 'neon', reviewer: 'gpt-6.2-sol' },
@@ -67,7 +67,7 @@ test('Idea 1: read-while-asleep serves fresh captured state and wakes on writes,
   assert.deepEqual(cachedDiff, { value: 'diff-v1', fromCache: true, woke: false, epoch: 1 })
   assert.equal(diffReads, 1)
   assert.equal(machine.sandbox.state, 'stopped')
-  assert.equal(machine.sandbox.startCount, 1)
+  assert.equal(machine.sandbox.startCount, initialStarts)
 
   // Requesting an uncaptured thread wakes the machine and resyncs live.
   const t2 = await mgr.readThread(machine.id, 't2', async () => ({
@@ -77,7 +77,7 @@ test('Idea 1: read-while-asleep serves fresh captured state and wakes on writes,
   assert.equal(t2.woke, true)
   assert.equal(t2.value.messages[0].text, 'uncaptured thread')
   assert.equal(machine.sandbox.state, 'started')
-  assert.equal(machine.sandbox.startCount, 2)
+  assert.equal(machine.sandbox.startCount, initialStarts + 1)
 
   // External / unclean stop (without clean drain): cache.fresh is false, so reads wake to resync.
   await machine.sandbox.stop()
@@ -85,7 +85,7 @@ test('Idea 1: read-while-asleep serves fresh captured state and wakes on writes,
   const rosterAfterUnclean = await mgr.readRoster(machine.id)
   assert.equal(rosterAfterUnclean.fromCache, false)
   assert.equal(rosterAfterUnclean.woke, true)
-  assert.equal(machine.sandbox.startCount, 3)
+  assert.equal(machine.sandbox.startCount, initialStarts + 2)
 
   // Writing advances the epoch, invalidating prior file/diff reads even after a clean sleep.
   const sent = await mgr.sendMessage(machine.id, {
@@ -104,7 +104,7 @@ test('Idea 1: read-while-asleep serves fresh captured state and wakes on writes,
   })
   assert.deepEqual(staleDiff, { value: 'diff-v2', fromCache: false, woke: true, epoch: 2 })
   assert.equal(diffReads, 2)
-  assert.equal(machine.sandbox.startCount, 4)
+  assert.equal(machine.sandbox.startCount, initialStarts + 3)
 })
 
 test('Idea 2: persistent CLI credentials, OAuth preview sign-in, and project .env sync survive sleep/wake', async () => {
@@ -246,4 +246,253 @@ test('Idea 3: idle watchdog refuses busy/pinned/due-soon machines, drains on idl
 
   await mgr.deleteMachine(machine.id)
   assert.equal(client.sandboxes.size, 0)
+})
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+test('Review P1: incoming writes abort sleep during captureState and serialize cleanly around in-flight stop()', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'race-box' })
+
+  // 1) Write arrives while captureState() awaits downloadFile.
+  const origDownload = machine.sandbox.fs.downloadFile
+  const dlGate = deferred()
+  let captureStarted = false
+  machine.sandbox.fs.downloadFile = async (p) => {
+    captureStarted = true
+    await dlGate.promise
+    return origDownload(p)
+  }
+
+  const sleepPromise = mgr.sleep(machine.id)
+  while (!captureStarted) await Promise.resolve()
+  const writeDuringCapture = mgr.sendMessage(machine.id, {
+    threadId: 't-race',
+    botId: 'coder',
+    text: 'keep running',
+    handler: async () => ({ reply: 'wrote during capture' }),
+  })
+  dlGate.resolve()
+
+  const [sleepRes, writeRes] = await Promise.all([sleepPromise, writeDuringCapture])
+  assert.deepEqual(sleepRes, { slept: false, reason: 'aborted' })
+  assert.equal(machine.sandbox.state, 'started')
+  assert.equal(machine.cache.fresh, false)
+  assert.equal(machine.activeJobs, 0)
+  assert.equal(writeRes.woke, false)
+  assert.equal(writeRes.result.reply, 'wrote during capture')
+
+  // 2) Write arrives while sandbox.stop() is already in flight: waits for stop, then wakes cleanly.
+  machine.sandbox.fs.downloadFile = origDownload
+  const origStop = machine.sandbox.stop
+  const stopGate = deferred()
+  let stopStarted = false
+  machine.sandbox.stop = async (...args) => {
+    stopStarted = true
+    await stopGate.promise
+    return origStop.apply(machine.sandbox, args)
+  }
+
+  const sleepPromise2 = mgr.sleep(machine.id)
+  while (!stopStarted) await Promise.resolve()
+  const writeDuringStop = mgr.sendMessage(machine.id, {
+    threadId: 't-race',
+    botId: 'coder',
+    text: 'wake after stop',
+    handler: async () => ({ reply: 'ran after wake' }),
+  })
+  stopGate.resolve()
+
+  const [sleepRes2, writeRes2] = await Promise.all([sleepPromise2, writeDuringStop])
+  assert.equal(sleepRes2.slept, true)
+  assert.equal(writeRes2.woke, true)
+  assert.equal(machine.sandbox.state, 'started')
+  assert.equal(machine.activeJobs, 0)
+  assert.equal(writeRes2.result.reply, 'ran after wake')
+})
+
+test('Review P2: keepAwake disables provider autoStopInterval, refreshes activity, and restores idleMinutes on unpin', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now, defaultIdleMinutes: 15 })
+
+  const pinned = await mgr.createMachine({ name: 'pinned-start', idleMinutes: 15, keepAwake: true })
+  assert.equal(pinned.sandbox.autoStopInterval, 0)
+
+  const machine = await mgr.createMachine({ name: 'pin-toggle', idleMinutes: 15 })
+  assert.equal(machine.sandbox.autoStopInterval, 15)
+
+  await mgr.setIdlePolicy(machine.id, { keepAwake: true })
+  assert.equal(machine.sandbox.autoStopInterval, 0)
+
+  clock.advance(20 * 60_000)
+  const checkPinned = await mgr.checkIdleAndSchedule(machine.id)
+  assert.deepEqual(checkPinned, { action: 'none', reason: 'keep-awake' })
+  assert.equal(machine.sandbox.refreshCount, 1)
+
+  await mgr.setIdlePolicy(machine.id, { keepAwake: false })
+  assert.equal(machine.sandbox.autoStopInterval, 15)
+})
+
+test('Review P2: requested size selects sized snapshots or sets image resources', async () => {
+  const client = mockDaytonaClient()
+  const mgr = createDaytonaMachineManager({ client })
+
+  // Snapshot-based creation selects built-in sized snapshots and omits resources.
+  const med = await mgr.createMachine({ name: 'box-med', size: 'medium' })
+  assert.equal(med.sandbox.createParams.snapshot, 'daytona-medium')
+  assert.equal(med.sandbox.createParams.resources, undefined)
+  assert.equal(med.sandbox.state, 'started')
+  assert.equal(med.sandbox.stopCount, 0)
+  assert.equal(med.sandbox.startCount, 1)
+  assert.equal(med.sandbox.cpu, 2)
+  assert.equal(med.sandbox.memory, 4)
+  assert.equal(med.sandbox.disk, 8)
+
+  const lg = await mgr.createMachine({ name: 'box-lg', size: 'large' })
+  assert.equal(lg.sandbox.createParams.snapshot, 'daytona-large')
+  assert.equal(lg.sandbox.createParams.resources, undefined)
+  assert.equal(lg.sandbox.cpu, 4)
+  assert.equal(lg.sandbox.memory, 8)
+  assert.equal(lg.sandbox.disk, 10)
+
+  // Image-based creation passes resources directly at create() without snapshot.
+  const custom = await mgr.createMachine({ name: 'box-img', image: 'node:22', size: 'large', resources: { disk: 25 } })
+  assert.equal(custom.sandbox.createParams.image, 'node:22')
+  assert.equal(custom.sandbox.createParams.snapshot, undefined)
+  assert.deepEqual(custom.sandbox.createParams.resources, { cpu: 4, memory: 8, disk: 25 })
+  assert.equal(custom.sandbox.stopCount, 0)
+  assert.equal(custom.sandbox.startCount, 1)
+  assert.equal(custom.sandbox.cpu, 4)
+  assert.equal(custom.sandbox.memory, 8)
+  assert.equal(custom.sandbox.disk, 25)
+
+  await assert.rejects(mgr.createMachine({ name: 'bad', size: 'xl' }), /unsupported machine size/)
+  await assert.rejects(mgr.createMachine({ name: 'both', image: 'node:22', snapshot: 'snap' }), /both image and snapshot/)
+  await assert.rejects(mgr.createMachine({ name: 'no-img-res', resources: { cpu: 2 } }), /without an image/)
+})
+
+test('Review P2: automatic roster capture reads /data/bot/state.json for both live and asleep reads', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'state-path-box' })
+
+  const botState = {
+    version: 1,
+    bots: {
+      p1: { id: 'p1', name: 'Planner', model: 'liftgate/gemini-pro-orchestrator-g1-pro' },
+      r1: { id: 'r1', name: 'Reviewer', model: 'local-codex-cli/gpt-6.2-sol' },
+    },
+  }
+  await machine.sandbox.fs.uploadFile(Buffer.from(JSON.stringify(botState)), '/data/bot/state.json')
+
+  const liveRoster = await mgr.readRoster(machine.id)
+  assert.equal(liveRoster.fromCache, false)
+  assert.equal(liveRoster.value.r1.model, 'local-codex-cli/gpt-6.2-sol')
+
+  // Clear local cache and sleep without passing manual captureState args: auto-capture reads /data/bot/state.json.
+  machine.cache.roster = null
+  await mgr.sleep(machine.id)
+  assert.equal(machine.sandbox.state, 'stopped')
+
+  const asleepRoster = await mgr.readRoster(machine.id)
+  assert.equal(asleepRoster.fromCache, true)
+  assert.equal(asleepRoster.woke, false)
+  assert.equal(asleepRoster.value.p1.name, 'Planner')
+
+  // Fallback to ~/.ds-bot/bot/state.json when /data/bot/state.json is absent and botStatePath was omitted.
+  const fallbackMachine = await mgr.createMachine({ name: 'home-state-box' })
+  await fallbackMachine.sandbox.fs.uploadFile(
+    Buffer.from(JSON.stringify({ version: 1, bots: { h1: { id: 'h1', name: 'HomeBot' } } })),
+    '/home/daytona/.ds-bot/bot/state.json',
+  )
+  await mgr.sleep(fallbackMachine.id)
+  const fallbackRoster = await mgr.readRoster(fallbackMachine.id)
+  assert.equal(fallbackRoster.fromCache, true)
+  assert.equal(fallbackRoster.woke, false)
+  assert.equal(fallbackRoster.value.h1.name, 'HomeBot')
+
+  // Explicit botStatePath does not fall back to ~/.ds-bot/bot/state.json.
+  const customMgr = createDaytonaMachineManager({
+    client,
+    now: clock.now,
+    botStatePath: '/custom/missing/state.json',
+  })
+  const customMachine = await customMgr.createMachine({ name: 'custom-state-box' })
+  await customMachine.sandbox.fs.uploadFile(
+    Buffer.from(JSON.stringify({ version: 1, bots: { h2: { id: 'h2', name: 'Ignored' } } })),
+    '/home/daytona/.ds-bot/bot/state.json',
+  )
+  const customRoster = await customMgr.readRoster(customMachine.id)
+  assert.equal(customRoster.value, null)
+})
+
+test('Review P2: syncCliCredentials advances epoch before mutating disk, including on partial failure', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'cli-epoch-box' })
+
+  await mgr.syncCliCredentials(machine.id, {
+    cli: 'codex',
+    files: { 'config.toml': 'model = "gpt-6.1-sol"\n' },
+  })
+
+  let reads = 0
+  const initialRead = await mgr.readFileOrDiff(machine.id, 'codex-config', async (sb) => {
+    reads += 1
+    return (await sb.fs.downloadFile('.codex/config.toml')).toString('utf8')
+  })
+  assert.match(initialRead.value, /gpt-6\.1-sol/)
+  assert.equal(reads, 1)
+
+  // Successful update must invalidate prior cached reading even after a clean sleep.
+  await mgr.syncCliCredentials(machine.id, {
+    cli: 'codex',
+    files: { 'config.toml': 'model = "gpt-6.2-sol"\n' },
+  })
+  await mgr.sleep(machine.id)
+  const freshAfterSync = await mgr.readFileOrDiff(machine.id, 'codex-config', async (sb) => {
+    reads += 1
+    return (await sb.fs.downloadFile('.codex/config.toml')).toString('utf8')
+  })
+  assert.equal(freshAfterSync.fromCache, false)
+  assert.equal(freshAfterSync.woke, true)
+  assert.match(freshAfterSync.value, /gpt-6\.2-sol/)
+  assert.equal(reads, 2)
+
+  // Partial failure (2nd file fails after 1st file was written) still invalidates stale cache across sleep.
+  const origUpload = machine.sandbox.fs.uploadFile
+  let uploadCount = 0
+  machine.sandbox.fs.uploadFile = async (...args) => {
+    uploadCount += 1
+    if (uploadCount === 2) throw new Error('simulated second upload failure')
+    return origUpload(...args)
+  }
+  await assert.rejects(
+    mgr.syncCliCredentials(machine.id, {
+      cli: 'codex',
+      files: { 'config.toml': 'model = "gpt-6.3-sol"\n', 'auth.json': '{}' },
+    }),
+    /simulated second upload failure/,
+  )
+  machine.sandbox.fs.uploadFile = origUpload
+  await mgr.sleep(machine.id)
+
+  const freshAfterPartial = await mgr.readFileOrDiff(machine.id, 'codex-config', async (sb) => {
+    reads += 1
+    return (await sb.fs.downloadFile('.codex/config.toml')).toString('utf8')
+  })
+  assert.equal(freshAfterPartial.fromCache, false)
+  assert.equal(freshAfterPartial.woke, true)
+  assert.match(freshAfterPartial.value, /gpt-6\.3-sol/)
+  assert.equal(reads, 3)
 })

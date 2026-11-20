@@ -15,11 +15,19 @@ const SIGNIN_COMMANDS = {
   agy: { login: 'agy acp --login', status: 'agy --version' },
 }
 
-const SIZE_RESOURCES = {
-  small: { cpu: 2, memory: 4, disk: 20 },
-  medium: { cpu: 4, memory: 8, disk: 30 },
-  large: { cpu: 8, memory: 16, disk: 50 },
+const SIZE_SNAPSHOTS = {
+  small: 'daytona-small',
+  medium: 'daytona-medium',
+  large: 'daytona-large',
 }
+
+const SIZE_RESOURCES = {
+  small: { cpu: 1, memory: 1, disk: 3 },
+  medium: { cpu: 2, memory: 4, disk: 8 },
+  large: { cpu: 4, memory: 8, disk: 10 },
+}
+
+const DEFAULT_BOT_STATE_PATH = '/data/bot/state.json'
 
 const shellQuote = value => `'${String(value).replace(/'/g, "'\\''")}'`
 
@@ -43,8 +51,8 @@ function normalizeRemotePath(path, homeDir) {
 }
 
 function defaultMockExec(sandbox, command) {
-  if (command.includes('/data/state.json')) {
-    const raw = sandbox.files.get('/data/state.json')
+  if (command.includes('/data/bot/state.json')) {
+    const raw = sandbox.files.get('/data/bot/state.json')
     return { exitCode: raw ? 0 : 1, result: raw ? raw.toString('utf8') : 'not found' }
   }
   if (command.startsWith('chmod ') || command.startsWith('mkdir ')) {
@@ -68,7 +76,12 @@ function defaultMockExec(sandbox, command) {
  */
 export function mockDaytonaClient({ now = Date.now, onCommand } = {}) {
   const sandboxes = new Map()
-  const snapshots = new Map()
+  const snapshots = new Map(
+    Object.entries(SIZE_SNAPSHOTS).map(([sz, snapName]) => [
+      snapName,
+      { name: snapName, createdAt: now(), files: new Map(), env: {}, resources: { ...SIZE_RESOURCES[sz] } },
+    ]),
+  )
   let seq = 0
 
   function wrapSandbox(record) {
@@ -91,6 +104,8 @@ export function mockDaytonaClient({ now = Date.now, onCommand } = {}) {
       get commands() { return record.commands },
       get startCount() { return record.startCount },
       get stopCount() { return record.stopCount },
+      get refreshCount() { return record.refreshCount },
+      get createParams() { return record.createParams },
       get files() { return record.files },
       getUserHomeDir: async () => homeDir,
       fs: {
@@ -145,6 +160,7 @@ export function mockDaytonaClient({ now = Date.now, onCommand } = {}) {
         return { url: `https://${port}-${record.id}.daytona.mock`, token: `tok-${record.id}-${port}` }
       },
       async refreshActivity() {
+        record.refreshCount += 1
         record.lastActivityAt = now()
       },
       async createSnapshot(name) {
@@ -159,10 +175,12 @@ export function mockDaytonaClient({ now = Date.now, onCommand } = {}) {
       async resize(resources = {}) {
         const keys = ['cpu', 'memory', 'disk'].filter(k => resources[k] !== undefined)
         if (keys.length === 0) throw new Error('resize requires at least one of cpu, memory, disk')
-        if (resources.disk !== undefined) {
-          if (record.state !== 'stopped') throw new Error('disk resize requires a stopped sandbox')
-          if (resources.disk < record.resources.disk) throw new Error('disk size cannot decrease')
+        if (record.state === 'started') {
+          if (resources.disk !== undefined) throw new Error('disk resize requires a stopped sandbox')
+          if (resources.cpu !== undefined && resources.cpu < record.resources.cpu) throw new Error('hot cpu decrease requires a stopped sandbox')
+          if (resources.memory !== undefined && resources.memory < record.resources.memory) throw new Error('hot memory decrease requires a stopped sandbox')
         }
+        if (resources.disk !== undefined && resources.disk < record.resources.disk) throw new Error('disk size cannot decrease')
         for (const key of keys) record.resources[key] = resources[key]
       },
     }
@@ -173,6 +191,12 @@ export function mockDaytonaClient({ now = Date.now, onCommand } = {}) {
     sandboxes,
     snapshots,
     async create(params = {}) {
+      if (!params.image && params.resources !== undefined) {
+        throw new Error('Cannot specify Sandbox resources when using a snapshot')
+      }
+      if (params.snapshot && !snapshots.has(params.snapshot)) {
+        throw new Error(`snapshot not found: ${params.snapshot}`)
+      }
       const id = `sbx-${++seq}-${randomUUID().slice(0, 8)}`
       const baseSnap = params.snapshot ? snapshots.get(params.snapshot) : undefined
       const record = {
@@ -187,11 +211,13 @@ export function mockDaytonaClient({ now = Date.now, onCommand } = {}) {
         snapshot: params.snapshot,
         labels: { ...(params.labels ?? {}) },
         env: { ...(baseSnap?.env ?? {}), ...(params.envVars ?? params.env ?? {}) },
-        resources: { ...(baseSnap?.resources ?? SIZE_RESOURCES[params.labels?.size] ?? SIZE_RESOURCES.small), ...(params.resources ?? {}) },
+        resources: { ...(baseSnap?.resources ?? { cpu: 1, memory: 1, disk: 3 }), ...(params.resources ?? {}) },
+        createParams: structuredClone(params),
         files: baseSnap ? new Map([...baseSnap.files.entries()].map(([k, v]) => [k, Buffer.from(v)])) : new Map(),
         commands: [],
         startCount: 1,
         stopCount: 0,
+        refreshCount: 0,
         lastActivityAt: now(),
         destroyed: false,
       }
@@ -242,6 +268,7 @@ export function createDaytonaMachineManager({
   defaultIdleMinutes = 15,
   scheduleHorizonMs = 5 * 60_000,
   preWakeLeadMs = 2 * 60_000,
+  botStatePath,
   now = Date.now,
 } = {}) {
   const client = providedClient ?? (() => {
@@ -295,23 +322,85 @@ export function createDaytonaMachineManager({
 
   async function ensureAwake(machineId, reason = 'write') {
     const machine = requireMachine(machineId)
-    const state = currentState(machine)
-    if (state === 'stopped') {
-      if (machine.pendingResize) {
-        const { size, ...resources } = machine.pendingResize
-        if (Object.keys(resources).length > 0) await machine.sandbox.resize?.(resources)
-        machine.size = size ?? machine.size
-        machine.pendingResize = null
+    let woke = false
+    while (true) {
+      if (machine.sleepLock) {
+        machine.sleepAborted = true
+        await machine.sleepLock
+        continue
       }
-      await safeStart(machine.sandbox)
-      machine.state = 'started'
-      machine.cache.fresh = false
-      machine.lastActivityAt = now()
-      return { woke: true, reason }
+      if (machine.startLock) {
+        await machine.startLock
+        woke = true
+        continue
+      }
+      const state = currentState(machine)
+      if (state !== 'stopped') {
+        machine.state = state
+        machine.lastActivityAt = now()
+        return { woke, reason }
+      }
+      let startPromise
+      startPromise = (async () => {
+        try {
+          if (machine.pendingResize) {
+            const { size, ...resources } = machine.pendingResize
+            if (Object.keys(resources).length > 0) await machine.sandbox.resize?.(resources)
+            machine.size = size ?? machine.size
+            machine.pendingResize = null
+          }
+          await safeStart(machine.sandbox)
+          machine.state = 'started'
+          machine.cache.fresh = false
+          machine.lastActivityAt = now()
+        } finally {
+          if (machine.startLock === startPromise) machine.startLock = null
+        }
+      })()
+      machine.startLock = startPromise
+      await startPromise
+      woke = true
     }
-    machine.state = state
-    machine.lastActivityAt = now()
-    return { woke: false, reason }
+  }
+
+  async function beginActiveJob(machineId, reason) {
+    const machine = requireMachine(machineId)
+    let woke = false
+    while (true) {
+      if (machine.sleepLock) {
+        machine.sleepAborted = true
+        await machine.sleepLock
+        continue
+      }
+      if (currentState(machine) === 'stopped' || machine.startLock) {
+        const res = await ensureAwake(machineId, reason)
+        woke ||= res.woke
+        continue
+      }
+      machine.activeJobs += 1
+      machine.lastActivityAt = now()
+      return { machine, woke }
+    }
+  }
+
+  async function readBotStateFile(sandbox, filePath) {
+    try {
+      const buf = await sandbox.fs.downloadFile(filePath)
+      const parsed = JSON.parse(buf.toString('utf8'))
+      return {
+        roster: parsed.bots ?? null,
+        projects: Array.isArray(parsed.projects) ? parsed.projects : undefined,
+      }
+    } catch {
+      return null
+    }
+  }
+
+  async function loadBotState(sandbox) {
+    const primary = await readBotStateFile(sandbox, botStatePath ?? DEFAULT_BOT_STATE_PATH)
+    if (primary || botStatePath !== undefined) return primary
+    const home = await homeDirOf(sandbox)
+    return readBotStateFile(sandbox, pathPosix.join(home, '.ds-bot', 'bot', 'state.json'))
   }
 
   async function captureState(machineId, { roster, threads, projects } = {}) {
@@ -319,13 +408,14 @@ export function createDaytonaMachineManager({
     if (currentState(machine) !== 'started') {
       throw new Error(`cannot capture live state while machine ${machineId} is ${currentState(machine)}`)
     }
-    if (roster === undefined && threads === undefined && projects === undefined) {
-      try {
-        const buf = await machine.sandbox.fs.downloadFile('/data/state.json')
-        const parsed = JSON.parse(buf.toString('utf8'))
-        if (parsed.bots !== undefined) machine.cache.roster = structuredClone(parsed.bots)
-        if (parsed.projects !== undefined) machine.cache.projects = structuredClone(parsed.projects)
-      } catch { /* sandboxes without a serialized state file still capture in-memory turn snapshots */ }
+    if (roster === undefined || projects === undefined) {
+      const loaded = await loadBotState(machine.sandbox)
+      if (roster === undefined && loaded?.roster !== null && loaded?.roster !== undefined) {
+        machine.cache.roster = structuredClone(loaded.roster)
+      }
+      if (projects === undefined && loaded?.projects !== undefined) {
+        machine.cache.projects = structuredClone(loaded.projects)
+      }
     }
     if (roster !== undefined) machine.cache.roster = structuredClone(roster)
     if (projects !== undefined) machine.cache.projects = structuredClone(projects)
@@ -347,6 +437,8 @@ export function createDaytonaMachineManager({
   }
 
   async function readCachedOrWake(machine, reason, { cacheHit, readCache, readLive }) {
+    if (machine.sleepLock) await machine.sleepLock
+    if (machine.startLock) await machine.startLock
     if (currentState(machine) === 'stopped') {
       if (machine.cache.fresh && cacheHit()) {
         return { value: structuredClone(readCache()), fromCache: true, woke: false, epoch: machine.cache.capturedEpoch }
@@ -361,22 +453,39 @@ export function createDaytonaMachineManager({
 
   const fetcherOf = opt => (typeof opt === 'function' ? opt : opt?.fetcher)
 
+  async function withActiveJob(machineId, reason, fn) {
+    const { machine, woke } = await beginActiveJob(machineId, reason)
+    try {
+      return await fn(machine, woke)
+    } finally {
+      machine.activeJobs -= 1
+      machine.lastActivityAt = now()
+    }
+  }
+
   return {
     client,
     machines,
 
-    async createMachine({ name, size = 'small', snapshot, idleMinutes = defaultIdleMinutes, labels = {}, envVars } = {}) {
+    async createMachine({ name, size = 'small', resources, image, snapshot, idleMinutes = defaultIdleMinutes, keepAwake = false, labels = {}, envVars } = {}) {
+      if (image && snapshot) throw new Error('Cannot specify both image and snapshot')
+      if (!(size in SIZE_RESOURCES)) throw new Error(`unsupported machine size: ${size}`)
+      if (!image && resources !== undefined) {
+        throw new Error('Cannot specify custom resources without an image (use size or pass an image)')
+      }
       if (!Number.isInteger(idleMinutes) || idleMinutes < 0) {
         throw new Error('idleMinutes must be a non-negative integer')
       }
+      const targetResources = image ? { ...SIZE_RESOURCES[size], ...(resources ?? {}) } : undefined
+      const selectedSnapshot = image ? undefined : (snapshot ?? SIZE_SNAPSHOTS[size])
       const sandbox = await client.create({
         name,
         language: 'typescript',
         ephemeral: false,
         networkBlockAll: false,
-        autoStopInterval: idleMinutes,
+        autoStopInterval: keepAwake ? 0 : idleMinutes,
         autoDeleteInterval: -1,
-        ...(snapshot ? { snapshot } : {}),
+        ...(image ? { image, resources: targetResources } : { snapshot: selectedSnapshot }),
         ...(envVars ? { envVars } : {}),
         labels: { app: 'ds-bot-machine', ...(name ? { machine: name } : {}), size, ...labels },
       }, { timeout: 300 })
@@ -388,13 +497,16 @@ export function createDaytonaMachineManager({
         state: sandbox.state ?? 'started',
         sandbox,
         idleMinutes,
-        keepAwake: false,
+        keepAwake: Boolean(keepAwake),
         activeJobs: 0,
         lastActivityAt: now(),
         epoch: 1,
         seq: 0,
         nextScheduledAt: null,
         pendingResize: null,
+        sleepLock: null,
+        sleepAborted: false,
+        startLock: null,
         cache: {
           fresh: false,
           capturedSeq: 0,
@@ -428,7 +540,14 @@ export function createDaytonaMachineManager({
         cacheHit: () => machine.cache.roster !== null,
         readCache: () => machine.cache.roster,
         readLive: async (sandbox) => {
-          if (fetcher) machine.cache.roster = structuredClone(await fetcher(sandbox))
+          if (fetcher) {
+            machine.cache.roster = structuredClone(await fetcher(sandbox))
+          } else {
+            const loaded = await loadBotState(sandbox)
+            if (loaded?.roster !== null && loaded?.roster !== undefined) {
+              machine.cache.roster = structuredClone(loaded.roster)
+            }
+          }
           return machine.cache.roster
         },
       })
@@ -479,159 +598,160 @@ export function createDaytonaMachineManager({
     },
 
     async sendMessage(machineId, { threadId, botId, text, handler } = {}) {
-      const machine = requireMachine(machineId)
-      const { woke } = await ensureAwake(machineId, 'send-message')
-      machine.activeJobs += 1
-      machine.epoch += 1
-      machine.seq += 1
-      const message = { role: 'user', botId, text, seq: machine.seq, at: now() }
-      const existing = machine.cache.threads.get(threadId) ?? { threadId, seq: 0, messages: [] }
-      existing.messages.push(message)
-      existing.seq = machine.seq
-      machine.cache.threads.set(threadId, existing)
+      return withActiveJob(machineId, 'send-message', async (machine, woke) => {
+        machine.epoch += 1
+        machine.seq += 1
+        const message = { role: 'user', botId, text, seq: machine.seq, at: now() }
+        const existing = machine.cache.threads.get(threadId) ?? { threadId, seq: 0, messages: [] }
+        existing.messages.push(message)
+        existing.seq = machine.seq
+        machine.cache.threads.set(threadId, existing)
 
-      let result
-      try {
-        if (typeof handler === 'function') result = await handler(machine.sandbox, message)
-        else result = await machine.sandbox.process.executeCommand(String(text ?? ''), undefined, undefined, 120)
+        const result = typeof handler === 'function'
+          ? await handler(machine.sandbox, message)
+          : await machine.sandbox.process.executeCommand(String(text ?? ''), undefined, undefined, 120)
         if (result?.reply !== undefined) {
           machine.seq += 1
           existing.messages.push({ role: 'assistant', botId, text: result.reply, seq: machine.seq, at: now() })
           existing.seq = machine.seq
         }
         return { woke, seq: machine.seq, epoch: machine.epoch, result }
-      } finally {
-        machine.activeJobs -= 1
-        machine.lastActivityAt = now()
-      }
+      })
     },
 
     async execCommand(machineId, script, { cwd, env, timeoutSecs = 120 } = {}) {
-      const machine = requireMachine(machineId)
-      const { woke } = await ensureAwake(machineId, 'exec-command')
-      machine.activeJobs += 1
-      machine.epoch += 1
-      try {
+      return withActiveJob(machineId, 'exec-command', async (machine, woke) => {
+        machine.epoch += 1
         const res = await machine.sandbox.process.executeCommand(script, cwd, env, timeoutSecs)
         return { woke, exitCode: res.exitCode, stdout: res.result, epoch: machine.epoch }
-      } finally {
-        machine.activeJobs -= 1
-        machine.lastActivityAt = now()
-      }
+      })
     },
 
     async syncCliCredentials(machineId, { cli, files = {}, env = {} } = {}) {
       validateCli(cli)
-      const machine = requireMachine(machineId)
-      const { woke } = await ensureAwake(machineId, `sync-cli-${cli}`)
-      const homeDir = await homeDirOf(machine.sandbox)
-      const cliRoot = pathPosix.join(homeDir, ALLOWED_CLI_DIRS[cli])
-      const uploaded = []
-
-      for (const [rawPath, content] of Object.entries(files)) {
-        const target = resolveUnder(cliRoot, rawPath)
-        await ensureDirectory(machine.sandbox, target)
-        const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8')
-        await machine.sandbox.fs.uploadFile(buf, target)
-        await runShellOrFail(machine.sandbox, `chmod 600 ${shellQuote(target)}`, `chmod ${target}`)
-        uploaded.push(target)
+      const entries = Object.entries(files)
+      const cliDir = ALLOWED_CLI_DIRS[cli]
+      for (const [rawPath] of entries) {
+        if (typeof rawPath !== 'string' || rawPath.trim() === '' || rawPath.includes('\0') || rawPath.split(/[\\/]+/).includes('..') || (rawPath.startsWith('/') && !rawPath.includes(`/${cliDir}/`))) {
+          resolveUnder(`/home/placeholder/${cliDir}`, rawPath)
+        }
       }
-      if (Object.keys(env).length > 0) await machine.sandbox.updateEnv(env)
-      machine.clis[cli] = { signedIn: true, method: 'synced', files: uploaded, updatedAt: now() }
-      machine.lastActivityAt = now()
-      return { woke, cli, files: uploaded }
+      return withActiveJob(machineId, `sync-cli-${cli}`, async (machine, woke) => {
+        const homeDir = await homeDirOf(machine.sandbox)
+        const cliRoot = pathPosix.join(homeDir, ALLOWED_CLI_DIRS[cli])
+        const targets = entries.map(([rawPath, content]) => [resolveUnder(cliRoot, rawPath), content])
+        const envKeys = Object.keys(env)
+        if (targets.length > 0 || envKeys.length > 0) machine.epoch += 1
+
+        const uploaded = []
+        for (const [target, content] of targets) {
+          await ensureDirectory(machine.sandbox, target)
+          const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8')
+          await machine.sandbox.fs.uploadFile(buf, target)
+          await runShellOrFail(machine.sandbox, `chmod 600 ${shellQuote(target)}`, `chmod ${target}`)
+          uploaded.push(target)
+        }
+        if (envKeys.length > 0) await machine.sandbox.updateEnv(env)
+        machine.clis[cli] = { signedIn: true, method: 'synced', files: uploaded, updatedAt: now() }
+        return { woke, cli, files: uploaded, epoch: machine.epoch }
+      })
     },
 
     async startCliSignIn(machineId, { cli, callbackPort = 1455 } = {}) {
       const spec = SIGNIN_COMMANDS[cli]
       if (!spec) throw new Error(`interactive sign-in is not defined for ${cli}`)
-      const machine = requireMachine(machineId)
-      const { woke } = await ensureAwake(machineId, `cli-signin-${cli}`)
-      const preview = await machine.sandbox.getPreviewLink?.(callbackPort)
-      const res = await runShellOrFail(machine.sandbox, spec.login, `${cli} sign-in`, { timeout: 60 })
-      const text = String(res.result ?? '')
-      let parsed = {}
-      try { parsed = JSON.parse(text.trim().split('\n').at(-1)) } catch { /* plain text output */ }
-      const urlMatch = /https?:\/\/\S+/.exec(text)
-      const codeMatch = /\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/.exec(text)
-      const url = parsed.url ?? urlMatch?.[0] ?? preview?.url
-      const userCode = parsed.userCode ?? codeMatch?.[0] ?? null
-      machine.clis[cli] = { signedIn: false, pending: true, previewUrl: preview?.url, callbackPort }
-      machine.lastActivityAt = now()
-      return {
-        cli,
-        woke,
-        url,
-        userCode,
-        previewUrl: preview?.url ?? null,
-        previewToken: preview?.token ?? null,
-        callbackPort,
-        completeSignIn: () => this.completeCliSignIn(machineId, cli),
-      }
+      return withActiveJob(machineId, `cli-signin-${cli}`, async (machine, woke) => {
+        const preview = await machine.sandbox.getPreviewLink?.(callbackPort)
+        const res = await runShellOrFail(machine.sandbox, spec.login, `${cli} sign-in`, { timeout: 60 })
+        const text = String(res.result ?? '')
+        let parsed = {}
+        try { parsed = JSON.parse(text.trim().split('\n').at(-1)) } catch { /* plain text output */ }
+        const urlMatch = /https?:\/\/\S+/.exec(text)
+        const codeMatch = /\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/.exec(text)
+        const url = parsed.url ?? urlMatch?.[0] ?? preview?.url
+        const userCode = parsed.userCode ?? codeMatch?.[0] ?? null
+        machine.clis[cli] = { signedIn: false, pending: true, previewUrl: preview?.url, callbackPort }
+        return {
+          cli,
+          woke,
+          url,
+          userCode,
+          previewUrl: preview?.url ?? null,
+          previewToken: preview?.token ?? null,
+          callbackPort,
+          completeSignIn: () => this.completeCliSignIn(machineId, cli),
+        }
+      })
     },
 
     async completeCliSignIn(machineId, cli) {
       const spec = SIGNIN_COMMANDS[cli]
       if (!spec) throw new Error(`interactive sign-in is not defined for ${cli}`)
-      const machine = requireMachine(machineId)
-      const { woke } = await ensureAwake(machineId, `cli-verify-${cli}`)
-      const res = await runShellOrFail(machine.sandbox, spec.status, `${cli} sign-in status`, { timeout: 30 })
-      machine.clis[cli] = { signedIn: true, method: 'oauth', verifiedAt: now() }
-      machine.lastActivityAt = now()
-      return { cli, woke, signedIn: true, output: String(res.result ?? '').trim() }
+      return withActiveJob(machineId, `cli-verify-${cli}`, async (machine, woke) => {
+        const res = await runShellOrFail(machine.sandbox, spec.status, `${cli} sign-in status`, { timeout: 30 })
+        machine.clis[cli] = { signedIn: true, method: 'oauth', verifiedAt: now() }
+        return { cli, woke, signedIn: true, output: String(res.result ?? '').trim() }
+      })
     },
 
     async syncProjectEnv(machineId, { projectId, repoUrl, workDir, envFiles = {} } = {}) {
       if (typeof projectId !== 'string' || projectId.trim() === '') throw new Error('projectId is required')
-      const machine = requireMachine(machineId)
-      const { woke } = await ensureAwake(machineId, 'sync-project-env')
-      const homeDir = await homeDirOf(machine.sandbox)
       if (typeof workDir !== 'string' || workDir.trim() === '' || workDir.includes('\0')) {
         throw new Error('workDir must be a non-empty string')
       }
       if (workDir.split(/[\\/]+/).includes('..')) throw new Error(`path traversal is not allowed: ${workDir}`)
-      const targetDir = workDir.startsWith('/') ? pathPosix.resolve(workDir) : resolveUnder(homeDir, workDir)
-
-      if (repoUrl) {
-        const quotedDir = shellQuote(targetDir)
-        const quotedUrl = shellQuote(repoUrl)
-        const cmd = `if [ -d ${quotedDir}/.git ]; then git -C ${quotedDir} fetch --all --prune; else mkdir -p ${shellQuote(pathPosix.dirname(targetDir))} && git clone ${quotedUrl} ${quotedDir}; fi`
-        await runShellOrFail(machine.sandbox, cmd, `sync repo ${projectId}`, { timeout: 120 })
-      } else {
-        await runShellOrFail(machine.sandbox, `mkdir -p ${shellQuote(targetDir)}`, `mkdir ${targetDir}`, { timeout: 30 })
-      }
-
-      const written = []
-      for (const [relPath, content] of Object.entries(envFiles)) {
+      const envEntries = Object.entries(envFiles)
+      for (const [relPath] of envEntries) {
         if (!pathPosix.basename(relPath).startsWith('.env')) {
           throw new Error(`only .env* files may be synced via syncProjectEnv: ${relPath}`)
         }
-        const envPath = resolveUnder(targetDir, relPath)
-        await ensureDirectory(machine.sandbox, envPath)
-        await machine.sandbox.fs.uploadFile(Buffer.from(String(content), 'utf8'), envPath)
-        await runShellOrFail(machine.sandbox, `chmod 600 ${shellQuote(envPath)}`, `chmod ${envPath}`)
-        written.push(relPath)
       }
 
-      machine.epoch += 1
-      machine.lastActivityAt = now()
-      const record = { projectId, repoUrl: repoUrl ?? null, workDir: targetDir, envFileNames: written, syncedAt: now() }
-      const existing = machine.cache.projects.findIndex(p => p.projectId === projectId)
-      if (existing === -1) machine.cache.projects.push(record)
-      else machine.cache.projects[existing] = record
-      return { woke, ...record, epoch: machine.epoch }
+      return withActiveJob(machineId, 'sync-project-env', async (machine, woke) => {
+        const homeDir = await homeDirOf(machine.sandbox)
+        const targetDir = workDir.startsWith('/') ? pathPosix.resolve(workDir) : resolveUnder(homeDir, workDir)
+        const targets = envEntries.map(([relPath, content]) => [relPath, resolveUnder(targetDir, relPath), content])
+        machine.epoch += 1
+
+        if (repoUrl) {
+          const quotedDir = shellQuote(targetDir)
+          const quotedUrl = shellQuote(repoUrl)
+          const cmd = `if [ -d ${quotedDir}/.git ]; then git -C ${quotedDir} fetch --all --prune; else mkdir -p ${shellQuote(pathPosix.dirname(targetDir))} && git clone ${quotedUrl} ${quotedDir}; fi`
+          await runShellOrFail(machine.sandbox, cmd, `sync repo ${projectId}`, { timeout: 120 })
+        } else {
+          await runShellOrFail(machine.sandbox, `mkdir -p ${shellQuote(targetDir)}`, `mkdir ${targetDir}`, { timeout: 30 })
+        }
+
+        const written = []
+        for (const [relPath, envPath, content] of targets) {
+          await ensureDirectory(machine.sandbox, envPath)
+          await machine.sandbox.fs.uploadFile(Buffer.from(String(content), 'utf8'), envPath)
+          await runShellOrFail(machine.sandbox, `chmod 600 ${shellQuote(envPath)}`, `chmod ${envPath}`)
+          written.push(relPath)
+        }
+
+        const record = { projectId, repoUrl: repoUrl ?? null, workDir: targetDir, envFileNames: written, syncedAt: now() }
+        const existing = machine.cache.projects.findIndex(p => p.projectId === projectId)
+        if (existing === -1) machine.cache.projects.push(record)
+        else machine.cache.projects[existing] = record
+        return { woke, ...record, epoch: machine.epoch }
+      })
     },
 
     async setIdlePolicy(machineId, { idleMinutes, keepAwake, nextScheduledAt } = {}) {
       const machine = requireMachine(machineId)
-      if (idleMinutes !== undefined) {
-        if (!Number.isInteger(idleMinutes) || idleMinutes < 0) throw new Error('idleMinutes must be a non-negative integer')
-        if (idleMinutes !== machine.idleMinutes) {
-          await machine.sandbox.setAutostopInterval?.(idleMinutes)
-          machine.idleMinutes = idleMinutes
-        }
+      if (idleMinutes !== undefined && (!Number.isInteger(idleMinutes) || idleMinutes < 0)) {
+        throw new Error('idleMinutes must be a non-negative integer')
       }
-      if (keepAwake !== undefined) machine.keepAwake = Boolean(keepAwake)
+      const prevEffective = machine.keepAwake ? 0 : machine.idleMinutes
+      const nextIdle = idleMinutes !== undefined ? idleMinutes : machine.idleMinutes
+      const nextPin = keepAwake !== undefined ? Boolean(keepAwake) : machine.keepAwake
+      const nextEffective = nextPin ? 0 : nextIdle
+      if (nextEffective !== prevEffective) {
+        await machine.sandbox.setAutostopInterval?.(nextEffective)
+      }
+      machine.idleMinutes = nextIdle
+      machine.keepAwake = nextPin
       if (nextScheduledAt !== undefined) machine.nextScheduledAt = nextScheduledAt
       return { idleMinutes: machine.idleMinutes, keepAwake: machine.keepAwake, nextScheduledAt: machine.nextScheduledAt }
     },
@@ -639,7 +759,7 @@ export function createDaytonaMachineManager({
     async resizeMachine(machineId, resources = {}) {
       const machine = requireMachine(machineId)
       const { size, ...hw } = resources
-      if (machine.activeJobs > 0 || (hw.disk !== undefined && currentState(machine) === 'started')) {
+      if (machine.activeJobs > 0 || machine.sleepLock || (hw.disk !== undefined && currentState(machine) === 'started')) {
         machine.pendingResize = { ...resources }
         return { applied: false, pending: true }
       }
@@ -650,7 +770,10 @@ export function createDaytonaMachineManager({
 
     async sleep(machineId, { saveSnapshot = false, snapshotName } = {}) {
       const machine = requireMachine(machineId)
-      if (machine.activeJobs > 0) return { slept: false, reason: 'busy', activeJobs: machine.activeJobs }
+      if (machine.sleepLock) return machine.sleepLock
+      if (machine.activeJobs > 0 || machine.startLock) {
+        return { slept: false, reason: 'busy', activeJobs: machine.activeJobs }
+      }
       if (currentState(machine) === 'stopped') {
         return {
           slept: true,
@@ -659,19 +782,43 @@ export function createDaytonaMachineManager({
           capturedEpoch: machine.cache.capturedEpoch,
         }
       }
-      await captureState(machineId)
-      machine.cache.fresh = true
-      const resolvedSnap = saveSnapshot ? (snapshotName ?? `ds-bot-${machine.name}-${machine.id}`) : undefined
-      if (resolvedSnap) await machine.sandbox.createSnapshot?.(resolvedSnap)
-      await safeStop(machine.sandbox)
-      machine.state = 'stopped'
-      machine.cache.stoppedAt = now()
-      return {
-        slept: true,
-        capturedSeq: machine.cache.capturedSeq,
-        capturedEpoch: machine.cache.capturedEpoch,
-        ...(resolvedSnap ? { snapshotName: resolvedSnap } : {}),
-      }
+      machine.sleepAborted = false
+      const aborted = () => ({ slept: false, reason: 'aborted' })
+      let sleepPromise
+      sleepPromise = (async () => {
+        try {
+          await captureState(machineId)
+          if (machine.sleepAborted || machine.activeJobs > 0) {
+            machine.cache.fresh = false
+            return aborted()
+          }
+          const resolvedSnap = saveSnapshot ? (snapshotName ?? `ds-bot-${machine.name}-${machine.id}`) : undefined
+          if (resolvedSnap) {
+            await machine.sandbox.createSnapshot?.(resolvedSnap)
+            if (machine.sleepAborted || machine.activeJobs > 0) {
+              machine.cache.fresh = false
+              return aborted()
+            }
+          }
+          await safeStop(machine.sandbox)
+          machine.state = 'stopped'
+          machine.cache.fresh = true
+          machine.cache.stoppedAt = now()
+          return {
+            slept: true,
+            capturedSeq: machine.cache.capturedSeq,
+            capturedEpoch: machine.cache.capturedEpoch,
+            ...(resolvedSnap ? { snapshotName: resolvedSnap } : {}),
+          }
+        } finally {
+          if (machine.sleepLock === sleepPromise) {
+            machine.sleepLock = null
+            machine.sleepAborted = false
+          }
+        }
+      })()
+      machine.sleepLock = sleepPromise
+      return sleepPromise
     },
 
     async checkIdleAndSchedule(machineId) {
@@ -684,7 +831,10 @@ export function createDaytonaMachineManager({
         }
         return { action: 'none', state: 'stopped' }
       }
-      if (machine.keepAwake) return { action: 'none', reason: 'keep-awake' }
+      if (machine.keepAwake) {
+        await machine.sandbox.refreshActivity?.()
+        return { action: 'none', reason: 'keep-awake' }
+      }
       if (machine.activeJobs > 0) return { action: 'none', reason: 'active-jobs' }
       if (machine.nextScheduledAt !== null && machine.nextScheduledAt - now() <= scheduleHorizonMs) {
         return { action: 'none', reason: 'schedule-due-soon' }
@@ -694,6 +844,7 @@ export function createDaytonaMachineManager({
         return { action: 'none', reason: 'not-idle-yet' }
       }
       const res = await this.sleep(machineId)
+      if (!res.slept) return { action: 'none', reason: res.reason }
       return { action: 'slept', capturedSeq: res.capturedSeq, capturedEpoch: res.capturedEpoch }
     },
 
