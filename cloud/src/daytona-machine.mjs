@@ -279,6 +279,7 @@ export function createDaytonaMachineManager({
   })()
 
   const machines = new Map()
+  let createOrder = 0
 
   function serializeMachine(machine) {
     const labels = machine.sandbox?.labels ?? machine.labels ?? {}
@@ -594,6 +595,9 @@ export function createDaytonaMachineManager({
         const res = await fn(machine, woke)
         await persist(machine)
         return res
+      } catch (err) {
+        await persist(machine).catch(() => {})
+        throw err
       } finally {
         machine.activeMutations -= 1
       }
@@ -665,6 +669,7 @@ export function createDaytonaMachineManager({
         },
       }
       record.persisting = true
+      record.createOrder = ++createOrder
       record.saveQueue = Promise.resolve()
       record.remoteBusyUntil = null
       machines.set(record.id, record)
@@ -1042,10 +1047,11 @@ export function createDaytonaMachineManager({
 
     async rehydrate() {
       if (!store) return []
+      const startOrder = createOrder
       const rows = await store.loadAll()
       const seenIds = new Set(rows.map(r => r.id))
       for (const [id, existing] of machines.entries()) {
-        if (!seenIds.has(id) && !existing.persisting && existing.activeJobs === 0) {
+        if (!seenIds.has(id) && !existing.persisting && existing.activeJobs === 0 && (existing.createOrder ?? 0) <= startOrder) {
           machines.delete(id)
         }
       }

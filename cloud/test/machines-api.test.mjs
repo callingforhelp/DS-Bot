@@ -471,3 +471,49 @@ test('expired job lease allows auto-sleep, sleep resolves unresolved sandbox, an
   assert.equal(client.sandboxes.size, beforeCount)
   assert.equal(failMgr.listMachines().length, 0)
 })
+
+test('rehydrate preserves machines created mid-refresh and failed mutations persist epoch invalidation', async () => {
+  const client = mockDaytonaClient()
+  const baseStore = pgMachineStore({ pool: db.pool, tenants: ['t1'] })
+  let releaseLoadAll
+  let holdLoadAll = false
+  const gatedStore = {
+    ...baseStore,
+    async loadAll() {
+      const rows = await baseStore.loadAll()
+      if (holdLoadAll) {
+        await new Promise(r => { releaseLoadAll = r })
+      }
+      return rows
+    },
+  }
+  const mgr = createDaytonaMachineManager({ client, store: gatedStore })
+  holdLoadAll = true
+  const rehydratePromise = mgr.rehydrate()
+  await new Promise(r => setTimeout(r, 10))
+  const createdDuringRefresh = await mgr.createMachine({ name: 'mid-refresh', labels: { tenant_id: 't1' } })
+  releaseLoadAll()
+  await rehydratePromise
+  assert.equal(mgr.listMachines().some(m => m.id === createdDuringRefresh.id), true)
+
+  // Cache a reading, sleep/wake, then fail a mutation after epoch advances; restart must see new epoch.
+  await mgr.readFileOrDiff(createdDuringRefresh.id, 'cfg', async () => 'old-cfg')
+  await mgr.sleep(createdDuringRefresh.id)
+  await mgr.ensureAwake(createdDuringRefresh.id)
+  const beforeRow = await baseStore.loadOne(createdDuringRefresh.id, 't1')
+  const sbx = mgr.getMachine(createdDuringRefresh.id).sandbox
+  const origUpload = sbx.fs.uploadFile.bind(sbx.fs)
+  let uploads = 0
+  sbx.fs.uploadFile = async (buf, path) => {
+    uploads += 1
+    if (uploads === 2) throw new Error('second upload failed')
+    return origUpload(buf, path)
+  }
+  await assert.rejects(
+    mgr.syncCliCredentials(createdDuringRefresh.id, { cli: 'codex', files: { '.codex/a.toml': 'new', '.codex/b.toml': 'fail' } }),
+    /second upload failed/,
+  )
+  const afterRow = await baseStore.loadOne(createdDuringRefresh.id, 't1')
+  assert.ok(afterRow.epoch > beforeRow.epoch)
+  await mgr.deleteMachine(createdDuringRefresh.id)
+})
