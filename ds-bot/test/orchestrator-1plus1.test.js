@@ -22,7 +22,7 @@ const TEAM = {
   questions: {},
 }
 
-function start(team = TEAM, { providers, failureFor } = {}) {
+function start(team = TEAM, { providers, failureFor, resolveModelInfo } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-1plus1-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(team))
   const catalogMap = providers ?? {
@@ -46,7 +46,7 @@ function start(team = TEAM, { providers, failureFor } = {}) {
     llm: {
       listProviders: () => Object.keys(catalogMap).map(id => ({ id, name: id })),
       listModels: async provider => catalogMap[provider] ?? [],
-      resolveModelInfo: async () => ({}),
+      resolveModelInfo: resolveModelInfo ?? (async () => ({})),
       stream(options) {
         const chain = ctx.listeners.get('llm/stream') ?? []
         const run = index => (index < chain.length ? chain[index](options, () => run(index + 1)) : (async function* () {
@@ -437,4 +437,66 @@ test('llm/stream transparently falls back from Argon to Orchestrator (Neon) on p
     { provider: 'liftgate', model: 'gemini-pro-orchestrator-neon' },
     { provider: 'liftgate', model: 'gemini-pro-orchestrator-g1-pro' },
   ])
+})
+
+test('Neon fallback keeps supported request reasoningEffort without a Bot and keeps Bot effort for Bot chats', async (t) => {
+  const { ctx, requests, tool, stop } = start({
+    ...TEAM,
+    bots: {
+      ...TEAM.bots,
+      m1: { ...TEAM.bots.m1, effort: 'low' },
+    },
+  }, {
+    providers: {
+      liftgate: [
+        { id: 'gemini-pro-orchestrator-g1-pro', name: 'Orchestrator (Argon)' },
+        { id: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+      ],
+    },
+    failureFor: ({ model }) => (model === 'gemini-pro-orchestrator-g1-pro'
+      ? { code: 'QUOTA', message: 'Argon quota exhausted' }
+      : undefined),
+    resolveModelInfo: async (_provider, model) => (model === 'gemini-pro-orchestrator-neon'
+      ? { reasoning: { efforts: [{ id: 'low' }, { id: 'high' }] } }
+      : {}),
+  })
+  t.after(stop)
+  await tool('list_bots', {}, 'm1')
+
+  const user = { role: 'user', content: [{ type: 'text', text: 'Run' }] }
+
+  await drain(ctx.llm.stream({ sessionId: 'standalone', provider: 'liftgate', model: 'gemini-pro-orchestrator-g1-pro', reasoningEffort: 'high', messages: [user] }))
+  assert.equal(requests.at(-1).model, 'gemini-pro-orchestrator-neon')
+  assert.equal(requests.at(-1).reasoningEffort, 'high')
+
+  await drain(ctx.llm.stream({ sessionId: 'standalone', provider: 'liftgate', model: 'gemini-pro-orchestrator-g1-pro', reasoningEffort: 'unsupported', messages: [user] }))
+  assert.equal(requests.at(-1).model, 'gemini-pro-orchestrator-neon')
+  assert.equal(requests.at(-1).reasoningEffort, undefined)
+
+  await drain(ctx.llm.stream({ sessionId: 'm1', provider: 'liftgate', model: 'gemini-pro-orchestrator-g1-pro', reasoningEffort: 'high', messages: [user] }))
+  assert.equal(requests.at(-1).model, 'gemini-pro-orchestrator-neon')
+  assert.equal(requests.at(-1).reasoningEffort, 'low')
+})
+
+test('bot-identity includes the orchestrator bridge rule for bare and qualified Argon IDs', async (t) => {
+  const { ctx, tool, stop } = start({
+    ...TEAM,
+    bots: {
+      ...TEAM.bots,
+      bBarePrefixed: { id: 'bBarePrefixed', sessionId: 'bBarePrefixed', name: 'BarePrefixed', model: 'liftgate/gemini-4-argon', createdAt: 3 },
+      bBarePlain: { id: 'bBarePlain', sessionId: 'bBarePlain', name: 'BarePlain', model: 'gemini-4-argon', createdAt: 4 },
+      bArgonHigh: { id: 'bArgonHigh', sessionId: 'bArgonHigh', name: 'ArgonHigh', model: 'liftgate/gemini-4-argon-high', createdAt: 5 },
+      bNotArgon: { id: 'bNotArgon', sessionId: 'bNotArgon', name: 'NotArgon', model: 'liftgate/gemini-4-argon2', createdAt: 6 },
+    },
+  })
+  t.after(stop)
+  await tool('list_bots', {}, 'm1')
+
+  const section = ctx.sections.get('bot-identity')
+  for (const id of ['m1', 'bBarePrefixed', 'bBarePlain', 'bArgonHigh']) {
+    assert.match(section.text({ agent: { id } }), /Antigravity Orchestrator Bridge Rule/, id)
+  }
+  for (const id of ['b2', 'bNotArgon']) {
+    assert.doesNotMatch(section.text({ agent: { id } }), /Antigravity Orchestrator Bridge Rule/, id)
+  }
 })
