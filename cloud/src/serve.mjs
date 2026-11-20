@@ -5,6 +5,7 @@
 import { readFileSync } from 'node:fs'
 import { validatePrincipals } from './api.mjs'
 import { startController } from './controller-service.mjs'
+import { createDaytonaMachineManager, mockDaytonaClient } from './daytona-machine.mjs'
 import { mockEmbedder, openaiEmbedder } from './embed.mjs'
 import { localObjectStore } from './objectstore.mjs'
 import { r2ClientFromEnv, r2ObjectStore } from './r2store.mjs'
@@ -31,16 +32,20 @@ const embedder = env.OPENAI_API_KEY && env.OPENAI_EMBEDDINGS_CONSENT === 'yes'
   ? openaiEmbedder({ apiKey: env.OPENAI_API_KEY, consentExternalTransfer: true })
   : mockEmbedder()
 const provider = env.DAYTONA_API_KEY ? daytonaProvider({ apiKey: env.DAYTONA_API_KEY }) : mockDaytona()
+const machines = env.DAYTONA_API_KEY
+  ? createDaytonaMachineManager({ apiKey: env.DAYTONA_API_KEY })
+  : createDaytonaMachineManager({ client: mockDaytonaClient() })
 
 say(`object store: ${haveR2 ? 'Cloudflare R2' : 'LOCAL stand-in (not durable)'}`)
 say(`embeddings: ${embedder.model}${embedder.model.startsWith('mock') ? ' (mock; no consent or key)' : ''}`)
 say(`sandboxes: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock (no isolation)'}`)
+say(`persistent machines: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock'}`)
 
 const localTenants = (env.EMBED_LOCAL_TENANTS ?? '').split(',').map(t => t.trim()).filter(Boolean)
 if (localTenants.length) say(`embeddings for ${localTenants.join(', ')}: local only (EMBED_LOCAL_TENANTS)`)
 
 const ctl = await startController({
-  pool, principals, embedder, localEmbedder: mockEmbedder(), localTenants, objectStore, provider, host: env.HOST ?? '127.0.0.1', port: Number(env.PORT ?? 8080),
+  pool, principals, embedder, localEmbedder: mockEmbedder(), localTenants, objectStore, provider, machines, host: env.HOST ?? '127.0.0.1', port: Number(env.PORT ?? 8080),
   bucket: haveR2 ? env.R2_BUCKET : 'artifacts', instance: env.INSTANCE_ID ?? `ctl-${process.pid}`, log: (...a) => say(...a),
 })
 say(`listening on ${ctl.base}`)
