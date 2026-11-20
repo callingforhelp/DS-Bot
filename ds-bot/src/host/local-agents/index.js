@@ -92,10 +92,16 @@ export function install(rt) {
       const record = store().sessions[sessionId]
       if (record !== undefined) Object.assign(record, patch)
     },
-    presetFor: (sessionId) => {
+    // The preset the CLI is run under: the group's or the Bot's own, else the one DSH
+    // enforces on the Session. A Bot with no preset keeps DSH's default there
+    // (permissions.js), and that default decides its approvals: under one with the
+    // `never` approval policy, a CLI left in a mode that asks has every ask rejected.
+    presetFor: async (sessionId) => {
       const bot = rt.botOf(rt.selfOf(sessionId))
       const room = rt.roomOf(rt.groupOwners.get(sessionId)?.roomId)
-      return room?.permission ?? bot?.permission ?? 'workspace-write'
+      const own = room?.permission ?? bot?.permission
+      if (own !== undefined) return own
+      return (await sessionPreset(sessionId)) ?? 'workspace-write'
     },
     cwdFor: async (sessionId) => {
       try {
@@ -168,6 +174,20 @@ export function install(rt) {
   const localAgentOf = (bot) => {
     const ref = bot?.model ?? bot?.appliedModel
     return ref !== undefined && isLocalAgentRef(ref) ? ref : undefined
+  }
+  // The preset DSH resolves for a Session from its sandbox and approval settings, or
+  // undefined when DSH offers none or they match no named preset ('custom').
+  const sessionPreset = async (sessionId) => {
+    const presets = ctx.get?.('permissionPresets')
+    if (presets === undefined) return undefined
+    try {
+      const current = presets.current((await rt.resolveAgent(sessionId)).session)
+      return current === 'custom' ? undefined : current
+    } catch (error) {
+      // An unresolvable Session runs under the fallback; the failure is recorded.
+      rt.warn('ds-bot: the permission preset of a local agent Session was not read: %s', error)
+      return undefined
+    }
   }
   const isLocalAgentSession = (sessionId) => {
     const bot = rt.botOf(rt.selfOf(sessionId))
