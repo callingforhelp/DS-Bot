@@ -48,6 +48,46 @@ test('the executor picker includes local model endpoints and excludes local agen
   assert.deepEqual(choices, ['auto', '', 'local-openai/qwen-coder', 'deepseek/v4'])
 })
 
+test('the executor picker shows an unavailable saved executor instead of falling back to Default', () => {
+  const models = [
+    { ref: 'deepseek/v4', providerName: 'DeepSeek', name: 'V4' },
+    { ref: 'unconfigured/flash', needsKey: true },
+  ]
+  const inspect = (executorModel) => {
+    const nodes = settings({ ...bot, executorModel }, { models })
+    const row = nodes.find(node => node.props?.label === 'Executor model')
+    const select = nodes.find(node => node.props?.['aria-label'] === 'Executor model')
+    const options = walk(select).filter(node => node.type === 'option').map(node => ({
+      value: node.props.value,
+      disabled: Boolean(node.props.disabled),
+      text: (node.props.children ?? []).join(''),
+    }))
+    return { row, select, options }
+  }
+
+  const missing = inspect('removed/fast')
+  assert.equal(missing.select.props.value, 'removed/fast')
+  assert.equal(missing.row.props.hint, 'This model is not available now. Pick another one.')
+  assert.deepEqual(
+    missing.options.find(option => option.value === 'removed/fast'),
+    { value: 'removed/fast', disabled: true, text: 'removed/fast (not available)' },
+  )
+
+  const unkeyed = inspect('unconfigured/flash')
+  assert.equal(unkeyed.select.props.value, 'unconfigured/flash')
+  assert.equal(unkeyed.row.props.hint, 'This model is not available now. Pick another one.')
+  assert.deepEqual(
+    unkeyed.options.find(option => option.value === 'unconfigured/flash'),
+    { value: 'unconfigured/flash', disabled: true, text: 'unconfigured/flash (not available)' },
+  )
+
+  for (const availableRef of ['deepseek/v4', undefined]) {
+    const ok = inspect(availableRef)
+    assert.equal(ok.row.props.hint, 'Optional fast model for tool steps after planning (1+1 mode).')
+    assert.equal(ok.options.some(option => option.disabled), false)
+  }
+})
+
 test('the Private switch is enabled only for a state the host accepts', () => {
   const noFolder = settings(bot).find(node => node.props?.label === 'Private')
   assert.equal(noFolder.props.disabled, true)
