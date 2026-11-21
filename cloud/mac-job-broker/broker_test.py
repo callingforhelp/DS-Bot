@@ -647,6 +647,119 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(sess["worker_terminal_id"], "term-new")
         self.assertEqual(sess["reviewer_terminal_id"], "term-rev")
 
+    def test_preupgrade_row_mark_delivery_preserves_completed_at(self) -> None:
+        # Simulate a pre-upgrade finished row: completed_at NULL, old updated_at
+        old_ts = time.time() - 100
+        with self.store._lock:
+            self.store.conn.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, target, task, repo, branch, timeout_sec,
+                    aws_session_id, status, attempt, worker_id,
+                    workspace_id, terminal_id, role,
+                    delivery_state, delivery_attempts,
+                    created_at, updated_at, expires_at
+                ) VALUES (?, 'paradev', 'old task', 'demo-app', 'main', 900,
+                          's1', 'succeeded', 1, 'mac-1',
+                          'ws-old', 'term-old', 'worker',
+                          'delivered', 1, ?, ?, ?)
+                """,
+                ("mac_oldjob1", old_ts, old_ts, old_ts + 86400),
+            )
+            self.store.conn.commit()
+
+        self._run_paradev_job(
+            {"repo": "demo-app", "branch": "main"},
+            {"workspace_id": "ws-new", "terminal_id": "term-new", "role": "worker"},
+        )
+        self._run_paradev_job(
+            {"workspace_id": "ws-new", "role": "reviewer"},
+            {"workspace_id": "ws-new", "terminal_id": "term-rev", "role": "reviewer"},
+        )
+
+        # mark_delivery must backfill completed_at from the pre-bump updated_at
+        self.store.mark_delivery("mac_oldjob1", True)
+        old_job = self.store.get_job("mac_oldjob1")
+        self.assertEqual(old_job["completed_at"], old_ts)
+        self.assertGreater(old_job["updated_at"], old_job["completed_at"])
+
+        # Delayed retry uses completed_at (t_old), so it cannot clobber ws-new
+        st, done = self._req(
+            "POST",
+            "/v1/worker/complete",
+            {
+                "job_id": "mac_oldjob1",
+                "worker_id": "mac-1",
+                "status": "succeeded",
+                "result_summary": "done",
+                "workspace_id": "ws-old",
+                "terminal_id": "term-old",
+            },
+            token="work-secret",
+        )
+        self.assertEqual(st, 200)
+
+        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(sessions["sessions"]), 1)
+        sess = sessions["sessions"][0]
+        self.assertEqual(sess["workspace_id"], "ws-new")
+        self.assertEqual(sess["worker_terminal_id"], "term-new")
+        self.assertEqual(sess["reviewer_terminal_id"], "term-rev")
+
+    def test_complete_job_rolls_back_when_session_upsert_fails(self) -> None:
+        st, data = self._req(
+            "POST",
+            "/v1/jobs",
+            {
+                "target": "paradev",
+                "task": "t",
+                "aws_session_id": "s1",
+                "repo": "demo-app",
+            },
+            token="prod-secret",
+        )
+        self.assertEqual(st, 201)
+        job_id = data["job"]["job_id"]
+        st, claim = self._req(
+            "POST",
+            "/v1/worker/claim",
+            {"worker_id": "mac-1", "hostname": "mini"},
+            token="work-secret",
+        )
+        self.assertEqual(claim["job"]["job_id"], job_id)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated session upsert failure")
+
+        orig = self.store._record_paradev_session
+        self.store._record_paradev_session = boom
+        try:
+            with self.assertRaises(Exception):
+                self._req(
+                    "POST",
+                    "/v1/worker/complete",
+                    {
+                        "job_id": job_id,
+                        "worker_id": "mac-1",
+                        "status": "succeeded",
+                        "result_summary": "done",
+                        "workspace_id": "ws-1",
+                        "terminal_id": "term-1",
+                    },
+                    token="work-secret",
+                )
+        finally:
+            self.store._record_paradev_session = orig
+
+        # The UPDATE jobs write must have been rolled back; an unrelated commit
+        # must not resurrect it.
+        self.store.touch_worker("mac-1")
+        job = self.store.get_job(job_id)
+        self.assertEqual(job["status"], "running")
+        self.assertIsNone(job["completed_at"])
+        self.assertIsNone(job["result_summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

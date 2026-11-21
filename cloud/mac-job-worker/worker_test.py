@@ -337,6 +337,82 @@ class WorkerTest(unittest.TestCase):
         )
         self.assertEqual(ls.returncode, 0)
 
+    def _make_tag_collision_repo(self) -> tuple:
+        bare_dir = os.path.join(self.tmpdir.name, "tag-collide-remote.git")
+        subprocess.run(["git", "init", "--bare", "-b", "main", bare_dir], check=True, capture_output=True)
+        src_dir = os.path.join(self.tmpdir.name, "tag-collide-repo")
+        subprocess.run(["git", "init", "-b", "main", src_dir], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=src_dir, check=True)
+        with open(os.path.join(src_dir, "README.md"), "w", encoding="utf-8") as f:
+            f.write("# tag-collide\n")
+        subprocess.run(["git", "add", "-A"], cwd=src_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", bare_dir], cwd=src_dir, check=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=src_dir, check=True, capture_output=True)
+        return bare_dir, src_dir
+
+    def test_git_sync_pull_branch_colliding_with_tag(self) -> None:
+        bare_dir, src_dir = self._make_tag_collision_repo()
+        subprocess.run(["git", "checkout", "-B", "v1"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "push", "-u", "origin", "v1"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "main"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-D", "v1"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "tag", "v1"], cwd=src_dir, check=True, capture_output=True)
+
+        res = default_git_sync_runner(
+            {
+                "task": json.dumps(
+                    {"action": "pull", "repo": src_dir, "branch": "v1"}
+                ),
+                "repo": src_dir,
+                "branch": "v1",
+            },
+            "/nonexistent",
+            parent_dir=self.tmpdir.name,
+        )
+        self.assertEqual(res["status"], "succeeded")
+        meta = json.loads(res["result_summary"])
+        self.assertTrue(meta["pulled"])
+        self.assertEqual(meta["branch"], "v1")
+        ab = subprocess.run(
+            ["git", "-C", src_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn(ab.stdout.strip(), ("v1", "heads/v1"))
+
+    def test_git_sync_branchless_push_on_tag_named_branch(self) -> None:
+        bare_dir, src_dir = self._make_tag_collision_repo()
+        subprocess.run(["git", "tag", "v1"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-B", "v1"], cwd=src_dir, check=True, capture_output=True)
+
+        res = default_git_sync_runner(
+            {
+                "task": json.dumps({"action": "push", "repo": src_dir}),
+                "repo": src_dir,
+            },
+            "/nonexistent",
+            parent_dir=self.tmpdir.name,
+        )
+        self.assertEqual(res["status"], "succeeded")
+        meta = json.loads(res["result_summary"])
+        self.assertEqual(meta["branch"], "v1")
+        ls = subprocess.run(
+            ["git", "ls-remote", "--exit-code", bare_dir, "refs/heads/v1"],
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(ls.returncode, 0)
+        ab = subprocess.run(
+            ["git", "-C", src_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn(ab.stdout.strip(), ("v1", "heads/v1"))
+
 
 FAKE_PARADEV_SCRIPT = r"""#!/usr/bin/env python3
 import json
@@ -896,6 +972,71 @@ class ParaDevRunnerTest(unittest.TestCase):
         _acquire_dir_lock(lock, timeout_sec=1.0, stale_sec=30.0)
         _release_dir_lock(lock)
         self.assertFalse(os.path.exists(lock))
+
+    def test_dsbot_strict_roots_fail_closed(self) -> None:
+        os.environ["MAC_WORKER_ALLOWED_ROOTS"] = self.tmpdir.name
+        fake_dsh = os.path.join(self.tmpdir.name, "dsh")
+        with open(fake_dsh, "w", encoding="utf-8") as f:
+            f.write(FAKE_DSH_SCRIPT)
+        os.chmod(fake_dsh, 0o755)
+        with self.assertRaises(RuntimeError) as ctx:
+            default_paradev_runner(
+                {
+                    "task": "x",
+                    "workspace_id": "ws-unknown",
+                    "agent": "dsbot",
+                    "timeout_sec": 60,
+                },
+                self.fake_bin,
+                dsh_bin=fake_dsh,
+            )
+        self.assertIn("could not be verified", str(ctx.exception))
+
+    def test_flush_concurrent_calls_no_loss(self) -> None:
+        spool = os.path.join(self.tmpdir.name, "decisions.jsonl")
+        claim = f"{spool}.flushing"
+        with open(spool, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"d": "first"}) + "\n")
+            f.write(json.dumps({"d": "second"}) + "\n")
+
+        calls: list = []
+        release = threading.Event()
+
+        class FlakyBroker(_StubBroker):
+            def post(self, path, payload, timeout=15.0):
+                if path == "/v1/decisions":
+                    calls.append(payload)
+                    if len(calls) == 1:
+                        release.wait(5)
+                        return 500, {"ok": False}
+                return super().post(path, payload, timeout)
+
+        worker = MacJobWorker(
+            broker=FlakyBroker(),
+            worker_id="mac-test",
+            state_dir=os.path.join(self.tmpdir.name, "state"),
+            paradev_runner=lambda job: {"status": "succeeded", "result_summary": "ok"},
+            dsbot_runner=lambda job: {"status": "succeeded", "result_summary": "ok"},
+        )
+        results: list = []
+        t1 = threading.Thread(
+            target=lambda: results.append(worker.flush_pending_decisions(spool))
+        )
+        t1.start()
+        time.sleep(0.2)
+        t2 = threading.Thread(
+            target=lambda: results.append(worker.flush_pending_decisions(spool))
+        )
+        t2.start()
+        release.set()
+        t1.join(timeout=10)
+        t2.join(timeout=20)
+        self.assertEqual(sorted(results), [0, 2])
+        self.assertEqual(
+            calls, [{"d": "first"}, {"d": "first"}, {"d": "second"}]
+        )
+        self.assertFalse(os.path.exists(claim))
+        self.assertFalse(os.path.exists(spool))
 
 
 if __name__ == "__main__":

@@ -767,13 +767,26 @@ def default_paradev_runner(
     if cwd and not is_authorized_local_path(cwd, paradev_bin):
         raise RuntimeError(f"Unauthorized local path: {cwd}")
 
+    ws_info = None
+    if ws_id and ws_id != "local":
+        ws_info = _get_workspace_info(paradev_bin, ws_id=ws_id)
+        wt_path = str((ws_info or {}).get("worktreePath") or "").strip()
+        if wt_path:
+            if not is_authorized_local_path(wt_path, paradev_bin):
+                raise RuntimeError(f"Unauthorized local path: {wt_path}")
+        elif "MAC_WORKER_ALLOWED_ROOTS" in os.environ:
+            raise RuntimeError(
+                f"Workspace worktree path could not be verified under strict roots: {ws_id}"
+            )
+
     if agent == "dsbot":
         worktree_path: Optional[str] = None
         if ws_id:
-            ws = _get_workspace_info(paradev_bin, ws_id=ws_id)
-            if ws:
+            if ws_info:
                 worktree_path = (
-                    ws.get("worktreePath") or ws.get("worktree_path") or ws.get("path")
+                    ws_info.get("worktreePath")
+                    or ws_info.get("worktree_path")
+                    or ws_info.get("path")
                 )
         elif repo_hint or cwd:
             proj, _ = ensure_paradev_project(
@@ -886,17 +899,6 @@ def default_paradev_runner(
             store.upsert(session_key, entry)
         except Exception:
             pass
-
-    if ws_id and ws_id != "local":
-        ws_info = _get_workspace_info(paradev_bin, ws_id=ws_id)
-        wt_path = str((ws_info or {}).get("worktreePath") or "").strip()
-        if wt_path:
-            if not is_authorized_local_path(wt_path, paradev_bin):
-                raise RuntimeError(f"Unauthorized local path: {wt_path}")
-        elif "MAC_WORKER_ALLOWED_ROOTS" in os.environ:
-            raise RuntimeError(
-                f"Workspace worktree path could not be verified under strict roots: {ws_id}"
-            )
 
     if ws_id and term_id:
         send_res = subprocess.run(
@@ -1055,6 +1057,20 @@ def _run_git(
     )
 
 
+def _current_branch_name(repo_path: str) -> Optional[str]:
+    sym = _run_git(["symbolic-ref", "--quiet", "HEAD"], cwd=repo_path)
+    if sym.returncode == 0:
+        ref = sym.stdout.strip()
+        if ref.startswith("refs/heads/"):
+            return ref[len("refs/heads/"):]
+        if ref:
+            return ref
+    br_res = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+    if br_res.returncode == 0 and br_res.stdout.strip():
+        return br_res.stdout.strip()
+    return None
+
+
 def _resolve_mac_repo_path(
     repo_hint: str, paradev_bin: str, parent_dir: str = "/Users/chief"
 ) -> tuple[str, str]:
@@ -1161,9 +1177,20 @@ def default_git_sync_runner(
             if dirty:
                 dirty_skipped = True
             else:
-                co = _run_git(["checkout", req_branch], cwd=repo_path)
-                if co.returncode != 0:
-                    co = _run_git(["checkout", "-B", req_branch, f"origin/{req_branch}"], cwd=repo_path)
+                has_local_branch = (
+                    _run_git(
+                        ["show-ref", "--verify", "--quiet", f"refs/heads/{req_branch}"],
+                        cwd=repo_path,
+                    ).returncode
+                    == 0
+                )
+                if has_local_branch:
+                    co = _run_git(["checkout", req_branch], cwd=repo_path)
+                else:
+                    co = _run_git(
+                        ["checkout", "-B", req_branch, f"origin/{req_branch}"],
+                        cwd=repo_path,
+                    )
                 if co.returncode != 0:
                     return {
                         "status": "failed",
@@ -1194,7 +1221,6 @@ def default_git_sync_runner(
                     }
                 pulled = True
 
-        br_res = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
         sha_res = _run_git(["rev-parse", "--short", "HEAD"], cwd=repo_path)
         rem_res = _run_git(["remote", "get-url", "origin"], cwd=repo_path)
         summary = {
@@ -1202,7 +1228,7 @@ def default_git_sync_runner(
             "repo": short_name,
             "path": repo_path,
             "remote_url": rem_res.stdout.strip() if rem_res.returncode == 0 else (remote_hint or None),
-            "branch": br_res.stdout.strip() if br_res.returncode == 0 else (req_branch or None),
+            "branch": _current_branch_name(repo_path) or (req_branch or None),
             "commit": sha_res.stdout.strip() if sha_res.returncode == 0 else None,
             "pulled": pulled,
             "dirty_skipped": dirty_skipped,
@@ -1241,8 +1267,7 @@ def default_git_sync_runner(
                 "error": redact_secrets(cm.stderr or cm.stdout or "initial commit failed"),
             }
 
-    cur_br_res = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
-    cur_branch = cur_br_res.stdout.strip() if cur_br_res.returncode == 0 else "main"
+    cur_branch = _current_branch_name(repo_path) or "main"
     st = _run_git(["status", "--porcelain"], cwd=repo_path)
     dirty_committed = False
     active_branch = cur_branch
@@ -1611,47 +1636,54 @@ class MacJobWorker:
         claim_path = f"{spool_path}.flushing"
         claim_tmp = f"{claim_path}.tmp"
         lock_dir = f"{spool_path}.lock"
-        lines: list[str] = []
-        _acquire_dir_lock(lock_dir)
+        flush_lock_dir = f"{spool_path}.flush.lock"
+        _acquire_dir_lock(flush_lock_dir, timeout_sec=15.0, stale_sec=60.0)
         try:
-            if os.path.exists(claim_path):
-                with open(claim_path, "r", encoding="utf-8") as f:
-                    lines.extend(ln.strip() for ln in f if ln.strip())
-            if os.path.exists(spool_path):
-                with open(spool_path, "r", encoding="utf-8") as f:
-                    lines.extend(ln.strip() for ln in f if ln.strip())
-                if lines:
-                    with open(claim_tmp, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
-                    os.replace(claim_tmp, claim_path)
-                os.remove(spool_path)
-        finally:
-            _release_dir_lock(lock_dir)
-        if not lines:
-            if os.path.exists(claim_path):
-                os.remove(claim_path)
-            return 0
-        remaining: list[str] = []
-        flushed = 0
-        for idx, ln in enumerate(lines):
+            lines: list[str] = []
+            _acquire_dir_lock(lock_dir)
             try:
-                payload = json.loads(ln)
-                code, _ = self.broker.post("/v1/decisions", payload, timeout=10.0)
-                if code in (200, 201):
-                    flushed += 1
-                else:
+                if os.path.exists(claim_path):
+                    with open(claim_path, "r", encoding="utf-8") as f:
+                        lines.extend(ln.strip() for ln in f if ln.strip())
+                if os.path.exists(spool_path):
+                    with open(spool_path, "r", encoding="utf-8") as f:
+                        lines.extend(ln.strip() for ln in f if ln.strip())
+                    if lines:
+                        with open(claim_tmp, "w", encoding="utf-8") as f:
+                            f.write("\n".join(lines) + "\n")
+                        os.replace(claim_tmp, claim_path)
+                    os.remove(spool_path)
+            finally:
+                _release_dir_lock(lock_dir)
+            if not lines:
+                if os.path.exists(claim_path):
+                    os.remove(claim_path)
+                return 0
+            remaining: list[str] = []
+            flushed = 0
+            for idx, ln in enumerate(lines):
+                try:
+                    payload = json.loads(ln)
+                    code, _ = self.broker.post(
+                        "/v1/decisions", payload, timeout=10.0
+                    )
+                    if code in (200, 201):
+                        flushed += 1
+                    else:
+                        remaining.extend(lines[idx:])
+                        break
+                except Exception:
                     remaining.extend(lines[idx:])
                     break
-            except Exception:
-                remaining.extend(lines[idx:])
-                break
-        if remaining:
-            with open(claim_tmp, "w", encoding="utf-8") as f:
-                f.write("\n".join(remaining) + "\n")
-            os.replace(claim_tmp, claim_path)
-        elif os.path.exists(claim_path):
-            os.remove(claim_path)
-        return flushed
+            if remaining:
+                with open(claim_tmp, "w", encoding="utf-8") as f:
+                    f.write("\n".join(remaining) + "\n")
+                os.replace(claim_tmp, claim_path)
+            elif os.path.exists(claim_path):
+                os.remove(claim_path)
+            return flushed
+        finally:
+            _release_dir_lock(flush_lock_dir)
 
     def poll_once(self) -> Optional[dict[str, Any]]:
         code, data = self.broker.post(

@@ -145,6 +145,9 @@ class BrokerStore:
                     self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
                     pass
+            self.conn.execute(
+                "UPDATE jobs SET completed_at = updated_at WHERE completed_at IS NULL AND status IN ('succeeded', 'failed')"
+            )
             self.conn.commit()
 
     def close(self) -> None:
@@ -418,60 +421,71 @@ class BrokerStore:
                 return False, None
             # Idempotent re-delivery from same worker if already finished
             if row["status"] in ("succeeded", "failed") and row["worker_id"] == worker_id:
-                comp_src = row["completed_at"] if "completed_at" in row.keys() else None
-                comp_ts = float(comp_src if comp_src is not None else row["updated_at"])
-                self._record_paradev_session(
-                    row, workspace_id, terminal_id, role, agent, worktree_path,
-                    job_id, comp_ts,
-                )
-                self.conn.commit()
+                try:
+                    comp_ts = float(
+                        row["completed_at"]
+                        if "completed_at" in row.keys() and row["completed_at"] is not None
+                        else row["updated_at"]
+                    )
+                    self._record_paradev_session(
+                        row, workspace_id, terminal_id, role, agent, worktree_path,
+                        job_id, comp_ts,
+                    )
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
                 return True, self._row_to_dict(row)
             if row["status"] not in ("running", "lease_lost") or (
                 row["worker_id"] and row["worker_id"] != worker_id
             ):
                 return False, self._row_to_dict(row)
-            self.conn.execute(
-                """
-                UPDATE jobs
-                SET status = ?,
-                    result_summary = ?,
-                    pr_url = ?,
-                    error = ?,
-                    lease_expires_at = NULL,
-                    delivery_state = 'pending',
-                    workspace_id = COALESCE(?, workspace_id),
-                    terminal_id = COALESCE(?, terminal_id),
-                    role = COALESCE(?, role),
-                    agent = COALESCE(?, agent),
-                    worktree_path = COALESCE(?, worktree_path),
-                    completed_at = COALESCE(completed_at, ?),
-                    updated_at = ?
-                WHERE job_id = ?
-                """,
-                (
-                    status,
-                    clean_summary,
-                    clean_pr,
-                    clean_error,
-                    workspace_id,
-                    terminal_id,
-                    role,
-                    agent,
-                    worktree_path,
-                    now,
-                    now,
-                    job_id,
-                ),
-            )
-            updated = self.conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
-            ).fetchone()
-            if updated is not None:
-                self._record_paradev_session(
-                    updated, workspace_id, terminal_id, role, agent, worktree_path,
-                    job_id, now,
+            try:
+                self.conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?,
+                        result_summary = ?,
+                        pr_url = ?,
+                        error = ?,
+                        lease_expires_at = NULL,
+                        delivery_state = 'pending',
+                        workspace_id = COALESCE(?, workspace_id),
+                        terminal_id = COALESCE(?, terminal_id),
+                        role = COALESCE(?, role),
+                        agent = COALESCE(?, agent),
+                        worktree_path = COALESCE(?, worktree_path),
+                        completed_at = COALESCE(completed_at, ?),
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        status,
+                        clean_summary,
+                        clean_pr,
+                        clean_error,
+                        workspace_id,
+                        terminal_id,
+                        role,
+                        agent,
+                        worktree_path,
+                        now,
+                        now,
+                        job_id,
+                    ),
                 )
-            self.conn.commit()
+                updated = self.conn.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if updated is not None:
+                    self._record_paradev_session(
+                        updated, workspace_id, terminal_id, role, agent, worktree_path,
+                        job_id, now,
+                    )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
         return True, self._row_to_dict(updated)
 
     def _record_paradev_session(
@@ -629,6 +643,7 @@ class BrokerStore:
                     UPDATE jobs
                     SET delivery_state = 'delivered',
                         delivery_attempts = delivery_attempts + 1,
+                        completed_at = COALESCE(completed_at, updated_at),
                         updated_at = ?
                     WHERE job_id = ?
                     """,
@@ -639,6 +654,7 @@ class BrokerStore:
                     """
                     UPDATE jobs
                     SET delivery_attempts = delivery_attempts + 1,
+                        completed_at = COALESCE(completed_at, updated_at),
                         updated_at = ?
                     WHERE job_id = ?
                     """,
