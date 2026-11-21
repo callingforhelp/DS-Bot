@@ -269,6 +269,7 @@ export function createDaytonaMachineManager({
   scheduleHorizonMs = 5 * 60_000,
   preWakeLeadMs = 2 * 60_000,
   jobLeaseMs = 5 * 60_000,
+  stateRefreshTtlMs = 15_000,
   botStatePath,
   store,
   now = Date.now,
@@ -370,7 +371,33 @@ export function createDaytonaMachineManager({
     if (!sandbox) throw new Error(`sandbox ${machine.id} not found`)
     machine.sandbox = sandbox
     machine.state = sandbox.state ?? machine.state
+    machine.sandboxRefreshedAt = now()
     return sandbox
+  }
+
+  // A refresh costs a Daytona API round-trip. Hot paths (each turn, the 2s idle
+  // tick) share one refresh per stateRefreshTtlMs; a stale 'started' handle that
+  // fails anyway is woken and retried by withWakeRetry. Transitions force it.
+  async function refreshSandbox(machine, { force = false } = {}) {
+    if (!machine.sandbox) return resolveSandbox(machine)
+    if (!force && now() - (machine.sandboxRefreshedAt ?? -Infinity) < stateRefreshTtlMs) {
+      return machine.sandbox
+    }
+    if (typeof machine.sandbox.refreshData === 'function') {
+      await machine.sandbox.refreshData()
+      machine.state = machine.sandbox.state ?? machine.state
+      machine.sandboxRefreshedAt = now()
+      return machine.sandbox
+    }
+    if (typeof client.get === 'function') {
+      const fresh = await client.get(machine.id)
+      if (fresh) {
+        machine.sandbox = fresh
+        machine.state = fresh.state ?? machine.state
+      }
+      machine.sandboxRefreshedAt = now()
+    }
+    return machine.sandbox
   }
 
   function requireMachine(machineId) {
@@ -419,23 +446,37 @@ export function createDaytonaMachineManager({
     const machine = requireMachine(machineId)
     if ((await syncFromStore(machine)) === null) throw new Error(`unknown machine: ${machineId}`)
     let woke = false
+    let stoppingWaits = 0
+    let justResolved = false
     while (true) {
       if (!machine.sandbox) {
         await resolveSandbox(machine)
+        justResolved = true
         continue
       }
       if (machine.sleepLock) {
         machine.sleepAborted = true
         await machine.sleepLock
+        justResolved = false
         continue
       }
       if (machine.startLock) {
         await machine.startLock
         woke = true
+        justResolved = false
         continue
       }
+      // resolveSandbox already returned fresh state; forcing another API refresh
+      // right after it would pay a second Daytona round-trip for the same answer.
+      await refreshSandbox(machine, { force: !justResolved })
+      justResolved = false
       const state = currentState(machine)
-      if (state !== 'stopped') {
+      if (state === 'stopping' && stoppingWaits < 60) {
+        stoppingWaits += 1
+        await new Promise(resolve => setTimeout(resolve, 500))
+        continue
+      }
+      if (state !== 'stopped' && state !== 'archived') {
         machine.state = state
         machine.lastActivityAt = now()
         return { woke, reason }
@@ -478,7 +519,9 @@ export function createDaytonaMachineManager({
         await machine.sleepLock
         continue
       }
-      if (currentState(machine) === 'stopped' || machine.startLock) {
+      await refreshSandbox(machine)
+      const state = currentState(machine)
+      if (state === 'stopped' || state === 'archived' || state === 'stopping' || machine.startLock) {
         const res = await ensureAwake(machineId, reason)
         woke ||= res.woke
         continue
@@ -562,6 +605,9 @@ export function createDaytonaMachineManager({
     if (machine.sleepLock) await machine.sleepLock
     if (machine.startLock) await machine.startLock
     await syncFromStore(machine)
+    // A stale 'started' handle (provider-side autostop) must not wake a machine
+    // whose captured cache can answer the read.
+    if (machine.sandbox) await refreshSandbox(machine).catch(() => {})
     if (currentState(machine) === 'stopped' && machine.cache.fresh && cacheHit()) {
       return { value: structuredClone(readCache()), fromCache: true, woke: false, epoch: machine.cache.capturedEpoch }
     }
@@ -613,6 +659,20 @@ export function createDaytonaMachineManager({
     })
   }
 
+  // A handle may carry a stale 'started' state past the refresh TTL: run the
+  // sandbox op, and only when it reports a not-running sandbox wake and retry.
+  const notRunning = err => /stop|archiv|delet|not.{0,12}(start|running)|not.{0,12}found|ECONN|fetch failed|socket hang ?up/i.test(String(err?.message ?? err))
+
+  async function withWakeRetry(machineId, run) {
+    try {
+      return await run()
+    } catch (err) {
+      if (!notRunning(err)) throw err
+      await ensureAwake(machineId, 'wake-retry')
+      return run()
+    }
+  }
+
   return {
     client,
     machines,
@@ -653,6 +713,7 @@ export function createDaytonaMachineManager({
         activeMutations: 0,
         mutationSeq: 0,
         lastActivityAt: now(),
+        sandboxRefreshedAt: now(),
         epoch: 1,
         seq: 0,
         nextScheduledAt: null,
@@ -778,9 +839,9 @@ export function createDaytonaMachineManager({
         existing.seq = machine.seq
         machine.cache.threads.set(threadId, existing)
 
-        const result = typeof handler === 'function'
-          ? await handler(machine.sandbox, message)
-          : await machine.sandbox.process.executeCommand(String(text ?? ''), undefined, undefined, 120)
+        const result = await withWakeRetry(machineId, () => typeof handler === 'function'
+          ? handler(machine.sandbox, message)
+          : machine.sandbox.process.executeCommand(String(text ?? ''), undefined, undefined, 120))
         if (result?.reply !== undefined) {
           machine.seq += 1
           existing.messages.push({ role: 'assistant', botId, text: result.reply, seq: machine.seq, at: now() })
@@ -793,7 +854,7 @@ export function createDaytonaMachineManager({
     async execCommand(machineId, script, { cwd, env, timeoutSecs = 120 } = {}) {
       return withMutation(machineId, 'exec-command', async (machine, woke) => {
         machine.epoch += 1
-        const res = await machine.sandbox.process.executeCommand(script, cwd, env, timeoutSecs)
+        const res = await withWakeRetry(machineId, () => machine.sandbox.process.executeCommand(script, cwd, env, timeoutSecs))
         return { woke, exitCode: res.exitCode, stdout: res.result, epoch: machine.epoch }
       })
     },
@@ -955,19 +1016,26 @@ export function createDaytonaMachineManager({
     async sleep(machineId, { saveSnapshot = false, snapshotName } = {}) {
       const machine = requireMachine(machineId)
       if ((await syncFromStore(machine)) === null) return { slept: false, reason: 'deleted' }
-      await resolveSandbox(machine)
       if (machine.sleepLock) return machine.sleepLock
       const remoteBusy = (machine.remoteBusyUntil ?? 0) > now()
       if (machine.activeJobs > 0 || remoteBusy || machine.startLock) {
         return { slept: false, reason: 'busy', activeJobs: machine.activeJobs + (remoteBusy ? 1 : 0) }
       }
-      if (currentState(machine) === 'stopped') {
+      await refreshSandbox(machine, { force: true })
+      const state = currentState(machine)
+      if (state === 'stopped' || state === 'archived') {
+        machine.state = state
+        await persist(machine).catch(() => {})
         return {
           slept: true,
           alreadyStopped: true,
           capturedSeq: machine.cache.capturedSeq,
           capturedEpoch: machine.cache.capturedEpoch,
         }
+      }
+      if (state === 'stopping') {
+        machine.state = state
+        return { slept: false, reason: 'stopping' }
       }
       machine.sleepAborted = false
       const aborted = () => ({ slept: false, reason: 'aborted' })
@@ -1026,13 +1094,19 @@ export function createDaytonaMachineManager({
     async checkIdleAndSchedule(machineId) {
       const machine = requireMachine(machineId)
       if ((await syncFromStore(machine)) === null) return { action: 'none', reason: 'deleted' }
+      await refreshSandbox(machine)
       const state = currentState(machine)
-      if (state === 'stopped') {
+      if (state === 'stopped' || state === 'archived') {
+        machine.state = state
         if (machine.nextScheduledAt !== null && machine.nextScheduledAt - now() <= preWakeLeadMs) {
           await ensureAwake(machineId, 'scheduled-work')
           return { action: 'pre-woke', reason: 'scheduled-work' }
         }
-        return { action: 'none', state: 'stopped' }
+        return { action: 'none', state }
+      }
+      if (state === 'stopping') {
+        machine.state = state
+        return { action: 'none', state: 'stopping' }
       }
       if (machine.keepAwake) {
         await resolveSandbox(machine)
@@ -1092,6 +1166,7 @@ export function createDaytonaMachineManager({
                   if (cur && !cur.sandbox) {
                     cur.sandbox = fetched
                     cur.state = fetched?.state ?? cur.state
+                    cur.sandboxRefreshedAt = now()
                   }
                 } catch {
                   // Keep sandbox null so the next operation retries client.get().
@@ -1110,6 +1185,7 @@ export function createDaytonaMachineManager({
               if (!concurrent.sandbox && sandbox) {
                 concurrent.sandbox = sandbox
                 concurrent.state = sandbox.state ?? concurrent.state
+                concurrent.sandboxRefreshedAt = now()
               }
               continue
             }
@@ -1136,6 +1212,7 @@ export function createDaytonaMachineManager({
               sleepLock: null,
               sleepAborted: false,
               startLock: null,
+              sandboxRefreshedAt: sandbox ? now() : null,
               cache: {
                 fresh: Boolean(row.cache?.fresh),
                 capturedSeq: row.cache?.capturedSeq ?? 0,

@@ -651,3 +651,88 @@ test('Review P2: immediate resize reconciles superseded pendingResize fields so 
   assert.equal(machine.size, 'large')
   assert.equal(machine.pendingResize, null)
 })
+
+test('external Daytona auto-stop is refreshed before sendMessage wake and idle tick', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'autostop-sync', idleMinutes: 15 })
+
+  let remoteState = 'started'
+  Object.defineProperty(machine.sandbox, 'state', {
+    get: () => remoteState,
+    configurable: true,
+  })
+  machine.sandbox.refreshData = async () => {}
+
+  // Provider auto-stops externally while controller still thinks it is started.
+  remoteState = 'stopped'
+  clock.advance(16 * 60_000)
+
+  const idleRes = await mgr.checkIdleAndSchedule(machine.id)
+  assert.equal(idleRes.action, 'none')
+  assert.equal(idleRes.state, 'stopped')
+  assert.equal(machine.state, 'stopped')
+
+  // Incoming sendMessage wakes the externally stopped sandbox.
+  const origStart = machine.sandbox.start.bind(machine.sandbox)
+  machine.sandbox.start = async () => {
+    remoteState = 'started'
+    return origStart()
+  }
+  const msgRes = await mgr.sendMessage(machine.id, {
+    threadId: 'thread-1',
+    botId: 'coder',
+    text: 'hello after autostop',
+    handler: async () => ({ reply: 'ok' }),
+  })
+  assert.equal(msgRes.woke, true)
+  assert.equal(msgRes.result.reply, 'ok')
+})
+
+test('ensureAwake resolves a missing sandbox handle with a single Daytona fetch', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'resolve-once' })
+
+  let getCalls = 0
+  const origGet = client.get.bind(client)
+  client.get = async (sid) => { getCalls += 1; return origGet(sid) }
+
+  machine.sandbox = null
+  machine.sandboxRefreshedAt = null
+  const res = await mgr.ensureAwake(machine.id)
+  assert.equal(res.woke, false)
+  assert.equal(getCalls, 1)
+})
+
+test('stale started handle does not wake an auto-stopped machine for a cached read', async () => {
+  const clock = makeClock()
+  const client = mockDaytonaClient({ now: clock.now })
+  const mgr = createDaytonaMachineManager({ client, now: clock.now })
+  const machine = await mgr.createMachine({ name: 'asleep-read' })
+
+  await mgr.captureState(machine.id, {
+    roster: { coder: 'neon' },
+    threads: {},
+    projects: [],
+  })
+  machine.cache.fresh = true
+
+  // Provider-side autostop behind a stale 'started' handle: SDK state is fetched
+  // once, so the handle keeps saying 'started' until refreshData runs.
+  const record = client.sandboxes.get(machine.id).record
+  let handleState = 'started'
+  Object.defineProperty(machine.sandbox, 'state', { get: () => handleState, configurable: true })
+  machine.sandbox.refreshData = async () => { handleState = record.state }
+  record.state = 'stopped'
+  clock.advance(60_000)
+
+  const roster = await mgr.readRoster(machine.id)
+  assert.equal(roster.fromCache, true)
+  assert.equal(roster.woke, false)
+  assert.equal(roster.value.coder, 'neon')
+  assert.equal(record.state, 'stopped')
+  assert.equal(record.startCount, 1)
+})

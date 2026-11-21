@@ -681,3 +681,75 @@ test('createDshMessageHandler authenticates via DSH session cookie, delivers /ap
 
   await alice('DELETE', `/v1/machines/${id}`)
 })
+
+test('createDshMessageHandler falls back to sandbox inbox when allowSandboxInboxFallback is true and DSH login returns 401', async () => {
+  const execCalls = []
+  const fakeSandbox = {
+    getPreviewLink: async port => ({ url: `http://preview.invalid:${port}`, token: 'ptok' }),
+    process: {
+      executeCommand: async (script) => {
+        execCalls.push(script)
+        return { exitCode: 0, result: '' }
+      },
+    },
+  }
+  const fakeFetch = async () => ({ ok: false, status: 401, headers: { getSetCookie: () => [] } })
+
+  const strictHandler = createDshMessageHandler({ port: 3080, authToken: 'static', fetchImpl: fakeFetch })
+  await assert.rejects(
+    () => strictHandler({ id: 'm1' }, fakeSandbox, { threadId: 's1', botId: 'coder', text: 'hello' }),
+    /DSH login returned no session cookie \(HTTP 401\)/,
+  )
+  assert.equal(execCalls.length, 0)
+
+  const fallbackHandler = createDshMessageHandler({
+    port: 3080,
+    authToken: 'static',
+    fetchImpl: fakeFetch,
+    allowSandboxInboxFallback: true,
+  })
+  const out = await fallbackHandler({ id: 'm1' }, fakeSandbox, { threadId: 's1', botId: 'coder', text: 'hello sandbox' })
+  assert.equal(out.delivered, true)
+  assert.equal(out.mode, 'sandbox-inbox')
+  assert.equal(out.inboxPath, '/workspace/.ds-bot/inbox/s1.jsonl')
+  assert.equal(execCalls.length, 1)
+  assert.match(execCalls[0], /HANDOFF\.md/)
+})
+
+test('createDshMessageHandler falls back to sandbox inbox when the re-login after a 401 also fails', async () => {
+  const execCalls = []
+  const fakeSandbox = {
+    getPreviewLink: async port => ({ url: `http://preview.invalid:${port}`, token: 'ptok' }),
+    process: {
+      executeCommand: async (script) => {
+        execCalls.push(script)
+        return { exitCode: 0, result: '' }
+      },
+    },
+  }
+  let logins = 0
+  const fakeFetch = async (url, init = {}) => {
+    const parsedUrl = new URL(String(url))
+    if (init.method === 'POST' && parsedUrl.pathname === '/api/bot') {
+      return { ok: false, status: 401, headers: { getSetCookie: () => [] }, json: async () => ({ ok: false, error: 'unauthorized' }) }
+    }
+    logins += 1
+    if (logins === 1) {
+      return { ok: false, status: 302, headers: { getSetCookie: () => ['dsh_session=s1; HttpOnly; Path=/'] } }
+    }
+    return { ok: false, status: 401, headers: { getSetCookie: () => [] } }
+  }
+
+  const handler = createDshMessageHandler({
+    port: 3080,
+    authToken: 'static',
+    fetchImpl: fakeFetch,
+    allowSandboxInboxFallback: true,
+  })
+  const out = await handler({ id: 'm2' }, fakeSandbox, { threadId: 's9', botId: 'coder', text: 'retry path' })
+  assert.equal(out.delivered, true)
+  assert.equal(out.mode, 'sandbox-inbox')
+  assert.equal(out.inboxPath, '/workspace/.ds-bot/inbox/s9.jsonl')
+  assert.equal(logins, 2)
+  assert.equal(execCalls.length, 1)
+})
