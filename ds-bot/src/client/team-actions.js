@@ -282,6 +282,16 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     diagnosticsLog: () => call('diagnostics-log'),
     diagnosticsClear: () => call('diagnostics-clear'),
     repoStars: () => call('repo-stars'),
+    cloudStatus: () => after(call('cloud-status')),
+    cloudPreflight: sessionId => call('cloud-preflight', { sessionId }),
+    handoffToCloud: payload => after(call('cloud-handoff-to-cloud', payload)),
+    handoffToLocal: payload => after(call('cloud-handoff-to-local', payload)),
+    cloudSend: (sessionId, text) => after(call('cloud-send', { sessionId, text })),
+    dismissCloudHandoff: sessionId => after(call('cloud-dismiss-handoff', { sessionId })),
+    voiceStatus: sessionId => call('voice-status', { sessionId }).catch(() => ({ available: false })),
+    voiceSessionCreate: payload => call('voice-session-create', payload),
+    voiceSessionClose: liveSessionId => call('voice-session-close', { liveSessionId }).catch(() => ({ closed: false })),
+    voiceTranscriptAppend: (sessionId, role, text) => call('voice-transcript-append', { sessionId, role, text }).catch(() => ({ saved: false })),
     // A failed action away from any form (a menu, the palette) shows as a toast.
     reportError: (error, where = 'action') => {
       noteClientError(where, error)

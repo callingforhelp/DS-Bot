@@ -2,7 +2,7 @@
 // `POST /api/bot` route (`{ endpoint: 'send', payload: { sessionId, text } }`).
 // Authenticates through Daytona's preview link (`x-daytona-preview-token`) and obtains a DSH
 // session cookie via `GET /?token=<authToken>` (matching `ds-bot/dev/smoke.mjs`).
-export function createDshMessageHandler({ port, authToken, timeoutMs = 30_000, fetchImpl = fetch } = {}) {
+export function createDshMessageHandler({ port, authToken, timeoutMs = 30_000, fetchImpl = fetch, allowSandboxInboxFallback = false } = {}) {
   const portNum = Number(port)
   if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
     throw new Error(`invalid DSH port: ${port}`)
@@ -12,6 +12,20 @@ export function createDshMessageHandler({ port, authToken, timeoutMs = 30_000, f
   }
 
   const cookieCache = new Map()
+
+  async function deliverViaSandboxInbox(sandbox, { sessionId, botId, text }) {
+    const safeId = sessionId.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80) || 'default'
+    const inboxPath = `/workspace/.ds-bot/inbox/${safeId}.jsonl`
+    const at = new Date().toISOString()
+    const lineB64 = Buffer.from(JSON.stringify({ sessionId, botId: botId ?? null, text, at }) + '\n', 'utf8').toString('base64')
+    const mdB64 = Buffer.from(`# Latest Handoff (${at})\n- Session: ${sessionId}\n- Bot: ${botId ?? '-'}\n\n${text}\n`, 'utf8').toString('base64')
+    const cmd = `mkdir -p /workspace/.ds-bot/inbox && printf '%s' '${mdB64}' | base64 -d > /workspace/.ds-bot/HANDOFF.md && printf '%s' '${lineB64}' | base64 -d >> '${inboxPath}'`
+    const execRes = await sandbox.process.executeCommand(cmd, undefined, undefined, Math.ceil(timeoutMs / 1000))
+    if (execRes?.exitCode !== 0) {
+      throw new Error(`Sandbox inbox fallback failed (exit ${execRes?.exitCode}): ${execRes?.result ?? ''}`)
+    }
+    return { delivered: true, sessionId, mode: 'sandbox-inbox', endpoint: 'sandbox-inbox', inboxPath }
+  }
 
   async function loginForCookie(baseUrl, previewToken) {
     const loginUrl = `${baseUrl}/?token=${encodeURIComponent(authToken)}`
@@ -64,17 +78,35 @@ export function createDshMessageHandler({ port, authToken, timeoutMs = 30_000, f
       })
     }
 
+    const login = async () => {
+      const fresh = await loginForCookie(baseUrl, preview.token)
+      cookieCache.set(cacheKey, fresh)
+      return fresh
+    }
+    const fallbackOrThrow = (err) => {
+      if (allowSandboxInboxFallback && typeof sandbox?.process?.executeCommand === 'function') {
+        return deliverViaSandboxInbox(sandbox, { sessionId, botId: message.botId, text })
+      }
+      throw err
+    }
+
     let cookie = cookieCache.get(cacheKey)
     if (!cookie) {
-      cookie = await loginForCookie(baseUrl, preview.token)
-      cookieCache.set(cacheKey, cookie)
+      try {
+        cookie = await login()
+      } catch (loginError) {
+        return fallbackOrThrow(loginError)
+      }
     }
 
     let res = await postSend(cookie)
     if (res.status === 401 || res.status === 403) {
       cookieCache.delete(cacheKey)
-      cookie = await loginForCookie(baseUrl, preview.token)
-      cookieCache.set(cacheKey, cookie)
+      try {
+        cookie = await login()
+      } catch (loginError) {
+        return fallbackOrThrow(loginError)
+      }
       res = await postSend(cookie)
     }
 

@@ -114,4 +114,7 @@ export const ChatsIcon = lineIcon(['M3.5 5.5A1.5 1.5 0 0 1 5 4h7a1.5 1.5 0 0 1 1
 export const ImIcon = lineIcon(['M6.5 3.5h7A1.5 1.5 0 0 1 15 5v10a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 5 15V5a1.5 1.5 0 0 1 1.5-1.5z', 'M8 15.8h4', 'M8 6.5h4A1 1 0 0 1 13 7.5v2a1 1 0 0 1-1 1h-2.5L8 12v-5.5A1 1 0 0 1 8 6.5z'])
 // Stacked lines with a running start: queued messages.
 export const QueueIcon = lineIcon(['M4 6h12', 'M4 10h12', 'M4 14h8', 'M14 12.5l2 1.5-2 1.5'])
+export const CloudIcon = lineIcon(['M6.2 15.5h8.1a3.2 3.2 0 0 0 .4-6.38A4.6 4.6 0 0 0 5.9 7.8 3.6 3.6 0 0 0 6.2 15.5z'])
+export const ArrowUpRightIcon = lineIcon(['M6.5 13.5L13.5 6.5', 'M8 6.5h5.5V12'])
+export const ArrowDownLeftIcon = lineIcon(['M13.5 6.5L6.5 13.5', 'M12 13.5H6.5V8'])
 export const SETTINGS_ICONS = { general: GearIcon, bots: PeopleIcon, groups: ChatsIcon, im: ImIcon, usage: GaugeIcon }

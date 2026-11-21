@@ -8,6 +8,7 @@ import { PlusIcon, SearchIcon, SidebarIcon, GaugeIcon, ClockIcon, GearIcon, PinM
 import { lookOf, MAIN_LOOK } from './characters.js'
 import { botState, BotMark, BotAvatar, RoomAvatar } from './mark.js'
 import { AgentBadge } from './agent-badge.js'
+import { RuntimeBadge, SidebarRuntimeSwitch, runtimeOf } from './runtime-pill.js'
 import { reducedMotion } from './activity-row.js'
 import { Shimmer, workPhrase } from './cells.js'
 import { SPRING_GLIDE, SPRING_POP, SPRING_SHAPE, SPRING_TAP, stepMenuFocus, useLinger, useViewport, viewBottom } from './motion.js'
@@ -96,7 +97,7 @@ function BotRow({ bot, roster, actions, useSessions, useSessionStatus, useSessio
       'data-bot-id': id, title: preview || bot.name, onClick: () => actions.openSession(id), onContextMenu,
     },
     h(BotAvatar, { bot, size: 60, state, main: true }),
-    h('span', { className: 'bt-tile-name' }, bot.name),
+    h('span', { className: 'bt-tile-name' }, bot.name, h(RuntimeBadge, { runtime: runtimeOf(roster, bot.id) })),
     bot.role ? h('span', { className: 'bt-chip' }, bot.role) : null))
   }
   return h('button', {
@@ -109,7 +110,7 @@ function BotRow({ bot, roster, actions, useSessions, useSessionStatus, useSessio
   h(BotAvatar, { bot, size: wide ? 36 : 44, state, main }),
   pinned && !wide ? h(PinMark) : null,
   wide ? h('span', { className: 'bt-row-body' },
-    h('span', { className: 'bt-row-name' }, h('span', { className: 'bt-row-title' }, bot.name), bot.engine ? h(AgentBadge, { engine: bot.engine }) : null, pinned ? h(PinMark) : null),
+    h('span', { className: 'bt-row-name' }, h('span', { className: 'bt-row-title' }, bot.name), bot.engine ? h(AgentBadge, { engine: bot.engine }) : null, h(RuntimeBadge, { runtime: runtimeOf(roster, bot.id) }), pinned ? h(PinMark) : null),
     runningLine ? h('span', { className: 'bt-row-preview' }, runningLine)
       : awayLine ? h('span', { className: 'bt-row-preview' }, awayLine)
         : waitsFor ? h('span', { className: 'bt-row-preview' }, waitsFor)
@@ -145,7 +146,7 @@ function RoomRow({ room, roster, actions, useSessions, useSessionStatus, useSess
   h(RoomAvatar, { room, roster, size: wide ? 36 : 44 }),
   pinned && !wide ? h(PinMark) : null,
   wide ? h('span', { className: 'bt-row-body' },
-    h('span', { className: 'bt-row-name' }, h('span', { className: 'bt-row-title' }, room.name), pinned ? h(PinMark) : null),
+    h('span', { className: 'bt-row-name' }, h('span', { className: 'bt-row-title' }, room.name), h(RuntimeBadge, { runtime: runtimeOf(roster, room.id) }), pinned ? h(PinMark) : null),
     workingLine ? h('span', { className: 'bt-row-preview' }, workingLine) : preview ? h('span', { className: 'bt-row-preview' }, preview) : null) : null,
   wide && approval && !active ? h('span', { className: 'bt-unread bt-unread-wait', 'aria-hidden': true })
     : wide && unread && !active ? h('span', { className: 'bt-unread', 'aria-hidden': true })
@@ -815,6 +816,7 @@ export function TeamSidebar(props) {
         h(PluginsButton, { actions }))
   const content = h('div', { className: wideContent ? 'bt-side' : 'bt-side bt-rail', onKeyDown: typeToSearch },
     top,
+    wideContent ? h(SidebarRuntimeSwitch, { sessionId: main?.id ?? roster.bots?.[0]?.id ?? '__team__', useRoster: props.useRoster, actions }) : null,
     wideContent && roster.readOnly ? h('div', { className: 'bt-hint bt-read-only', role: 'status' }, hostText(roster.readOnly)) : null,
     h('div', {
       ref: listRef, className: 'bt-list', role: 'region', 'aria-label': t('Bot list'),

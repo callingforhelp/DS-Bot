@@ -7,14 +7,15 @@ import { Shimmer } from './cells.js'
 import { useEscape } from './overlay-hooks.js'
 import { t } from './i18n.js'
 import { openCapture, preparationStep, speechCatalog, transcribeWave, turnDetector } from './speech.js'
+import { openLiveVoiceSession } from './voice-live.js'
+import { runtimeOf } from './runtime-pill.js'
 
-// Voice chat: listen, send what the user said, read the Bot's answer aloud, listen
-// again. With DSH's Voice Input plugin on, its recognizer hears the user: one
-// recording ends after a pause and is transcribed whole. Otherwise the browser's
-// own speech recognition does. The browser's speech synthesis reads the answer.
+// Voice chat: defaults to OpenAI GPT-Live 1.1 WebRTC (with Standby and client
+// delegation to DS Bot) across both Local and Cloud bots, falling back to DSH's
+// Voice Input plugin or browser speech recognition/synthesis when unavailable.
 const plainSpeech = text => stripHeader(text).replace(/```[\s\S]*?```/g, ' ').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[*_`#>|~-]+/g, ' ').replace(/\s+/g, ' ').trim()
 const VOICE_LABELS = {
-  listening: 'Listening', thinking: 'Thinking', speaking: 'Speaking', paused: 'Paused',
+  connecting: 'Connecting…', listening: 'Listening', thinking: 'Thinking', speaking: 'Speaking', standby: 'Standby', paused: 'Paused',
   setup: 'Voice input needs its speech model', preparing: 'Preparing voice input…',
   unsupported: 'Voice chat is not available in this browser',
 }
@@ -82,6 +83,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   const bot = roster.byId[sessionId]
   const room = roster.roomsById[sessionId]
   const name = bot?.name ?? room?.name ?? t('Bot')
+  const runtime = runtimeOf(roster, sessionId)
   const running = useSessionStatus(map => map.get(sessionId)?.running === true)
   const lastReply = useSessions((list) => {
     const outline = list.projectionsBySession?.[sessionId]?.values?.turnOutline ?? list.byId[sessionId]?.projectionValues?.turnOutline
@@ -90,7 +92,10 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   })
   // The Voice Input plugin's Remote, read once: the engine does not change mid-chat.
   const [speech] = useState(() => actions.speech())
-  const [phase, setPhase] = useState(speech ? 'starting' : speechApi() ? 'listening' : 'unsupported')
+  const hasVoiceStatus = typeof actions.voiceStatus === 'function'
+  const [engine, setEngine] = useState(() => (hasVoiceStatus ? 'probing' : 'legacy'))
+  const [liveMeta, setLiveMeta] = useState(null)
+  const [phase, setPhase] = useState(() => (hasVoiceStatus ? 'starting' : (speech ? 'starting' : speechApi() ? 'listening' : 'unsupported')))
   const [catalog, setCatalog] = useState(null)
   const [heard, setHeard] = useState('')
   const [said, setSaid] = useState('')
@@ -100,9 +105,19 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   const waiting = useRef(null)
   const reply = useRef(lastReply)
   reply.current = lastReply
+  const liveRef = useRef(null)
+  const pendingDelegation = useRef(null)
+  const prevLocation = useRef(runtime.location)
   // Bumped on pause and close, so a transcript that arrives later is dropped.
   const turn = useRef(0)
-  const close = () => { turn.current += 1; window.speechSynthesis?.cancel(); actions.closeVoice() }
+  const close = () => {
+    turn.current += 1
+    liveRef.current?.close()
+    liveRef.current = null
+    pendingDelegation.current = null
+    window.speechSynthesis?.cancel()
+    actions.closeVoice()
+  }
   useEscape(close)
   const submit = (text) => {
     setHeard(text)
@@ -117,12 +132,107 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
     submit(text)
   })
   useEffect(() => {
+    if (!hasVoiceStatus) return undefined
+    let alive = true
+    const canWebRtc = typeof RTCPeerConnection === 'function' && Boolean(navigator.mediaDevices?.getUserMedia)
+    void Promise.resolve(actions.voiceStatus(sessionId)).then((status) => {
+      if (!alive) return
+      if (status?.available === true && canWebRtc) {
+        setLiveMeta(status)
+        setEngine('live')
+        setPhase('connecting')
+      } else {
+        setEngine('legacy')
+        setPhase(speech ? 'starting' : speechApi() ? 'listening' : 'unsupported')
+      }
+    }, () => {
+      if (!alive) return
+      setEngine('legacy')
+      setPhase(speech ? 'starting' : speechApi() ? 'listening' : 'unsupported')
+    })
+    return () => { alive = false }
+  }, [sessionId])
+  useEffect(() => {
+    if (engine !== 'live') return undefined
+    let disposed = false
+    setPhase('connecting')
+    void openLiveVoiceSession({
+      sessionId,
+      model: liveMeta?.model,
+      voice: liveMeta?.defaultVoice,
+      idleTimeoutS: liveMeta?.standby?.idleTimeoutS,
+      vadThreshold: liveMeta?.standby?.vadThreshold,
+      createSession: actions.voiceSessionCreate,
+      closeSession: actions.voiceSessionClose,
+      onPhase: (next) => {
+        if (disposed) return
+        setPhase(curr => (curr === 'paused' || curr === 'thinking' ? curr : next))
+      },
+      onTranscript: ({ role, text }) => {
+        if (disposed) return
+        if (role === 'user') setHeard(text)
+        else setSaid(text)
+      },
+      onTranscriptCommit: ({ role, text }) => {
+        if (disposed || !text) return
+        void actions.voiceTranscriptAppend?.(sessionId, role, text)
+      },
+      onLevel: (value) => { if (!disposed) setServiceLevel(value) },
+      onDelegation: ({ delegationId, query }) => {
+        if (disposed || !query) return
+        pendingDelegation.current = delegationId ?? null
+        submit(query)
+      },
+      onError: (msg) => {
+        if (disposed) return
+        setNote(typeof msg === 'string' && msg ? msg : t("Couldn't connect voice session"))
+        setPhase('paused')
+      },
+    }).then((session) => {
+      if (disposed) { session.close(); return }
+      liveRef.current = session
+      setLiveMeta(session.meta ?? liveMeta)
+    }).catch((error) => {
+      if (disposed) return
+      const msg = error?.kind === 'blocked'
+        ? t(CAPTURE_NOTES.blocked)
+        : error?.kind === 'unavailable'
+          ? t(CAPTURE_NOTES.unavailable)
+          : (error?.message || t("Couldn't connect voice session"))
+      setNote(msg)
+      setPhase('paused')
+    })
+    return () => {
+      disposed = true
+      const current = liveRef.current
+      liveRef.current = null
+      pendingDelegation.current = null
+      current?.close()
+    }
+  }, [engine, sessionId])
+  useEffect(() => {
+    if (engine !== 'live') {
+      prevLocation.current = runtime.location
+      return
+    }
+    if (prevLocation.current === runtime.location) return
+    prevLocation.current = runtime.location
+    liveRef.current?.sendEvent({
+      type: 'session.instructions.append',
+      event_id: `evt_${Date.now().toString(36)}`,
+      delegation_id: null,
+      content: runtime.location === 'cloud'
+        ? `Runtime update: this Bot is now handed off to Cloud machine "${runtime.machineName ?? runtime.machineId ?? 'AWS'}".`
+        : 'Runtime update: this Bot is now running back on the Local machine.',
+    })
+  }, [engine, runtime.location, runtime.machineId, runtime.machineName])
+  useEffect(() => {
     if (!note) return undefined
     const timer = setTimeout(() => setNote(''), 2600)
     return () => clearTimeout(timer)
   }, [note])
   useEffect(() => {
-    if (!speech) return undefined
+    if (engine !== 'legacy' || !speech) return undefined
     let live = true
     speechCatalog(speech).then(({ catalog: next, usable }) => {
       if (!live) return
@@ -130,20 +240,20 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
       setPhase(usable ? 'listening' : 'setup')
     }, () => { if (live) setPhase('setup') })
     return () => { live = false }
-  }, [speech])
+  }, [engine, speech])
   const listen = phase === 'listening'
   useEffect(() => {
-    if (speech || !listen || dictation.listening) return undefined
+    if (engine !== 'legacy' || speech || !listen || dictation.listening) return undefined
     const timer = setTimeout(() => dictation.start({ continuous: false, onEnd: () => {} }), 250)
     return () => clearTimeout(timer)
-  }, [listen, dictation.listening])
+  }, [engine, listen, dictation.listening])
   // Recognition stops on silence; keep listening until the user pauses or ends.
   useEffect(() => {
-    if (phase !== 'listening') dictation.stop()
-  }, [phase])
+    if (engine === 'legacy' && phase !== 'listening') dictation.stop()
+  }, [engine, phase])
   // The plugin's recognizer: record one utterance, end it after a pause, transcribe it.
   useEffect(() => {
-    if (!speech || !catalog || !listen) return undefined
+    if (engine !== 'legacy' || !speech || !catalog || !listen) return undefined
     const own = turn.current
     let capture = null
     let frame = 0
@@ -198,7 +308,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
       capture?.cancel()
       setServiceLevel(0)
     }
-  }, [speech, catalog, listen, cycle])
+  }, [engine, speech, catalog, listen, cycle])
   useEffect(() => {
     if (phase !== 'thinking' || running || waiting.current === null) return undefined
     const count = lastReply.slice(0, lastReply.indexOf('|'))
@@ -206,6 +316,14 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
     if (count === waiting.current) return undefined
     const speak = (text) => {
       waiting.current = null
+      if (engine === 'live' && liveRef.current) {
+        const delegationId = pendingDelegation.current
+        pendingDelegation.current = null
+        setHeard('')
+        setPhase('listening')
+        liveRef.current.sendCommentary(delegationId, text)
+        return
+      }
       const spoken = plainSpeech(text)
       setSaid(spoken)
       setHeard('')
@@ -225,16 +343,31 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
       () => actions.closingReply(sessionId, turn),
       listener => actions.watchTurns(sessionId, listener),
       (text) => {
-        if (text === null) { waiting.current = null; setPhase('listening'); return }
+        if (text === null) {
+          waiting.current = null
+          pendingDelegation.current = null
+          setPhase('listening')
+          return
+        }
         speak(text)
       })
-  }, [phase, running, lastReply])
+  }, [phase, running, lastReply, engine])
   useEffect(() => () => window.speechSynthesis?.cancel(), [])
-  const micLevel = useMicLevel(!speech && phase === 'listening' && dictation.listening)
-  const level = speech ? serviceLevel : micLevel
-  const markState = phase === 'thinking' || phase === 'transcribing' ? 'thinking' : phase === 'speaking' ? 'sending' : 'idle'
-  const blocked = phase === 'unsupported' || phase === 'setup' || phase === 'starting' || phase === 'preparing'
+  const micLevel = useMicLevel(engine === 'legacy' && !speech && phase === 'listening' && dictation.listening)
+  const level = engine === 'live' || speech ? serviceLevel : micLevel
+  const markState = phase === 'thinking' || phase === 'transcribing' || phase === 'connecting' ? 'thinking' : phase === 'speaking' ? 'sending' : 'idle'
+  const blocked = phase === 'unsupported' || phase === 'setup' || phase === 'starting' || phase === 'preparing' || phase === 'connecting'
   const togglePause = () => {
+    if (engine === 'live') {
+      if (phase === 'paused') {
+        liveRef.current?.setMuted(false)
+        setPhase('listening')
+      } else {
+        liveRef.current?.setMuted(true)
+        setPhase('paused')
+      }
+      return
+    }
     if (phase === 'paused') { setPhase('listening'); return }
     turn.current += 1
     window.speechSynthesis?.cancel()
@@ -243,7 +376,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   // A 'preparing' phase follows the speech Remote's own catalog until the
   // provider is usable; the plugin-manager path navigates away instead.
   useEffect(() => {
-    if (phase !== 'preparing' || !speech) return undefined
+    if (engine !== 'legacy' || phase !== 'preparing' || !speech) return undefined
     let stopped = false
     let timer
     const tick = async () => {
@@ -276,13 +409,19 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   }
   const caption = phase === 'speaking' ? said : heard
   const shownNote = note || dictation.note
+  const modelBadge = liveMeta?.model === 'gpt-live-1' ? 'GPT-Live 1' : 'GPT-Live 1.1'
+  const locationBadge = runtime.location === 'cloud' ? t('Cloud') : t('Local')
+  const metaLabel = engine === 'live'
+    ? `${modelBadge} · ${locationBadge}${phase === 'standby' ? ` · ${t('Standby')}` : ''}`
+    : null
   return h('div', { className: 'bt-pane bt-voice-pane', style: { left: paneLeft } },
-    h('div', { className: 'bt-voice-stage', role: 'dialog', 'aria-label': t('Voice chat with {name}', { name }), 'data-phase': phase === 'transcribing' ? 'thinking' : phase },
+    h('div', { className: 'bt-voice-stage', role: 'dialog', 'aria-label': t('Voice chat with {name}', { name }), 'data-phase': phase === 'transcribing' || phase === 'connecting' ? 'thinking' : phase },
       h('div', { className: 'bt-voice-orb', style: { '--bt-level': level } },
         h('span', { className: 'bt-voice-ring', 'aria-hidden': true }),
         h('span', { className: 'bt-voice-ring bt-voice-ring-2', 'aria-hidden': true }),
         bot ? h(BotMark, { bot, size: 112, state: markState, live: true, gaze: phase === 'listening' }) : room ? h(RoomAvatar, { room, roster, size: 112 }) : null),
       h('div', { className: 'bt-voice-name' }, name),
+      metaLabel ? h('div', { className: 'bt-voice-meta' }, metaLabel) : null,
       h('div', { className: 'bt-voice-status', role: 'status' },
         phase === 'thinking' ? h(Shimmer, null, t('Thinking…'))
           : phase === 'transcribing' ? h(Shimmer, null, t('Recognizing…'))

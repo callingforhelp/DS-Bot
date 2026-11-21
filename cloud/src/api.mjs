@@ -42,8 +42,9 @@ export function validatePrincipals(principals) {
 // The API never runs a model. A rejected request therefore starts nothing: authentication,
 // replay and scope checks all happen before the task is admitted or anything is dispatched.
 // embedderFor(tenant) picks the embedder per tenant (some tenants may be kept off external providers).
-export function createApi({ pool, embedder, embedderFor = () => embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore, machines, messageHandler, approvedSnapshots = [] }) {
+export function createApi({ pool, embedder, embedderFor = () => embedder, principals, now = Date.now, skewMs = 5 * 60_000, ready = async () => true, objectStore, machines, messageHandler, voice, approvedSnapshots = [] }) {
   const approvedSnapshotSet = new Set(approvedSnapshots)
+  const voiceSessions = new Map()
   // /ready is unauthenticated: its database check runs at most once a second.
   let readyCache = { at: -Infinity, value: false }
   const readyOnce = async () => {
@@ -392,6 +393,77 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     throw new HttpError(404, 'not found')
   }
 
+  async function handleVoiceRoute(req, p, pathname, raw) {
+    readerOnly(p)
+    if (pathname === '/v1/voice/config' && req.method === 'GET') {
+      const cfg = voice
+        ? voice.config()
+        : {
+            configured: false,
+            provider: 'openai',
+            model: 'gpt-live-1.1',
+            models: ['gpt-live-1.1', 'gpt-live-1'],
+            defaultVoice: 'marin',
+            voices: ['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'],
+            dataChannel: 'oai-events',
+            standby: {
+              enabled: true,
+              wakePolicy: 'speech',
+              idleTimeoutS: 15,
+              vadThreshold: 0.5,
+              activeRatePerMinUsd: 0.05,
+              standbyRatePerMinUsd: 0.02,
+            },
+          }
+      return { status: 200, json: cfg }
+    }
+    if (pathname === '/v1/voice/sessions' && req.method === 'POST') {
+      if (!voice || !voice.config().configured) throw new HttpError(501, 'voice is not configured')
+      const input = parseJsonBody(raw)
+      if (input.machineId !== undefined && input.machineId !== null && input.machineId !== '') {
+        await requireTenantMachine(p, String(input.machineId))
+      }
+      let result
+      try {
+        result = await voice.createSession(input)
+      } catch (error) {
+        if (Number.isInteger(error?.status)) throw new HttpError(error.status, error.message)
+        throw error
+      }
+      const cutoff = now() - 6 * 3600_000
+      for (const [id, entry] of voiceSessions) {
+        if (entry.createdAt < cutoff) voiceSessions.delete(id)
+      }
+      voiceSessions.set(result.liveSessionId, {
+        tenant: p.tenant,
+        owner: p.id,
+        botId: input.botId ?? null,
+        machineId: input.machineId ?? null,
+        model: result.model,
+        createdAt: now(),
+      })
+      return { status: 201, json: result }
+    }
+    if (pathname.startsWith('/v1/voice/sessions/') && req.method === 'DELETE') {
+      const rest = pathname.slice('/v1/voice/sessions/'.length)
+      if (!rest || rest.includes('/')) throw new HttpError(404, 'not found')
+      let liveSessionId
+      try { liveSessionId = decodeURIComponent(rest) } catch { throw new HttpError(400, 'bad voice session id') }
+      if (!voice || !voice.config().configured) throw new HttpError(501, 'voice is not configured')
+      const entry = voiceSessions.get(liveSessionId)
+      if (!entry || entry.tenant !== p.tenant) throw new HttpError(404, 'no such voice session')
+      try {
+        await voice.closeSession(liveSessionId)
+      } catch (error) {
+        if (Number.isInteger(error?.status)) throw new HttpError(error.status, error.message)
+        throw error
+      }
+      voiceSessions.delete(liveSessionId)
+      return { status: 200, json: { closed: true, liveSessionId } }
+    }
+    throw new HttpError(404, 'not found')
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://x')
     const send = (status, json) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(json)) }
@@ -415,6 +487,10 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
         const out = await handleMachineRoute(req, p, url.pathname, raw)
         return send(out.status, out.json)
       }
+      if (url.pathname === '/v1/voice/config' || url.pathname === '/v1/voice/sessions' || url.pathname.startsWith('/v1/voice/sessions/')) {
+        const out = await handleVoiceRoute(req, p, url.pathname, raw)
+        return send(out.status, out.json)
+      }
       const route = routes[`${req.method} ${url.pathname}`]
       if (!route) throw new HttpError(404, 'not found')
       const input = parseJsonBody(raw)
@@ -423,6 +499,7 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
     } catch (error) {
       if (error instanceof HttpError) return send(error.status, { error: error.message })
       if (error?.code === 'MACHINE_VERSION_CONFLICT') return send(409, { error: error.message })
+      console.error('[api] unhandled error:', req.method, url.pathname, error?.message ?? error)
       return send(500, { error: 'internal error' })
     }
   }
