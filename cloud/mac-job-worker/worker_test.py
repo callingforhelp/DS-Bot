@@ -209,6 +209,66 @@ class WorkerTest(unittest.TestCase):
         self.assertTrue(pull_meta["pulled"])
         self.assertTrue(os.path.exists(os.path.join(src_dir, "from_cloud.txt")))
 
+    def test_git_sync_branchless_pull_and_new_push_branch(self) -> None:
+        bare_dir = os.path.join(self.tmpdir.name, "remote2.git")
+        subprocess.run(["git", "init", "--bare", "-b", "main", bare_dir], check=True, capture_output=True)
+
+        src_dir = os.path.join(self.tmpdir.name, "repo-two")
+        subprocess.run(["git", "init", "-b", "main", src_dir], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=src_dir, check=True)
+        with open(os.path.join(src_dir, "README.md"), "w", encoding="utf-8") as f:
+            f.write("# repo-two\n")
+        subprocess.run(["git", "add", "-A"], cwd=src_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", bare_dir], cwd=src_dir, check=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=src_dir, check=True, capture_output=True)
+
+        cloud_dir = os.path.join(self.tmpdir.name, "cloud-two")
+        subprocess.run(["git", "clone", bare_dir, cloud_dir], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "cloud@example.com"], cwd=cloud_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Cloud User"], cwd=cloud_dir, check=True)
+        with open(os.path.join(cloud_dir, "new.txt"), "w", encoding="utf-8") as f:
+            f.write("from cloud\n")
+        subprocess.run(["git", "add", "-A"], cwd=cloud_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "cloud commit"], cwd=cloud_dir, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=cloud_dir, check=True, capture_output=True)
+
+        runner = lambda job: default_git_sync_runner(
+            job, "/nonexistent", parent_dir=self.tmpdir.name
+        )
+
+        pull_res = runner(
+            {
+                "task": json.dumps({"action": "pull", "repo": src_dir}),
+                "repo": src_dir,
+            }
+        )
+        self.assertEqual(pull_res["status"], "succeeded")
+        pull_meta = json.loads(pull_res["result_summary"])
+        self.assertTrue(pull_meta["pulled"])
+        self.assertEqual(pull_meta["branch"], "main")
+        self.assertTrue(os.path.exists(os.path.join(src_dir, "new.txt")))
+
+        push_res = runner(
+            {
+                "task": json.dumps(
+                    {"action": "push", "repo": src_dir, "branch": "feat/new"}
+                ),
+                "repo": src_dir,
+                "branch": "feat/new",
+            }
+        )
+        self.assertEqual(push_res["status"], "succeeded")
+        push_meta = json.loads(push_res["result_summary"])
+        self.assertEqual(push_meta["branch"], "feat/new")
+        ls = subprocess.run(
+            ["git", "ls-remote", "--exit-code", bare_dir, "refs/heads/feat/new"],
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(ls.returncode, 0)
+
 
 FAKE_PARADEV_SCRIPT = r"""#!/usr/bin/env python3
 import json
@@ -243,6 +303,9 @@ elif cmd == ["agents", "read"]:
         sys.exit(2)
     print(json.dumps({"text": "User: first task\nAssistant: first answer\nUser: follow up\nAssistant: latest answer"}))
 elif cmd == ["terminals", "read"]:
+    if os.environ.get("FAKE_PARADEV_TERMINALS_READ_FAIL"):
+        sys.stderr.write("Error: terminals read unavailable\n")
+        sys.exit(3)
     print(json.dumps({"text": "devin terminal transcript"}))
 elif cmd == ["ws", "create"]:
     print(json.dumps({"workspace": {"id": "ws-new-1"}, "agents": [{"sessionId": "term-new-1"}]}))
@@ -295,6 +358,7 @@ class ParaDevRunnerTest(unittest.TestCase):
                 "FAKE_PARADEV_WS_JSON",
                 "FAKE_PARADEV_PROJECTS_JSON",
                 "FAKE_PARADEV_AGENTS_READ_FAIL",
+                "FAKE_PARADEV_TERMINALS_READ_FAIL",
                 "FAKE_DSH_LOG",
                 "PARADEV_SESSIONS_FILE",
                 "WORKER_STATE_DIR",
@@ -309,6 +373,7 @@ class ParaDevRunnerTest(unittest.TestCase):
             "FAKE_PARADEV_WS_JSON",
             "FAKE_PARADEV_PROJECTS_JSON",
             "FAKE_PARADEV_AGENTS_READ_FAIL",
+            "FAKE_PARADEV_TERMINALS_READ_FAIL",
             "FAKE_DSH_LOG",
             "WORKER_STATE_DIR",
             "MAC_WORKER_ALLOWED_ROOTS",
@@ -650,6 +715,91 @@ class ParaDevRunnerTest(unittest.TestCase):
         self.assertEqual(res["status"], "succeeded")
         self.assertIn("devin terminal transcript", res["result_summary"])
         self.assertNotIn("latest answer", res["result_summary"])
+
+    def test_read_agent_output_raises_when_both_fail(self) -> None:
+        os.environ["FAKE_PARADEV_AGENTS_READ_FAIL"] = "1"
+        os.environ["FAKE_PARADEV_TERMINALS_READ_FAIL"] = "1"
+        with self.assertRaises(RuntimeError) as ctx:
+            _read_agent_output(self.fake_bin, "ws-1", "term-1")
+        self.assertIn("terminals read failed", str(ctx.exception))
+
+    def test_authorized_local_path_case_insensitive(self) -> None:
+        self.assertTrue(is_authorized_local_path("/USERS/CHIEF/some-new-project"))
+        self.assertFalse(is_authorized_local_path("/Users/Chief/.SSH"))
+        self.assertFalse(is_authorized_local_path("/users/chief/LIBRARY/foo"))
+        os.environ["MAC_WORKER_ALLOWED_ROOTS"] = "/Users/CHIEF/Devin-Agent-Work"
+        try:
+            self.assertTrue(
+                is_authorized_local_path("/users/chief/devin-agent-work/job-9")
+            )
+            self.assertFalse(is_authorized_local_path("/Users/chief/other-dir"))
+        finally:
+            os.environ.pop("MAC_WORKER_ALLOWED_ROOTS", None)
+
+    def test_paradev_runner_rejects_unauthorized_worktree(self) -> None:
+        os.environ["FAKE_PARADEV_WS_JSON"] = json.dumps(
+            [
+                {
+                    "id": "ws-evil",
+                    "projectId": "p",
+                    "worktreePath": "/Users/chief/.ssh",
+                }
+            ]
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            default_paradev_runner(
+                {
+                    "task": "x",
+                    "workspace_id": "ws-evil",
+                    "terminal_id": "t-1",
+                    "timeout_sec": 60,
+                },
+                self.fake_bin,
+            )
+        self.assertIn("Unauthorized local path", str(ctx.exception))
+        self.assertFalse(
+            any(c[:2] == ["terminals", "send"] for c in self._calls())
+        )
+
+    def test_flush_recovers_claim_and_preserves_appends(self) -> None:
+        spool = os.path.join(self.tmpdir.name, "decisions.jsonl")
+        claim = f"{spool}.flushing"
+        with open(claim, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"d": "claimed"}) + "\n")
+        with open(spool, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"d": "spooled"}) + "\n")
+
+        posted: list = []
+        appended: list = []
+
+        class AppendBroker(_StubBroker):
+            def post(self, path, payload, timeout=15.0):
+                if path == "/v1/decisions":
+                    posted.append(payload)
+                    if not appended:
+                        appended.append(True)
+                        with open(spool, "a", encoding="utf-8") as af:
+                            af.write(json.dumps({"d": "concurrent"}) + "\n")
+                return super().post(path, payload, timeout)
+
+        worker = MacJobWorker(
+            broker=AppendBroker(),
+            worker_id="mac-test",
+            state_dir=os.path.join(self.tmpdir.name, "state"),
+            paradev_runner=lambda job: {"status": "succeeded", "result_summary": "ok"},
+            dsbot_runner=lambda job: {"status": "succeeded", "result_summary": "ok"},
+        )
+        n = worker.flush_pending_decisions(spool)
+        self.assertEqual(n, 2)
+        self.assertEqual(posted, [{"d": "claimed"}, {"d": "spooled"}])
+        self.assertFalse(os.path.exists(claim))
+        self.assertTrue(os.path.exists(spool))
+        with open(spool, "r", encoding="utf-8") as f:
+            self.assertEqual(
+                [json.loads(ln) for ln in f if ln.strip()], [{"d": "concurrent"}]
+            )
+        self.assertEqual(worker.flush_pending_decisions(spool), 1)
+        self.assertFalse(os.path.exists(spool))
 
 
 if __name__ == "__main__":

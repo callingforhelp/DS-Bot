@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import http.client
 import json
 import os
@@ -253,8 +254,10 @@ def is_authorized_local_path(
 ) -> bool:
     real = os.path.realpath(os.path.expanduser(path))
     real_parent = os.path.realpath(os.path.expanduser(parent_dir))
+    real_lower = real.lower()
+    parent_prefix = (real_parent + os.sep).lower()
     forbidden_lower = {s.lower() for s in FORBIDDEN_HOME_SUBDIRS}
-    if real.startswith(real_parent + os.sep):
+    if real_lower.startswith(parent_prefix):
         top = real[len(real_parent) + 1 :].split(os.sep, 1)[0]
         if top and top.lower() in forbidden_lower:
             return False
@@ -266,8 +269,8 @@ def is_authorized_local_path(
     else:
         roots = list(DEFAULT_ALLOWED_ROOTS)
     for root in roots:
-        root_real = os.path.realpath(os.path.expanduser(root))
-        if real == root_real or real.startswith(root_real + os.sep):
+        root_lower = os.path.realpath(os.path.expanduser(root)).lower()
+        if real_lower == root_lower or real_lower.startswith(root_lower + os.sep):
             return True
 
     if env_set:
@@ -287,13 +290,17 @@ def is_authorized_local_path(
                     proj_path = str(p.get("path") or "").strip()
                     if not proj_path:
                         continue
-                    proj_real = os.path.realpath(os.path.expanduser(proj_path))
-                    if real == proj_real or real.startswith(proj_real + os.sep):
+                    proj_lower = os.path.realpath(
+                        os.path.expanduser(proj_path)
+                    ).lower()
+                    if real_lower == proj_lower or real_lower.startswith(
+                        proj_lower + os.sep
+                    ):
                         return True
         except Exception:
             pass
 
-    if real.startswith(real_parent + os.sep):
+    if real_lower.startswith(parent_prefix):
         top = real[len(real_parent) + 1 :].split(os.sep, 1)[0]
         if (
             top
@@ -664,14 +671,21 @@ def _read_agent_output(paradev_bin: str, ws_id: str, term_id: str) -> str:
         timeout=30,
         check=False,
     )
+    if term_res.returncode != 0:
+        raise RuntimeError(
+            f"paradev terminals read failed ({term_res.returncode}): {term_res.stderr or term_res.stdout or read_res.stderr}"
+        )
     raw_text = term_res.stdout
-    if term_res.returncode == 0:
-        try:
-            parsed = json.loads(term_res.stdout)
-            if isinstance(parsed, dict) and "text" in parsed:
-                raw_text = str(parsed.get("text") or "")
-        except Exception:
-            pass
+    try:
+        parsed = json.loads(term_res.stdout)
+        if isinstance(parsed, dict) and "text" in parsed:
+            raw_text = str(parsed.get("text") or "")
+    except Exception:
+        pass
+    if not raw_text.strip():
+        raise RuntimeError(
+            f"paradev agents read and terminals read returned no transcript: {read_res.stderr or read_res.stdout or term_res.stdout}"
+        )
     return raw_text
 
 
@@ -750,6 +764,9 @@ def default_paradev_runner(
     cwd = str(job.get("cwd") or "").strip() or None
     local_only = bool(job.get("local_only"))
     role = str(job.get("role") or "worker").strip().lower() or "worker"
+
+    if cwd and not is_authorized_local_path(cwd, paradev_bin):
+        raise RuntimeError(f"Unauthorized local path: {cwd}")
 
     if agent == "dsbot":
         worktree_path: Optional[str] = None
@@ -870,6 +887,15 @@ def default_paradev_runner(
             store.upsert(session_key, entry)
         except Exception:
             pass
+
+    if ws_id and ws_id != "local":
+        ws_info = _get_workspace_info(paradev_bin, ws_id=ws_id)
+        if ws_info and ws_info.get("worktreePath") and not is_authorized_local_path(
+            str(ws_info["worktreePath"]), paradev_bin
+        ):
+            raise RuntimeError(
+                f"Unauthorized local path: {ws_info['worktreePath']}"
+            )
 
     if ws_id and term_id:
         send_res = subprocess.run(
@@ -1140,6 +1166,12 @@ def default_git_sync_runner(
                 if co.returncode == 0:
                     ff = _run_git(["pull", "--ff-only", "origin", req_branch], cwd=repo_path, timeout=90)
                     pulled = ff.returncode == 0
+        else:
+            if dirty:
+                dirty_skipped = True
+            else:
+                ff = _run_git(["pull", "--ff-only"], cwd=repo_path, timeout=90)
+                pulled = ff.returncode == 0
 
         br_res = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
         sha_res = _run_git(["rev-parse", "--short", "HEAD"], cwd=repo_path)
@@ -1217,8 +1249,18 @@ def default_git_sync_runner(
         active_branch = target_branch
     elif req_branch and req_branch != cur_branch:
         co = _run_git(["checkout", req_branch], cwd=repo_path)
-        if co.returncode == 0:
-            active_branch = req_branch
+        if co.returncode != 0:
+            co = _run_git(["checkout", "-B", req_branch], cwd=repo_path)
+        if co.returncode != 0:
+            return {
+                "status": "failed",
+                "result_summary": "",
+                "pr_url": None,
+                "error": redact_secrets(
+                    co.stderr or co.stdout or f"git checkout {req_branch} failed"
+                ),
+            }
+        active_branch = req_branch
 
     rem_res = _run_git(["remote", "get-url", "origin"], cwd=repo_path)
     remote_created = False
@@ -1499,12 +1541,39 @@ class MacJobWorker:
         return payload
 
     def flush_pending_decisions(self, spool_path: str) -> int:
-        if not spool_path or not os.path.exists(spool_path):
+        if not spool_path:
             return 0
         claim_path = f"{spool_path}.flushing"
-        os.replace(spool_path, claim_path)
-        with open(claim_path, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
+        claim_tmp = f"{claim_path}.tmp"
+        lines: list[str] = []
+        if os.path.exists(claim_path):
+            try:
+                with open(claim_path, "r", encoding="utf-8") as cf:
+                    lines.extend(ln.strip() for ln in cf if ln.strip())
+            except OSError:
+                pass
+        if os.path.exists(spool_path):
+            try:
+                with open(spool_path, "r+", encoding="utf-8") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        lines.extend(ln.strip() for ln in f if ln.strip())
+                        if lines:
+                            with open(claim_tmp, "w", encoding="utf-8") as tmpf:
+                                tmpf.write("\n".join(lines) + "\n")
+                            os.replace(claim_tmp, claim_path)
+                        f.seek(0)
+                        f.truncate(0)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if not lines:
+            if os.path.exists(claim_path):
+                os.remove(claim_path)
+            return 0
         remaining: list[str] = []
         flushed = 0
         for idx, ln in enumerate(lines):
@@ -1519,18 +1588,25 @@ class MacJobWorker:
             except Exception:
                 remaining.extend(lines[idx:])
                 break
-        if os.path.exists(spool_path):
-            with open(spool_path, "r", encoding="utf-8") as f:
-                remaining.extend(ln.strip() for ln in f if ln.strip())
         if remaining:
-            tmp = f"{spool_path}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write("\n".join(remaining) + "\n")
-            os.replace(tmp, spool_path)
-        elif os.path.exists(spool_path) and os.path.getsize(spool_path) == 0:
-            os.remove(spool_path)
-        if os.path.exists(claim_path):
-            os.remove(claim_path)
+            with open(claim_tmp, "w", encoding="utf-8") as tmpf:
+                tmpf.write("\n".join(remaining) + "\n")
+            os.replace(claim_tmp, claim_path)
+        else:
+            if os.path.exists(claim_path):
+                os.remove(claim_path)
+            try:
+                if os.path.exists(spool_path):
+                    with open(spool_path, "r+", encoding="utf-8") as f:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                        try:
+                            f.seek(0, os.SEEK_END)
+                            if f.tell() == 0:
+                                os.remove(spool_path)
+                        finally:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
         return flushed
 
     def poll_once(self) -> Optional[dict[str, Any]]:

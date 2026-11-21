@@ -419,7 +419,7 @@ class BrokerStore:
             if row["status"] in ("succeeded", "failed") and row["worker_id"] == worker_id:
                 self._record_paradev_session(
                     row, workspace_id, terminal_id, role, agent, worktree_path,
-                    job_id, now,
+                    job_id, float(row["updated_at"]),
                 )
                 return True, self._row_to_dict(row)
             if row["status"] not in ("running", "lease_lost") or (
@@ -541,6 +541,7 @@ class BrokerStore:
                 agent = COALESCE(excluded.agent, paradev_sessions.agent),
                 last_job_id = excluded.last_job_id,
                 updated_at = excluded.updated_at
+            WHERE excluded.updated_at >= paradev_sessions.updated_at
             """,
             (
                 session_key,

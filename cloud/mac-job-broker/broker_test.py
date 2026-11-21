@@ -604,6 +604,46 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(sessions["sessions"][0]["worker_terminal_id"], "term-new-w")
         self.assertIsNone(sessions["sessions"][0]["reviewer_terminal_id"])
 
+    def test_out_of_order_retry_does_not_clobber_newer_workspace(self) -> None:
+        job1_id = self._run_paradev_job(
+            {"repo": "demo-app", "branch": "main"},
+            {"workspace_id": "ws-old", "terminal_id": "term-old", "role": "worker"},
+        )
+        self._run_paradev_job(
+            {"repo": "demo-app", "branch": "main"},
+            {"workspace_id": "ws-new", "terminal_id": "term-new", "role": "worker"},
+        )
+        self._run_paradev_job(
+            {"workspace_id": "ws-new", "role": "reviewer"},
+            {"workspace_id": "ws-new", "terminal_id": "term-rev", "role": "reviewer"},
+        )
+
+        # Delayed idempotent retry of job1's completion must not roll back ws-new
+        st, done = self._req(
+            "POST",
+            "/v1/worker/complete",
+            {
+                "job_id": job1_id,
+                "worker_id": "mac-1",
+                "status": "succeeded",
+                "result_summary": "done",
+                "workspace_id": "ws-old",
+                "terminal_id": "term-old",
+            },
+            token="work-secret",
+        )
+        self.assertEqual(st, 200)
+        self.assertTrue(done["ok"])
+
+        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(sessions["sessions"]), 1)
+        sess = sessions["sessions"][0]
+        self.assertEqual(sess["session_key"], "demo-app:main")
+        self.assertEqual(sess["workspace_id"], "ws-new")
+        self.assertEqual(sess["worker_terminal_id"], "term-new")
+        self.assertEqual(sess["reviewer_terminal_id"], "term-rev")
+
 
 if __name__ == "__main__":
     unittest.main()
