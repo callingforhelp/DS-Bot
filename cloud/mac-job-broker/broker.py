@@ -139,6 +139,7 @@ class BrokerStore:
                 ("local_only", "INTEGER NOT NULL DEFAULT 0"),
                 ("role", "TEXT"),
                 ("worktree_path", "TEXT"),
+                ("completed_at", "REAL"),
             ]:
                 try:
                     self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
@@ -417,10 +418,13 @@ class BrokerStore:
                 return False, None
             # Idempotent re-delivery from same worker if already finished
             if row["status"] in ("succeeded", "failed") and row["worker_id"] == worker_id:
+                comp_src = row["completed_at"] if "completed_at" in row.keys() else None
+                comp_ts = float(comp_src if comp_src is not None else row["updated_at"])
                 self._record_paradev_session(
                     row, workspace_id, terminal_id, role, agent, worktree_path,
-                    job_id, float(row["updated_at"]),
+                    job_id, comp_ts,
                 )
+                self.conn.commit()
                 return True, self._row_to_dict(row)
             if row["status"] not in ("running", "lease_lost") or (
                 row["worker_id"] and row["worker_id"] != worker_id
@@ -440,6 +444,7 @@ class BrokerStore:
                     role = COALESCE(?, role),
                     agent = COALESCE(?, agent),
                     worktree_path = COALESCE(?, worktree_path),
+                    completed_at = COALESCE(completed_at, ?),
                     updated_at = ?
                 WHERE job_id = ?
                 """,
@@ -454,10 +459,10 @@ class BrokerStore:
                     agent,
                     worktree_path,
                     now,
+                    now,
                     job_id,
                 ),
             )
-            self.conn.commit()
             updated = self.conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
@@ -466,6 +471,7 @@ class BrokerStore:
                     updated, workspace_id, terminal_id, role, agent, worktree_path,
                     job_id, now,
                 )
+            self.conn.commit()
         return True, self._row_to_dict(updated)
 
     def _record_paradev_session(
@@ -557,7 +563,6 @@ class BrokerStore:
                 now,
             ),
         )
-        self.conn.commit()
 
     def reconcile_worker(
         self, worker_id: str, hostname: str = "", capabilities: Optional[list[str]] = None

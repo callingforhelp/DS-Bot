@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,8 +17,10 @@ from worker import (
     BrokerClient,
     MacJobWorker,
     ParadevSessionStore,
+    _acquire_dir_lock,
     _ensure_local_git_repo,
     _read_agent_output,
+    _release_dir_lock,
     default_dsbot_runner,
     default_git_sync_runner,
     default_paradev_runner,
@@ -264,6 +267,71 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(push_meta["branch"], "feat/new")
         ls = subprocess.run(
             ["git", "ls-remote", "--exit-code", bare_dir, "refs/heads/feat/new"],
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(ls.returncode, 0)
+
+    def test_git_sync_pull_no_upstream_fails(self) -> None:
+        src_dir = os.path.join(self.tmpdir.name, "no-upstream")
+        subprocess.run(["git", "init", "-b", "main", src_dir], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=src_dir, check=True)
+        with open(os.path.join(src_dir, "README.md"), "w", encoding="utf-8") as f:
+            f.write("# no-upstream\n")
+        subprocess.run(["git", "add", "-A"], cwd=src_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=src_dir, check=True, capture_output=True)
+
+        res = default_git_sync_runner(
+            {
+                "task": json.dumps({"action": "pull", "repo": src_dir}),
+                "repo": src_dir,
+            },
+            "/nonexistent",
+            parent_dir=self.tmpdir.name,
+        )
+        self.assertEqual(res["status"], "failed")
+        self.assertIn("tracking information", res["error"])
+
+    def test_git_sync_push_branch_colliding_with_tag(self) -> None:
+        bare_dir = os.path.join(self.tmpdir.name, "tag-remote.git")
+        subprocess.run(["git", "init", "--bare", "-b", "main", bare_dir], check=True, capture_output=True)
+
+        src_dir = os.path.join(self.tmpdir.name, "tag-repo")
+        subprocess.run(["git", "init", "-b", "main", src_dir], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=src_dir, check=True)
+        with open(os.path.join(src_dir, "README.md"), "w", encoding="utf-8") as f:
+            f.write("# tag-repo\n")
+        subprocess.run(["git", "add", "-A"], cwd=src_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", bare_dir], cwd=src_dir, check=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "tag", "v1"], cwd=src_dir, check=True, capture_output=True)
+
+        res = default_git_sync_runner(
+            {
+                "task": json.dumps(
+                    {"action": "push", "repo": src_dir, "branch": "v1"}
+                ),
+                "repo": src_dir,
+                "branch": "v1",
+            },
+            "/nonexistent",
+            parent_dir=self.tmpdir.name,
+        )
+        self.assertEqual(res["status"], "succeeded")
+        meta = json.loads(res["result_summary"])
+        self.assertEqual(meta["branch"], "v1")
+        ab = subprocess.run(
+            ["git", "-C", src_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn(ab.stdout.strip(), ("v1", "heads/v1"))
+        ls = subprocess.run(
+            ["git", "ls-remote", "--exit-code", bare_dir, "refs/heads/v1"],
             capture_output=True,
             check=False,
         )
@@ -800,6 +868,34 @@ class ParaDevRunnerTest(unittest.TestCase):
             )
         self.assertEqual(worker.flush_pending_decisions(spool), 1)
         self.assertFalse(os.path.exists(spool))
+
+    def test_strict_roots_fail_closed_when_worktree_unverifiable(self) -> None:
+        os.environ["MAC_WORKER_ALLOWED_ROOTS"] = self.tmpdir.name
+        with self.assertRaises(RuntimeError) as ctx:
+            default_paradev_runner(
+                {
+                    "task": "x",
+                    "workspace_id": "ws-unknown",
+                    "terminal_id": "t-1",
+                    "timeout_sec": 60,
+                },
+                self.fake_bin,
+            )
+        self.assertIn("could not be verified", str(ctx.exception))
+        self.assertFalse(
+            any(c[:2] == ["terminals", "send"] for c in self._calls())
+        )
+
+    def test_dir_lock_timeout_and_stale_reclaim(self) -> None:
+        lock = os.path.join(self.tmpdir.name, "x.lock")
+        os.mkdir(lock)
+        with self.assertRaises(TimeoutError):
+            _acquire_dir_lock(lock, timeout_sec=0.05, stale_sec=60.0)
+        old = time.time() - 120
+        os.utime(lock, (old, old))
+        _acquire_dir_lock(lock, timeout_sec=1.0, stale_sec=30.0)
+        _release_dir_lock(lock)
+        self.assertFalse(os.path.exists(lock))
 
 
 if __name__ == "__main__":

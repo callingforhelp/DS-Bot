@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import http.client
 import json
 import os
@@ -890,11 +889,13 @@ def default_paradev_runner(
 
     if ws_id and ws_id != "local":
         ws_info = _get_workspace_info(paradev_bin, ws_id=ws_id)
-        if ws_info and ws_info.get("worktreePath") and not is_authorized_local_path(
-            str(ws_info["worktreePath"]), paradev_bin
-        ):
+        wt_path = str((ws_info or {}).get("worktreePath") or "").strip()
+        if wt_path:
+            if not is_authorized_local_path(wt_path, paradev_bin):
+                raise RuntimeError(f"Unauthorized local path: {wt_path}")
+        elif "MAC_WORKER_ALLOWED_ROOTS" in os.environ:
             raise RuntimeError(
-                f"Unauthorized local path: {ws_info['worktreePath']}"
+                f"Workspace worktree path could not be verified under strict roots: {ws_id}"
             )
 
     if ws_id and term_id:
@@ -1163,15 +1164,35 @@ def default_git_sync_runner(
                 co = _run_git(["checkout", req_branch], cwd=repo_path)
                 if co.returncode != 0:
                     co = _run_git(["checkout", "-B", req_branch, f"origin/{req_branch}"], cwd=repo_path)
-                if co.returncode == 0:
-                    ff = _run_git(["pull", "--ff-only", "origin", req_branch], cwd=repo_path, timeout=90)
-                    pulled = ff.returncode == 0
+                if co.returncode != 0:
+                    return {
+                        "status": "failed",
+                        "result_summary": "",
+                        "pr_url": None,
+                        "error": redact_secrets(co.stderr or co.stdout or f"git checkout {req_branch} failed"),
+                    }
+                ff = _run_git(["pull", "--ff-only", "origin", req_branch], cwd=repo_path, timeout=90)
+                if ff.returncode != 0:
+                    return {
+                        "status": "failed",
+                        "result_summary": "",
+                        "pr_url": None,
+                        "error": redact_secrets(ff.stderr or ff.stdout or "git pull --ff-only failed"),
+                    }
+                pulled = True
         else:
             if dirty:
                 dirty_skipped = True
             else:
                 ff = _run_git(["pull", "--ff-only"], cwd=repo_path, timeout=90)
-                pulled = ff.returncode == 0
+                if ff.returncode != 0:
+                    return {
+                        "status": "failed",
+                        "result_summary": "",
+                        "pr_url": None,
+                        "error": redact_secrets(ff.stderr or ff.stdout or "git pull --ff-only failed"),
+                    }
+                pulled = True
 
         br_res = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
         sha_res = _run_git(["rev-parse", "--short", "HEAD"], cwd=repo_path)
@@ -1248,8 +1269,16 @@ def default_git_sync_runner(
         dirty_committed = True
         active_branch = target_branch
     elif req_branch and req_branch != cur_branch:
-        co = _run_git(["checkout", req_branch], cwd=repo_path)
-        if co.returncode != 0:
+        has_branch = (
+            _run_git(
+                ["show-ref", "--verify", "--quiet", f"refs/heads/{req_branch}"],
+                cwd=repo_path,
+            ).returncode
+            == 0
+        )
+        if has_branch:
+            co = _run_git(["checkout", req_branch], cwd=repo_path)
+        else:
             co = _run_git(["checkout", "-B", req_branch], cwd=repo_path)
         if co.returncode != 0:
             return {
@@ -1292,7 +1321,11 @@ def default_git_sync_runner(
 
     remote_url = rem_res.stdout.strip() if rem_res.returncode == 0 else None
     if not remote_created:
-        push_res = _run_git(["push", "-u", "origin", active_branch], cwd=repo_path, timeout=120)
+        push_res = _run_git(
+            ["push", "-u", "origin", f"refs/heads/{active_branch}"],
+            cwd=repo_path,
+            timeout=120,
+        )
         if push_res.returncode != 0:
             return {
                 "status": "failed",
@@ -1362,6 +1395,38 @@ def default_dsbot_runner(
         "pr_url": extract_pr_url(out),
         "error": None,
     }
+
+
+def _acquire_dir_lock(
+    lock_dir: str, timeout_sec: float = 2.0, stale_sec: float = 30.0
+) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(lock_dir)), exist_ok=True)
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            return
+        except FileExistsError:
+            try:
+                stale = (time.time() - os.path.getmtime(lock_dir)) > stale_sec
+            except OSError:
+                continue
+            if stale:
+                try:
+                    os.rmdir(lock_dir)
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                raise TimeoutError(f"Timed out acquiring lock {lock_dir}")
+            time.sleep(0.01)
+
+
+def _release_dir_lock(lock_dir: str) -> None:
+    try:
+        os.rmdir(lock_dir)
+    except FileNotFoundError:
+        pass
 
 
 class MacJobWorker:
@@ -1545,31 +1610,23 @@ class MacJobWorker:
             return 0
         claim_path = f"{spool_path}.flushing"
         claim_tmp = f"{claim_path}.tmp"
+        lock_dir = f"{spool_path}.lock"
         lines: list[str] = []
-        if os.path.exists(claim_path):
-            try:
-                with open(claim_path, "r", encoding="utf-8") as cf:
-                    lines.extend(ln.strip() for ln in cf if ln.strip())
-            except OSError:
-                pass
-        if os.path.exists(spool_path):
-            try:
-                with open(spool_path, "r+", encoding="utf-8") as f:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    try:
-                        lines.extend(ln.strip() for ln in f if ln.strip())
-                        if lines:
-                            with open(claim_tmp, "w", encoding="utf-8") as tmpf:
-                                tmpf.write("\n".join(lines) + "\n")
-                            os.replace(claim_tmp, claim_path)
-                        f.seek(0)
-                        f.truncate(0)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    finally:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+        _acquire_dir_lock(lock_dir)
+        try:
+            if os.path.exists(claim_path):
+                with open(claim_path, "r", encoding="utf-8") as f:
+                    lines.extend(ln.strip() for ln in f if ln.strip())
+            if os.path.exists(spool_path):
+                with open(spool_path, "r", encoding="utf-8") as f:
+                    lines.extend(ln.strip() for ln in f if ln.strip())
+                if lines:
+                    with open(claim_tmp, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+                    os.replace(claim_tmp, claim_path)
+                os.remove(spool_path)
+        finally:
+            _release_dir_lock(lock_dir)
         if not lines:
             if os.path.exists(claim_path):
                 os.remove(claim_path)
@@ -1589,24 +1646,11 @@ class MacJobWorker:
                 remaining.extend(lines[idx:])
                 break
         if remaining:
-            with open(claim_tmp, "w", encoding="utf-8") as tmpf:
-                tmpf.write("\n".join(remaining) + "\n")
+            with open(claim_tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(remaining) + "\n")
             os.replace(claim_tmp, claim_path)
-        else:
-            if os.path.exists(claim_path):
-                os.remove(claim_path)
-            try:
-                if os.path.exists(spool_path):
-                    with open(spool_path, "r+", encoding="utf-8") as f:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                        try:
-                            f.seek(0, os.SEEK_END)
-                            if f.tell() == 0:
-                                os.remove(spool_path)
-                        finally:
-                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+        elif os.path.exists(claim_path):
+            os.remove(claim_path)
         return flushed
 
     def poll_once(self) -> Optional[dict[str, Any]]:

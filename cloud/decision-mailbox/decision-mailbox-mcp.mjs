@@ -99,9 +99,43 @@ async function brokerFetch(method, urlPath, body) {
   return { status: res.status, data };
 }
 
-function spoolDecision(payload) {
+async function acquireDirLock(lockDir, timeoutMs = 2000, staleMs = 30000) {
+  fs.mkdirSync(path.dirname(path.resolve(lockDir)), { recursive: true });
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      fs.mkdirSync(lockDir, { mode: 0o700 });
+      return;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      try {
+        const st = fs.statSync(lockDir);
+        if (Date.now() - st.mtimeMs > staleMs) {
+          try {
+            fs.rmdirSync(lockDir);
+          } catch {}
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out acquiring lock ${lockDir}`);
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+}
+
+async function spoolDecision(payload) {
   fs.mkdirSync(path.dirname(SPOOL_FILE), { recursive: true });
-  fs.appendFileSync(SPOOL_FILE, JSON.stringify(payload) + '\n', { mode: 0o600 });
+  const lockDir = `${SPOOL_FILE}.lock`;
+  await acquireDirLock(lockDir);
+  try {
+    fs.appendFileSync(SPOOL_FILE, JSON.stringify(payload) + '\n', { mode: 0o600 });
+  } finally {
+    try {
+      fs.rmdirSync(lockDir);
+    } catch {}
+  }
 }
 
 async function handleToolCall(name, args) {
@@ -122,7 +156,7 @@ async function handleToolCall(name, args) {
         isError: res.status >= 400,
       };
     } catch {
-      spoolDecision(payload);
+      await spoolDecision(payload);
       return {
         content: [
           {

@@ -618,6 +618,9 @@ class BrokerTest(unittest.TestCase):
             {"workspace_id": "ws-new", "terminal_id": "term-rev", "role": "reviewer"},
         )
 
+        # Simulate a late delivery mark that bumps job1.updated_at AFTER ws-new completed
+        self.store.mark_delivery(job1_id, True)
+
         # Delayed idempotent retry of job1's completion must not roll back ws-new
         st, done = self._req(
             "POST",
