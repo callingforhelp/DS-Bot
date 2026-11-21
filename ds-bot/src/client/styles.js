@@ -779,10 +779,13 @@ html:not([data-windows-titlebar]) [class*="_footArea"],:not([class*="_collapsed"
 .bt-voice-ring-2{inset:14px;background:none;box-shadow:inset 0 0 0 1px var(--bt-line-2);transform:scale(calc(.94 + var(--bt-level,0) * .3));opacity:.8}
 .bt-voice-stage[data-phase=thinking] .bt-voice-ring{animation:bt-voice-breathe 1.6s ease-in-out infinite}
 .bt-voice-stage[data-phase=speaking] .bt-voice-ring{animation:bt-voice-speak .9s ease-in-out infinite}
+.bt-voice-stage[data-phase=standby] .bt-voice-ring{opacity:.45;transform:scale(.94)}
+.bt-voice-stage[data-phase=standby] .bt-voice-ring-2{opacity:.35;transform:scale(.9)}
 @keyframes bt-voice-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
 @keyframes bt-voice-speak{0%,100%{transform:scale(1.04)}30%{transform:scale(1.2)}60%{transform:scale(1.1)}}
 .bt-voice-orb>.bt-mark{position:relative}
 .bt-voice-name{font-size:16px;line-height:22px;font-weight:500}
+.bt-voice-meta{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;background:var(--bt-hover);color:var(--bt-ink-2);font-size:11px;line-height:16px}
 .bt-voice-status{font-size:13px;line-height:18px;color:var(--bt-ink-2);min-height:18px}
 .bt-voice-caption{min-height:44px;font-size:15px;line-height:22px;color:var(--bt-ink);animation:bt-blur-in .25s ease-out;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .bt-voice-note{font-size:12px;color:var(--bt-danger)}

@@ -14,6 +14,7 @@ import { frameLayout, readSidebar, writeSidebar, toggledPref, DSH_NARROW } from 
 import { installFrameWatch } from './frame-watch.js'
 import { HeaderPill } from './header.js'
 import { ComposerPlus, ComposerVoice, menuIcons } from './composer.js'
+import { ComposerRuntimeChip, CloudHandoffDock, RUNTIME_CSS } from './runtime-pill.js'
 import { CHATS_SOURCE, atSources } from './at-menu.js'
 import { BtwDock, BtwTurnTail } from './btw.js'
 import { SIDE_CSS, sideSource } from './side-chat.js'
@@ -230,6 +231,7 @@ export function apply(ctx) {
     // The read-only notice goes once this host takes the team over from a dsh that
     // closed, without a reload: the window holds the answer's live fields until then.
     if (value.readOnly !== undefined && (value.readOnly ?? null) !== (current.readOnly ?? null)) live.readOnly = value.readOnly
+    if (value.cloudRuntime !== undefined && JSON.stringify(value.cloudRuntime) !== JSON.stringify(current.cloudRuntime ?? null)) live.cloudRuntime = value.cloudRuntime
     if (Object.keys(live).length > 0 && current.ready) roster.set({ ...current, ...live })
     if (value.unchanged || (value.revision === current.revision && value.modelsKey === current.modelsKey)) {
       return value.liveKey !== undefined && value.liveKey !== prevLiveKey
@@ -1192,6 +1194,7 @@ export function apply(ctx) {
     [HANDOFF_CSS, 'handoff'],
     [SIDE_CSS, 'side'],
     [BROWSER_CSS, 'browser'],
+    [RUNTIME_CSS, 'runtime'],
   ]
   // Settings outside Bot mode (Agent mode) brings DS Bot's own rules and colors while it
   // shows; the shell overrides and DSH's tokens stay as Agent mode has them.
@@ -1289,6 +1292,7 @@ export function apply(ctx) {
     () => shadow('conversation.composer.dock', { id: 'btw', order: 2, priority: BOT_PRIORITY, inject: face }, BtwDock),
     () => shadow('conversation.input.left', { id: 'bot-paste', order: -110, inject: face }, PasteGuard),
     () => shadow('conversation.input.left', { id: 'bot-plus', order: -100, inject: face }, ComposerPlus),
+    () => shadow('conversation.input.left', { id: 'bot-runtime', order: -90, inject: face }, ComposerRuntimeChip),
     () => shadow('conversation.input.right', { id: 'bot-voice', order: 100, inject: face }, ComposerVoice),
     () => shadow('conversation.composer', {
       priority: BOT_PRIORITY,
@@ -1303,6 +1307,7 @@ export function apply(ctx) {
     () => shadow('conversation.input.dock', { id: 'bot-secret', order: -90, inject: face }, SecretDock),
     () => shadow('conversation.input.dock', { id: 'bot-connector', order: -89, inject: face }, ConnectorDock),
     () => shadow('conversation.input.dock', { id: 'bot-mail', order: -88, inject: face }, MailDock),
+    () => shadow('conversation.input.dock', { id: 'bot-cloud-handoff', order: -86, inject: face }, CloudHandoffDock),
     () => shadow('conversation.input.dock', { id: 'bot-handoff', order: -85, inject: face }, HandoffDock),
     () => shadow('conversation.input.dock', { id: 'bot-computer-handoff', order: -84, inject: face }, ComputerHandoffDock),
     () => shadow('conversation.input.dock', { id: 'bot-computer-app', order: -83, inject: face }, AppAccessDock),

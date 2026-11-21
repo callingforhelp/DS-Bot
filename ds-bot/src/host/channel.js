@@ -135,6 +135,7 @@ export function install(rt) {
     im: rt.imView?.() ?? { connections: [], platforms: [] },
     // The computer-use switch, the provider it mounts, and each Bot's level and app grants.
     computer: rt.computerView?.() ?? { enabled: false },
+    cloudRuntime: rt.cloudRuntimeView?.() ?? { controllerOnline: false, configured: false, syncedAt: null, machines: [], sessions: {} },
   })
   // What changes without a new revision, sent with every state answer. `learning`:
   // each Bot's pending skill proposals; `learningSettled`: the answered ones of its
@@ -175,6 +176,7 @@ export function install(rt) {
     // Browser holds (handoffs and takeovers) change without bumping state.revision,
     // so they ride on live() to reconcile unchanged-revision polls.
     browserHolds: rt.browserChannel?.holdSnapshot?.() ?? {},
+    cloudRuntime: rt.cloudRuntimeView?.() ?? { controllerOnline: false, configured: false, syncedAt: null, machines: [], sessions: {} },
   })
   // The live fields' sources are spread across the host with no single change
   // counter, so the serialized answer itself is the detector: a poll whose `live`
@@ -192,7 +194,7 @@ export function install(rt) {
   }
   // What a host that only reads the team may still answer.
   // Updates change the dsh profile, not the team, so a reading host may run them too.
-  const READS = new Set(['secret-store', 'secret-unlock', 'state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'group-rows', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image', 'markdown-image', 'file-download', 'changes-check'])
+  const READS = new Set(['secret-store', 'secret-unlock', 'state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'group-rows', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image', 'markdown-image', 'file-download', 'changes-check', 'cloud-status', 'cloud-preflight', 'voice-status'])
 
   async function setPrefs(body) {
     if (body.theme !== undefined) {
@@ -851,6 +853,20 @@ export function install(rt) {
         case 'local-agent-remove':
           await rt.load()
           return ok(await rt.localAgentsEndpoint(endpoint, body))
+        case 'cloud-status':
+        case 'cloud-preflight':
+        case 'cloud-handoff-to-cloud':
+        case 'cloud-handoff-to-local':
+        case 'cloud-send':
+        case 'cloud-dismiss-handoff':
+          await rt.load()
+          return ok(await rt.cloudEndpoint(endpoint, body))
+        case 'voice-status':
+        case 'voice-session-create':
+        case 'voice-session-close':
+        case 'voice-transcript-append':
+          await rt.load()
+          return ok(await rt.voiceEndpoint(endpoint, body))
         // "New session" and "open an earlier session" on an abot's chat: ordinary
         // parts moves (parts.js), the same mechanism every Bot's chat uses.
         case 'bot-new-part': {
