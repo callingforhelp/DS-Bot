@@ -1002,7 +1002,10 @@ def default_paradev_runner(
     if is_session:
         create_cmd.append("--session")
     else:
-        create_cmd.extend(["--project", project_id])
+        ws_name = branch or (
+            f"{(proj.get('name') if proj else None) or 'workspace'}-{int(time.time())}"
+        )
+        create_cmd.extend(["--project", project_id, "--name", ws_name])
         if branch:
             create_cmd.extend(["--branch", branch])
         else:
