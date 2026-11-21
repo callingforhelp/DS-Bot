@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import http.client
 import json
 import os
@@ -26,6 +27,7 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)\b(AKIA[0-9A-Z]{16})\b"),
 ]
 PR_URL_RE = re.compile(r"https://github\.com/[^\s)\"'<>]+/pull/\d+")
+_FLUSH_THREAD_LOCK = threading.Lock()
 
 DEFAULT_ALLOWED_ROOTS = (
     "/Users/chief/flinter-cnc-tabletop",
@@ -1636,58 +1638,57 @@ class MacJobWorker:
         claim_path = f"{spool_path}.flushing"
         claim_tmp = f"{claim_path}.tmp"
         lock_dir = f"{spool_path}.lock"
-        flush_lock_dir = f"{spool_path}.flush.lock"
-        _acquire_dir_lock(flush_lock_dir, timeout_sec=15.0, stale_sec=120.0)
-        try:
-            lines: list[str] = []
-            _acquire_dir_lock(lock_dir)
-            try:
-                if os.path.exists(claim_path):
-                    with open(claim_path, "r", encoding="utf-8") as f:
-                        lines.extend(ln.strip() for ln in f if ln.strip())
-                if os.path.exists(spool_path):
-                    with open(spool_path, "r", encoding="utf-8") as f:
-                        lines.extend(ln.strip() for ln in f if ln.strip())
-                    if lines:
+        flush_lock_path = f"{spool_path}.flush.lockfile"
+        os.makedirs(os.path.dirname(os.path.abspath(flush_lock_path)), exist_ok=True)
+        with _FLUSH_THREAD_LOCK:
+            with open(flush_lock_path, "a+", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                try:
+                    lines: list[str] = []
+                    _acquire_dir_lock(lock_dir)
+                    try:
+                        if os.path.exists(claim_path):
+                            with open(claim_path, "r", encoding="utf-8") as f:
+                                lines.extend(ln.strip() for ln in f if ln.strip())
+                        if os.path.exists(spool_path):
+                            with open(spool_path, "r", encoding="utf-8") as f:
+                                lines.extend(ln.strip() for ln in f if ln.strip())
+                            if lines:
+                                with open(claim_tmp, "w", encoding="utf-8") as f:
+                                    f.write("\n".join(lines) + "\n")
+                                os.replace(claim_tmp, claim_path)
+                            os.remove(spool_path)
+                    finally:
+                        _release_dir_lock(lock_dir)
+                    if not lines:
+                        if os.path.exists(claim_path):
+                            os.remove(claim_path)
+                        return 0
+                    remaining: list[str] = []
+                    flushed = 0
+                    for idx, ln in enumerate(lines):
+                        try:
+                            payload = json.loads(ln)
+                            code, _ = self.broker.post(
+                                "/v1/decisions", payload, timeout=10.0
+                            )
+                            if code in (200, 201):
+                                flushed += 1
+                            else:
+                                remaining.extend(lines[idx:])
+                                break
+                        except Exception:
+                            remaining.extend(lines[idx:])
+                            break
+                    if remaining:
                         with open(claim_tmp, "w", encoding="utf-8") as f:
-                            f.write("\n".join(lines) + "\n")
+                            f.write("\n".join(remaining) + "\n")
                         os.replace(claim_tmp, claim_path)
-                    os.remove(spool_path)
-            finally:
-                _release_dir_lock(lock_dir)
-            if not lines:
-                if os.path.exists(claim_path):
-                    os.remove(claim_path)
-                return 0
-            remaining: list[str] = []
-            flushed = 0
-            for idx, ln in enumerate(lines):
-                try:
-                    os.utime(flush_lock_dir, None)
-                except OSError:
-                    pass
-                try:
-                    payload = json.loads(ln)
-                    code, _ = self.broker.post(
-                        "/v1/decisions", payload, timeout=10.0
-                    )
-                    if code in (200, 201):
-                        flushed += 1
-                    else:
-                        remaining.extend(lines[idx:])
-                        break
-                except Exception:
-                    remaining.extend(lines[idx:])
-                    break
-            if remaining:
-                with open(claim_tmp, "w", encoding="utf-8") as f:
-                    f.write("\n".join(remaining) + "\n")
-                os.replace(claim_tmp, claim_path)
-            elif os.path.exists(claim_path):
-                os.remove(claim_path)
-            return flushed
-        finally:
-            _release_dir_lock(flush_lock_dir)
+                    elif os.path.exists(claim_path):
+                        os.remove(claim_path)
+                    return flushed
+                finally:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
     def poll_once(self) -> Optional[dict[str, Any]]:
         code, data = self.broker.post(
