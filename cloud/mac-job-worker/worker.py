@@ -1637,7 +1637,7 @@ class MacJobWorker:
         claim_tmp = f"{claim_path}.tmp"
         lock_dir = f"{spool_path}.lock"
         flush_lock_dir = f"{spool_path}.flush.lock"
-        _acquire_dir_lock(flush_lock_dir, timeout_sec=15.0, stale_sec=60.0)
+        _acquire_dir_lock(flush_lock_dir, timeout_sec=15.0, stale_sec=120.0)
         try:
             lines: list[str] = []
             _acquire_dir_lock(lock_dir)
@@ -1662,6 +1662,10 @@ class MacJobWorker:
             remaining: list[str] = []
             flushed = 0
             for idx, ln in enumerate(lines):
+                try:
+                    os.utime(flush_lock_dir, None)
+                except OSError:
+                    pass
                 try:
                     payload = json.loads(ln)
                     code, _ = self.broker.post(
