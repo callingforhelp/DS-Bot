@@ -13,6 +13,7 @@ import { localObjectStore } from './objectstore.mjs'
 import { r2ClientFromEnv, r2ObjectStore } from './r2store.mjs'
 import { appPool } from './remote.mjs'
 import { daytonaProvider } from './daytona.mjs'
+import { createOpenAiLiveVoice } from './voice.mjs'
 import { mockDaytona } from './worker.mjs'
 
 const env = process.env
@@ -41,10 +42,26 @@ const machines = env.DAYTONA_API_KEY
   : createDaytonaMachineManager({ client: mockDaytonaClient(), store: machineStore })
 
 const machineMessageHandler = env.DS_BOT_DSH_PORT && env.DS_BOT_DSH_TOKEN
-  ? createDshMessageHandler({ port: Number(env.DS_BOT_DSH_PORT), authToken: env.DS_BOT_DSH_TOKEN })
+  ? createDshMessageHandler({
+      port: Number(env.DS_BOT_DSH_PORT),
+      authToken: env.DS_BOT_DSH_TOKEN,
+      allowSandboxInboxFallback: env.DS_BOT_DSH_INBOX_FALLBACK !== '0',
+    })
   : undefined
 const approvedSnapshots = (env.APPROVED_SNAPSHOTS ?? 'daytona-small,daytona-medium,daytona-large,ds-bot-dsh')
   .split(',').map(s => s.trim()).filter(Boolean)
+
+const voiceEnabled = Boolean(env.OPENAI_API_KEY) && env.OPENAI_VOICE_ENABLED !== '0' && env.OPENAI_VOICE_ENABLED !== 'false'
+const voice = voiceEnabled
+  ? createOpenAiLiveVoice({
+      apiKey: env.OPENAI_API_KEY,
+      baseUrl: env.OPENAI_BASE_URL,
+      defaultModel: env.OPENAI_LIVE_MODEL,
+      defaultVoice: env.OPENAI_LIVE_VOICE,
+      defaultIdleTimeoutS: env.OPENAI_LIVE_IDLE_TIMEOUT_S ? Number(env.OPENAI_LIVE_IDLE_TIMEOUT_S) : undefined,
+      defaultVadThreshold: env.OPENAI_LIVE_VAD_THRESHOLD ? Number(env.OPENAI_LIVE_VAD_THRESHOLD) : undefined,
+    })
+  : undefined
 
 say(`object store: ${haveR2 ? 'Cloudflare R2' : 'LOCAL stand-in (not durable)'}`)
 say(`embeddings: ${embedder.model}${embedder.model.startsWith('mock') ? ' (mock; no consent or key)' : ''}`)
@@ -52,12 +69,13 @@ say(`sandboxes: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock (no isolation)'}
 say(`persistent machines: ${env.DAYTONA_API_KEY ? 'Daytona' : 'LOCAL mock'}`)
 say(`approved snapshots: ${approvedSnapshots.join(', ')}`)
 say(`machine messages: ${machineMessageHandler ? `DSH preview port ${env.DS_BOT_DSH_PORT}` : 'disabled (set DS_BOT_DSH_PORT and DS_BOT_DSH_TOKEN to enable)'}`)
+say(`voice: ${voice ? `OpenAI ${voice.config().model} (${voice.config().defaultVoice}, standby ${voice.config().standby.idleTimeoutS}s)` : 'disabled (set OPENAI_API_KEY to enable)'}`)
 
 const localTenants = (env.EMBED_LOCAL_TENANTS ?? '').split(',').map(t => t.trim()).filter(Boolean)
 if (localTenants.length) say(`embeddings for ${localTenants.join(', ')}: local only (EMBED_LOCAL_TENANTS)`)
 
 const ctl = await startController({
-  pool, principals, embedder, localEmbedder: mockEmbedder(), localTenants, objectStore, provider, machines, machineMessageHandler, approvedSnapshots,
+  pool, principals, embedder, localEmbedder: mockEmbedder(), localTenants, objectStore, provider, machines, machineMessageHandler, voice, approvedSnapshots,
   host: env.HOST ?? '127.0.0.1', port: Number(env.PORT ?? 8080),
   bucket: haveR2 ? env.R2_BUCKET : 'artifacts', instance: env.INSTANCE_ID ?? `ctl-${process.pid}`, log: (...a) => say(...a),
 })

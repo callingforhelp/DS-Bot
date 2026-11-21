@@ -67,3 +67,17 @@ paths:
       summary: (user or human principal) Filtered keyword + vector search with weighted RRF. Returns source references and snippets, never generated claims.
       requestBody: { content: { application/json: { schema: { type: object, required: [project_id, query], properties: { project_id: { type: string }, query: { type: string }, mode: { type: string, enum: [lexical, vector, hybrid] }, limit: { type: integer, maximum: 50 }, from: { type: string, format: date-time }, to: { type: string, format: date-time }, bot_id: { type: string } } } } } }
       responses: { '200': { description: "{queryId, mode, vectorUsed, results[]}" }, '400': { description: 'query over 2000 characters, limit outside 1-50, bad date or mode' }, '403': { description: 'not a user or human principal' } }
+  /v1/voice/config:
+    get:
+      summary: Read OpenAI GPT-Live 1.1 WebRTC and Standby configuration (user or human principal).
+      responses: { '200': { description: "{configured, provider, model, models, defaultVoice, voices, dataChannel, standby}" }, '403': { description: 'not a user or human principal' } }
+  /v1/voice/sessions:
+    post:
+      summary: Exchange a WebRTC SDP offer for an OpenAI GPT-Live 1.1 session (POST /v1/live/sessions) with Standby enabled.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [sdp], properties: { sdp: { type: string }, model: { type: string, enum: [gpt-live-1.1, gpt-live-1] }, voice: { type: string }, instructions: { type: string }, standby: { type: boolean }, idleTimeoutS: { type: integer, minimum: 5, maximum: 60 }, vadThreshold: { type: number, minimum: 0, maximum: 1 }, botId: { type: string }, machineId: { type: string } } } } } }
+      responses: { '201': { description: "{liveSessionId, sdp, model, voice, standby, dataChannel, via}" }, '400': { description: 'invalid voice session parameters' }, '403': { description: 'not a user or human principal' }, '404': { description: 'unknown machineId in this tenant' }, '501': { description: 'voice is not configured' }, '502': { description: 'OpenAI Live API upstream failure' } }
+  /v1/voice/sessions/{session_id}:
+    delete:
+      summary: Close an active OpenAI GPT-Live 1.1 session created by this tenant.
+      parameters: [{ name: session_id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: "{closed: true, liveSessionId}" }, '403': { description: 'not a user or human principal' }, '404': { description: 'unknown voice session in this tenant' }, '501': { description: 'voice is not configured' } }
