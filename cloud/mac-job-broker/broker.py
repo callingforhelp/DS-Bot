@@ -417,6 +417,10 @@ class BrokerStore:
                 return False, None
             # Idempotent re-delivery from same worker if already finished
             if row["status"] in ("succeeded", "failed") and row["worker_id"] == worker_id:
+                self._record_paradev_session(
+                    row, workspace_id, terminal_id, role, agent, worktree_path,
+                    job_id, now,
+                )
                 return True, self._row_to_dict(row)
             if row["status"] not in ("running", "lease_lost") or (
                 row["worker_id"] and row["worker_id"] != worker_id
@@ -458,73 +462,101 @@ class BrokerStore:
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             if updated is not None:
-                eff_ws = updated["workspace_id"]
-                if eff_ws and eff_ws != "local":
-                    eff_repo = updated["repo"]
-                    eff_cwd = updated["cwd"]
-                    eff_branch = updated["branch"]
-                    eff_role = role or updated["role"] or "worker"
-                    eff_terminal = terminal_id or updated["terminal_id"]
-                    eff_agent = agent or updated["agent"]
-                    eff_worktree = worktree_path or updated["worktree_path"]
-                    existing = self.conn.execute(
-                        """
-                        SELECT session_key, repo, cwd, branch
-                        FROM paradev_sessions
-                        WHERE workspace_id = ?
-                        ORDER BY updated_at DESC
-                        LIMIT 1
-                        """,
-                        (eff_ws,),
-                    ).fetchone()
-                    if existing is not None:
-                        session_key = existing["session_key"]
-                        eff_repo = eff_repo or existing["repo"]
-                        eff_cwd = eff_cwd or existing["cwd"]
-                        eff_branch = eff_branch or existing["branch"]
-                    else:
-                        session_key = (
-                            f"{eff_repo or eff_cwd or eff_ws}:{eff_branch or 'default'}"
-                        )
-                    if eff_terminal == "dsbot-headless":
-                        eff_terminal = None
-                    worker_tid = eff_terminal if eff_role != "reviewer" else None
-                    reviewer_tid = eff_terminal if eff_role == "reviewer" else None
-                    self.conn.execute(
-                        """
-                        INSERT INTO paradev_sessions (
-                            session_key, repo, cwd, branch, workspace_id,
-                            worktree_path, worker_terminal_id, reviewer_terminal_id,
-                            agent, last_job_id, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(session_key) DO UPDATE SET
-                            repo = COALESCE(excluded.repo, paradev_sessions.repo),
-                            cwd = COALESCE(excluded.cwd, paradev_sessions.cwd),
-                            branch = COALESCE(excluded.branch, paradev_sessions.branch),
-                            workspace_id = excluded.workspace_id,
-                            worktree_path = COALESCE(excluded.worktree_path, paradev_sessions.worktree_path),
-                            worker_terminal_id = COALESCE(excluded.worker_terminal_id, paradev_sessions.worker_terminal_id),
-                            reviewer_terminal_id = COALESCE(excluded.reviewer_terminal_id, paradev_sessions.reviewer_terminal_id),
-                            agent = COALESCE(excluded.agent, paradev_sessions.agent),
-                            last_job_id = excluded.last_job_id,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            session_key,
-                            eff_repo,
-                            eff_cwd,
-                            eff_branch,
-                            eff_ws,
-                            eff_worktree,
-                            worker_tid,
-                            reviewer_tid,
-                            eff_agent,
-                            job_id,
-                            now,
-                        ),
-                    )
-                    self.conn.commit()
+                self._record_paradev_session(
+                    updated, workspace_id, terminal_id, role, agent, worktree_path,
+                    job_id, now,
+                )
         return True, self._row_to_dict(updated)
+
+    def _record_paradev_session(
+        self,
+        job: sqlite3.Row,
+        workspace_id: Optional[str],
+        terminal_id: Optional[str],
+        role: Optional[str],
+        agent: Optional[str],
+        worktree_path: Optional[str],
+        job_id: str,
+        now: float,
+    ) -> None:
+        """Upsert paradev_sessions from a finished job. Caller must hold self._lock."""
+        eff_ws = workspace_id or job["workspace_id"]
+        if not eff_ws or eff_ws == "local":
+            return
+        eff_repo = job["repo"]
+        eff_cwd = job["cwd"]
+        eff_branch = job["branch"]
+        eff_role = role or job["role"] or "worker"
+        eff_terminal = terminal_id or job["terminal_id"]
+        eff_agent = agent or job["agent"]
+        eff_worktree = worktree_path or job["worktree_path"]
+        existing = self.conn.execute(
+            """
+            SELECT session_key, repo, cwd, branch
+            FROM paradev_sessions
+            WHERE workspace_id = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (eff_ws,),
+        ).fetchone()
+        if existing is not None:
+            session_key = existing["session_key"]
+            eff_repo = eff_repo or existing["repo"]
+            eff_cwd = eff_cwd or existing["cwd"]
+            eff_branch = eff_branch or existing["branch"]
+        else:
+            session_key = f"{eff_repo or eff_cwd or eff_ws}:{eff_branch or 'default'}"
+        if eff_terminal == "dsbot-headless":
+            eff_terminal = None
+        worker_tid = eff_terminal if eff_role != "reviewer" else None
+        reviewer_tid = eff_terminal if eff_role == "reviewer" else None
+        self.conn.execute(
+            """
+            INSERT INTO paradev_sessions (
+                session_key, repo, cwd, branch, workspace_id,
+                worktree_path, worker_terminal_id, reviewer_terminal_id,
+                agent, last_job_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_key) DO UPDATE SET
+                repo = COALESCE(excluded.repo, paradev_sessions.repo),
+                cwd = COALESCE(excluded.cwd, paradev_sessions.cwd),
+                branch = COALESCE(excluded.branch, paradev_sessions.branch),
+                workspace_id = excluded.workspace_id,
+                worktree_path = CASE
+                    WHEN paradev_sessions.workspace_id = excluded.workspace_id
+                    THEN COALESCE(excluded.worktree_path, paradev_sessions.worktree_path)
+                    ELSE excluded.worktree_path
+                END,
+                worker_terminal_id = CASE
+                    WHEN paradev_sessions.workspace_id = excluded.workspace_id
+                    THEN COALESCE(excluded.worker_terminal_id, paradev_sessions.worker_terminal_id)
+                    ELSE excluded.worker_terminal_id
+                END,
+                reviewer_terminal_id = CASE
+                    WHEN paradev_sessions.workspace_id = excluded.workspace_id
+                    THEN COALESCE(excluded.reviewer_terminal_id, paradev_sessions.reviewer_terminal_id)
+                    ELSE excluded.reviewer_terminal_id
+                END,
+                agent = COALESCE(excluded.agent, paradev_sessions.agent),
+                last_job_id = excluded.last_job_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                session_key,
+                eff_repo,
+                eff_cwd,
+                eff_branch,
+                eff_ws,
+                eff_worktree,
+                worker_tid,
+                reviewer_tid,
+                eff_agent,
+                job_id,
+                now,
+            ),
+        )
+        self.conn.commit()
 
     def reconcile_worker(
         self, worker_id: str, hostname: str = "", capabilities: Optional[list[str]] = None

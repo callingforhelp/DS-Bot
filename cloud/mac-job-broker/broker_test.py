@@ -520,6 +520,90 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(sess["worker_terminal_id"], "term-w")
         self.assertEqual(sess["reviewer_terminal_id"], "term-r")
 
+    def _run_paradev_job(self, enqueue_fields, complete_fields):
+        st, data = self._req(
+            "POST",
+            "/v1/jobs",
+            {
+                "target": "paradev",
+                "task": "t",
+                "aws_session_id": "s1",
+                **enqueue_fields,
+            },
+            token="prod-secret",
+        )
+        self.assertEqual(st, 201)
+        job_id = data["job"]["job_id"]
+        st, claim = self._req(
+            "POST",
+            "/v1/worker/claim",
+            {"worker_id": "mac-1", "hostname": "mini"},
+            token="work-secret",
+        )
+        self.assertEqual(claim["job"]["job_id"], job_id)
+        st, done = self._req(
+            "POST",
+            "/v1/worker/complete",
+            {
+                "job_id": job_id,
+                "worker_id": "mac-1",
+                "status": "succeeded",
+                "result_summary": "done",
+                **complete_fields,
+            },
+            token="work-secret",
+        )
+        self.assertEqual(st, 200)
+        return job_id
+
+    def test_paradev_session_workspace_rotation_clears_stale_terminals(self) -> None:
+        self._run_paradev_job(
+            {"repo": "demo-app", "branch": "main"},
+            {"workspace_id": "ws-old", "terminal_id": "term-w-old", "role": "worker"},
+        )
+        self._run_paradev_job(
+            {"workspace_id": "ws-old", "role": "reviewer"},
+            {"workspace_id": "ws-old", "terminal_id": "term-r-old", "role": "reviewer"},
+        )
+        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(sessions["sessions"]), 1)
+        self.assertEqual(sessions["sessions"][0]["reviewer_terminal_id"], "term-r-old")
+
+        # Same repo:branch rotates to a brand-new workspace -> stale reviewer cleared
+        job3_id = self._run_paradev_job(
+            {"repo": "demo-app", "branch": "main"},
+            {"workspace_id": "ws-new", "terminal_id": "term-new-w", "role": "worker"},
+        )
+        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(sessions["sessions"]), 1)
+        sess = sessions["sessions"][0]
+        self.assertEqual(sess["session_key"], "demo-app:main")
+        self.assertEqual(sess["workspace_id"], "ws-new")
+        self.assertEqual(sess["worker_terminal_id"], "term-new-w")
+        self.assertIsNone(sess["reviewer_terminal_id"])
+
+        # Idempotent retry of the same completion still leaves the session correct
+        st, done = self._req(
+            "POST",
+            "/v1/worker/complete",
+            {
+                "job_id": job3_id,
+                "worker_id": "mac-1",
+                "status": "succeeded",
+                "result_summary": "done",
+            },
+            token="work-secret",
+        )
+        self.assertEqual(st, 200)
+        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(sessions["sessions"]), 1)
+        self.assertEqual(sessions["sessions"][0]["workspace_id"], "ws-new")
+        self.assertEqual(sessions["sessions"][0]["worker_terminal_id"], "term-new-w")
+        self.assertIsNone(sessions["sessions"][0]["reviewer_terminal_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

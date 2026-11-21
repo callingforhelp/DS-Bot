@@ -252,6 +252,13 @@ def is_authorized_local_path(
     path: str, paradev_bin: str = "", parent_dir: str = "/Users/chief"
 ) -> bool:
     real = os.path.realpath(os.path.expanduser(path))
+    real_parent = os.path.realpath(os.path.expanduser(parent_dir))
+    forbidden_lower = {s.lower() for s in FORBIDDEN_HOME_SUBDIRS}
+    if real.startswith(real_parent + os.sep):
+        top = real[len(real_parent) + 1 :].split(os.sep, 1)[0]
+        if top and top.lower() in forbidden_lower:
+            return False
+
     env_set = "MAC_WORKER_ALLOWED_ROOTS" in os.environ
     env_roots = os.environ.get("MAC_WORKER_ALLOWED_ROOTS") or ""
     if env_set:
@@ -262,6 +269,9 @@ def is_authorized_local_path(
         root_real = os.path.realpath(os.path.expanduser(root))
         if real == root_real or real.startswith(root_real + os.sep):
             return True
+
+    if env_set:
+        return False
 
     if paradev_bin and os.path.exists(paradev_bin):
         try:
@@ -283,16 +293,14 @@ def is_authorized_local_path(
         except Exception:
             pass
 
-    if not env_set:
-        real_parent = os.path.realpath(os.path.expanduser(parent_dir))
-        if real.startswith(real_parent + os.sep):
-            top = real[len(real_parent) + 1 :].split(os.sep, 1)[0]
-            if (
-                top
-                and top.lower() not in {s.lower() for s in FORBIDDEN_HOME_SUBDIRS}
-                and not top.startswith(".")
-            ):
-                return True
+    if real.startswith(real_parent + os.sep):
+        top = real[len(real_parent) + 1 :].split(os.sep, 1)[0]
+        if (
+            top
+            and top.lower() not in forbidden_lower
+            and not top.startswith(".")
+        ):
+            return True
     return False
 
 
@@ -356,6 +364,16 @@ def ensure_paradev_project(
     if existing is None and cwd:
         existing = _find_paradev_project(cwd, paradev_bin)
     if existing is not None:
+        if existing.get("path") and not is_authorized_local_path(
+            str(existing["path"]), paradev_bin, parent_dir=parent_dir
+        ):
+            raise RuntimeError(f"Unauthorized local path: {existing['path']}")
+        if cwd and cwd.strip() and not is_authorized_local_path(
+            os.path.expanduser(cwd.strip()), paradev_bin, parent_dir=parent_dir
+        ):
+            raise RuntimeError(
+                f"Unauthorized local path: {os.path.expanduser(cwd.strip())}"
+            )
         return existing, True
 
     if cwd and cwd.strip():
@@ -511,6 +529,10 @@ class ParadevSessionStore:
                     break
         existing = data.get(key)
         merged = dict(existing) if isinstance(existing, dict) else {}
+        existing_ws = merged.get("workspace_id")
+        if existing_ws and ws and str(existing_ws) != str(ws):
+            for stale in ("worker_terminal_id", "reviewer_terminal_id", "worktree_path"):
+                merged.pop(stale, None)
         merged.update(updates)
         data[key] = merged
         self._save(data)
@@ -619,7 +641,8 @@ def _read_agent_output(paradev_bin: str, ws_id: str, term_id: str) -> str:
     if read_res.returncode == 0:
         try:
             parsed = json.loads(read_res.stdout)
-            raw_text = str(parsed.get("text") or read_res.stdout)
+            if isinstance(parsed, dict) and "text" in parsed:
+                raw_text = str(parsed.get("text") or "")
         except Exception:
             pass
     if read_res.returncode == 0 and raw_text.strip():
@@ -645,7 +668,8 @@ def _read_agent_output(paradev_bin: str, ws_id: str, term_id: str) -> str:
     if term_res.returncode == 0:
         try:
             parsed = json.loads(term_res.stdout)
-            raw_text = str(parsed.get("text") or term_res.stdout)
+            if isinstance(parsed, dict) and "text" in parsed:
+                raw_text = str(parsed.get("text") or "")
         except Exception:
             pass
     return raw_text
@@ -820,6 +844,14 @@ def default_paradev_runner(
             return
         try:
             entry = dict(saved_entry or {})
+            existing_ws = entry.get("workspace_id")
+            if existing_ws and str(existing_ws) != str(ws):
+                for stale in (
+                    "worker_terminal_id",
+                    "reviewer_terminal_id",
+                    "worktree_path",
+                ):
+                    entry.pop(stale, None)
             entry["workspace_id"] = ws
             entry["agent"] = agent
             entry["updated_at"] = time.time()
@@ -1009,7 +1041,7 @@ def _resolve_mac_repo_path(
         os.path.join(parent_dir, "ds-bot-dev", short_name),
     ]
     for cand in candidates:
-        if os.path.isdir(os.path.join(cand, ".git")):
+        if os.path.exists(os.path.join(cand, ".git")):
             return cand, short_name
     for cand in candidates:
         if os.path.isdir(cand):
@@ -1057,14 +1089,22 @@ def default_git_sync_runner(
 
     repo_path, short_name = _resolve_mac_repo_path(repo_hint, paradev_bin, parent_dir=parent_dir)
 
+    if not is_authorized_local_path(repo_path, paradev_bin, parent_dir=parent_dir):
+        return {
+            "status": "failed",
+            "result_summary": "",
+            "pr_url": None,
+            "error": f"Unauthorized local path: {repo_path}",
+        }
+
     if action == "pull":
-        if not os.path.isdir(os.path.join(repo_path, ".git")):
+        if not os.path.exists(os.path.join(repo_path, ".git")):
             clone_src = remote_hint
             if not clone_src and paradev_bin and os.path.exists(paradev_bin):
                 proj, _ = ensure_paradev_project(repo_hint, paradev_bin, parent_dir=parent_dir)
                 if proj and proj.get("path") and os.path.isdir(str(proj["path"])):
                     repo_path = str(proj["path"])
-            if not os.path.isdir(os.path.join(repo_path, ".git")):
+            if not os.path.exists(os.path.join(repo_path, ".git")):
                 if not clone_src:
                     return {
                         "status": "failed",
@@ -1117,7 +1157,7 @@ def default_git_sync_runner(
         return {"status": "succeeded", "result_summary": json.dumps(summary), "pr_url": None, "error": None}
 
     # action == "push"
-    if not os.path.isdir(os.path.join(repo_path, ".git")):
+    if not os.path.exists(os.path.join(repo_path, ".git")):
         if not create_if_missing:
             return {
                 "status": "failed",
@@ -1183,6 +1223,13 @@ def default_git_sync_runner(
     rem_res = _run_git(["remote", "get-url", "origin"], cwd=repo_path)
     remote_created = False
     if rem_res.returncode != 0:
+        if not create_if_missing:
+            return {
+                "status": "failed",
+                "result_summary": "",
+                "pr_url": None,
+                "error": "No origin remote configured and create_if_missing is false",
+            }
         gh_res = subprocess.run(
             [gh_bin, "repo", "create", short_name, "--private", "--source=.", "--remote=origin", "--push"],
             cwd=repo_path,
@@ -1454,10 +1501,10 @@ class MacJobWorker:
     def flush_pending_decisions(self, spool_path: str) -> int:
         if not spool_path or not os.path.exists(spool_path):
             return 0
-        with open(spool_path, "r", encoding="utf-8") as f:
+        claim_path = f"{spool_path}.flushing"
+        os.replace(spool_path, claim_path)
+        with open(claim_path, "r", encoding="utf-8") as f:
             lines = [ln.strip() for ln in f if ln.strip()]
-        if not lines:
-            return 0
         remaining: list[str] = []
         flushed = 0
         for idx, ln in enumerate(lines):
@@ -1472,13 +1519,18 @@ class MacJobWorker:
             except Exception:
                 remaining.extend(lines[idx:])
                 break
+        if os.path.exists(spool_path):
+            with open(spool_path, "r", encoding="utf-8") as f:
+                remaining.extend(ln.strip() for ln in f if ln.strip())
         if remaining:
             tmp = f"{spool_path}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(remaining) + "\n")
             os.replace(tmp, spool_path)
-        else:
+        elif os.path.exists(spool_path) and os.path.getsize(spool_path) == 0:
             os.remove(spool_path)
+        if os.path.exists(claim_path):
+            os.remove(claim_path)
         return flushed
 
     def poll_once(self) -> Optional[dict[str, Any]]:
