@@ -358,7 +358,7 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   assert.equal(detail.startsWith('Customer summary (untrusted evidence)\n'), true)
   assert.ok(detail.includes(summary))
   assert.ok(detail.indexOf('Customer summary (untrusted evidence)\n') < detail.indexOf('Why handoff\n'))
-  assert.ok(detail.includes('No consensus.'), `Expected an explicit no-consensus label:\n${detail}`)
+  assert.equal(detail.match(/No consensus\./g)?.length, 1, `Expected one no-consensus explanation:\n${detail}`)
   assert.ok(detail.includes('Valid votes: 2/2; quorum: 2.'))
   assert.doesNotMatch(detail, /Consensus confidence:/)
   assert.ok(detail.includes('p/one: quote · 80% · quote request'))
@@ -398,7 +398,7 @@ test('handoff details respect the required judge quorum for empty and one-vote h
     await s.bank.syncHandoffs()
     const detail = s.rt.state.questions.main.detail
     assert.ok(detail.includes(`Insufficient valid votes: ${voteCount} of ${voteCount}; 2 required.`))
-    assert.ok(detail.includes(`No consensus. Valid votes: ${voteCount}/${voteCount}; quorum: 2.`))
+    assert.ok(detail.includes(`Valid votes: ${voteCount}/${voteCount}; quorum: 2.`))
   }
 })
 

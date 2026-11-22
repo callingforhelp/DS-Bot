@@ -147,7 +147,7 @@ function handoffDetail(entry) {
   })
   const confidenceLine = quorumMet && routes.size === 1
     ? `Route confidence: ${percent(confidence)}; required threshold: ${percent(threshold)}.`
-    : `No consensus. Valid votes: ${valid.length}/${votes.length}; quorum: ${quorum}.`
+    : `Valid votes: ${valid.length}/${votes.length}; quorum: ${quorum}.`
   return [
     `Customer summary (untrusted evidence)\n${entry.summary}`,
     `Why handoff\n${why}\n${confidenceLine}`,
