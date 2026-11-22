@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { DICTIONARY, LANGUAGES, dateLocale, hostText, installLocale, language, t } from '../src/client/i18n.js'
 import { imPlatform } from '../src/shared/im-platforms.js'
+import { imText, imTexts } from '../src/host/im/texts.js'
 
 function fakeLocale(initial = 'zh') {
   let active = initial
@@ -86,6 +87,25 @@ test('every DICTIONARY.zh key exists in all other supported locales', () => {
     }
   }
   assert.deepEqual(missing, [])
+})
+
+test('every IM text and call-site key exists in every supported IM locale', () => {
+  const tables = imTexts({ target: 'Target', name: 'Name', bot: 'Bot' })
+  const locales = ['en', 'zh', 'zh-TW', 'ja', 'ko', 'es', 'fr', 'de']
+  assert.deepEqual(Object.keys(tables), locales)
+  const source = readFileSync(new URL('../src/host/im/index.js', import.meta.url), 'utf8')
+  const used = [...source.matchAll(/\btext\(\s*(['"])(.*?)\1/g)].map(match => match[2])
+  assert.ok(used.includes('unavailable'))
+  const keys = [...new Set([...Object.keys(tables.en), ...used])].sort()
+  for (const locale of locales) {
+    assert.deepEqual(Object.keys(tables[locale]).sort(), keys, locale)
+    for (const key of keys) assert.ok(tables[locale][key]?.trim(), `${locale}: ${key}`)
+    assert.notEqual(imText(locale, 'unavailable'), 'unavailable')
+    assert.ok(tables[locale].connected.includes('Target'))
+  }
+  assert.equal(imText('unknown', 'unavailable'), tables.en.unavailable)
+  assert.equal(imText('en', 'unknown'), 'unknown')
+  assert.equal(imText('en', ''), '')
 })
 
 test('copy follows the DSH language across all locales and stays English without a locale service', () => {

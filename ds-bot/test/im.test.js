@@ -8,6 +8,7 @@ import { createRuntime } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
 import { adapters } from '../src/host/im/platforms/index.js'
 import { focusOpenPart, pushThreadPart } from '../src/host/threads.js'
+import { imText } from '../src/host/im/texts.js'
 
 // A platform adapter that records sends/edits and lets the test feed inbound
 // messages, actions and statuses. `fail` makes send throw once per call queued.
@@ -434,6 +435,23 @@ test('customer messages without IDs fail visibly without an unidentifiable retry
   await s.flush()
   assert.match(s.fake.sent.at(-1).text, /Sorry/)
   assert.equal(s.prompts.length, 0)
+})
+
+test('customer setup apologies follow every supported IM language', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  s.rt.customerPart = async () => { throw Object.assign(new Error('setup unavailable'), { permanent: true }) }
+  for (const [locale, language] of [
+    ['en', 'English'], ['zh', 'Chinese'], ['zh-TW', 'Traditional Chinese'], ['ja', 'Japanese'],
+    ['ko', 'Korean'], ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'],
+  ]) {
+    s.rt.uiLanguage = () => language
+    await dm(s, 'customer', 'first', { messageId: locale })
+    await s.flush()
+    assert.equal(s.fake.sent.at(-1).text, imText(locale, 'unavailable'), locale)
+    assert.notEqual(s.fake.sent.at(-1).text, 'unavailable')
+  }
 })
 
 test('triage tools restrict current and historical customer parts but not normal conversations', async (t) => {
