@@ -35,6 +35,46 @@ function verifyHmac(headers, method, path, rawBody, secret) {
   assert.equal(headers['x-tenant'], 'dsbot-cloud')
 }
 
+const uiBundle = await build({
+  entryPoints: [fileURLToPath(new URL('../src/client/runtime-pill.js', import.meta.url))],
+  bundle: true,
+  format: 'cjs',
+  platform: 'node',
+  write: false,
+  external: ['react', 'react-dom'],
+})
+const uiMod = { exports: {} }
+runInNewContext(uiBundle.outputFiles[0].text, {
+  module: uiMod,
+  exports: uiMod.exports,
+  URL,
+  URLSearchParams,
+  setTimeout,
+  clearTimeout,
+  require: (name) => {
+    const platform = {
+      react: {
+        createContext: (initial) => { const ctx = { value: initial }; ctx.Provider = ({ value, children }) => { ctx.value = value; return children }; return ctx },
+        useContext: ctx => ctx.value,
+        useId: () => 'rt-id',
+        useSyncExternalStore: (sub, get) => get(),
+        createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
+        useState: initial => [initial, () => {}],
+        useEffect: () => {},
+        useRef: current => ({ current }),
+        useLayoutEffect: () => {},
+        useMemo: make => make(),
+        useCallback: fn => fn,
+        Fragment: 'fragment',
+      },
+      'react-dom': { createPortal: node => node },
+    }
+    if (!(name in platform)) throw new Error(`no platform module ${name}`)
+    return platform[name]
+  },
+})
+const { RuntimeStatusPill, SidebarRuntimeSwitch, ComposerRuntimeChip, RuntimeBadge, CloudHandoffDock, runtimeOf } = uiMod.exports
+
 async function setupHost(t, { gitRunner, ghRunner, macBrokerCall, execResponder, controllerState } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-cloud-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(seed()))
@@ -306,46 +346,6 @@ test('cloud_exec tool and bot-cloud-runtime systemPrompt section follow Local <-
   assert.equal(viaSidebarCloud.value.view.sessions.a.location, 'cloud')
   assert.equal(viaSidebarCloud.value.view.sessions.b.location, 'cloud')
 })
-
-const uiBundle = await build({
-  entryPoints: [fileURLToPath(new URL('../src/client/runtime-pill.js', import.meta.url))],
-  bundle: true,
-  format: 'cjs',
-  platform: 'node',
-  write: false,
-  external: ['react', 'react-dom'],
-})
-const uiMod = { exports: {} }
-runInNewContext(uiBundle.outputFiles[0].text, {
-  module: uiMod,
-  exports: uiMod.exports,
-  URL,
-  URLSearchParams,
-  setTimeout,
-  clearTimeout,
-  require: (name) => {
-    const platform = {
-      react: {
-        createContext: (initial) => { const ctx = { value: initial }; ctx.Provider = ({ value, children }) => { ctx.value = value; return children }; return ctx },
-        useContext: ctx => ctx.value,
-        useId: () => 'rt-id',
-        useSyncExternalStore: (sub, get) => get(),
-        createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
-        useState: initial => [initial, () => {}],
-        useEffect: () => {},
-        useRef: current => ({ current }),
-        useLayoutEffect: () => {},
-        useMemo: make => make(),
-        useCallback: fn => fn,
-        Fragment: 'fragment',
-      },
-      'react-dom': { createPortal: node => node },
-    }
-    if (!(name in platform)) throw new Error(`no platform module ${name}`)
-    return platform[name]
-  },
-})
-const { RuntimeStatusPill, SidebarRuntimeSwitch, ComposerRuntimeChip, RuntimeBadge, CloudHandoffDock, runtimeOf } = uiMod.exports
 
 test('RuntimeStatusPill, SidebarRuntimeSwitch, RuntimeBadge, ComposerRuntimeChip, and CloudHandoffDock render all states cleanly', () => {
   const hook = value => select => select(value)

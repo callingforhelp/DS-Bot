@@ -22,6 +22,29 @@ function verifyHmac(headers, method, path, rawBody, secret) {
   assert.equal(headers['x-tenant'], 'dsbot-cloud')
 }
 
+// Bundle client voice-live.js to test WebRTC, Standby, transcript concatenation, and client delegation.
+const clientBundle = await build({
+  stdin: { contents: "export * from './src/client/voice-live.js'", resolveDir: dirname(dirname(fileURLToPath(import.meta.url))) },
+  bundle: true, format: 'cjs', platform: 'node', write: false, logLevel: 'silent',
+})
+const clientMod = { exports: {} }
+runInNewContext(clientBundle.outputFiles[0].text, {
+  module: clientMod,
+  exports: clientMod.exports,
+  setTimeout,
+  clearTimeout,
+  Date,
+  Math,
+  JSON,
+  Promise,
+  Error,
+  Object,
+  String,
+  Number,
+  Array,
+})
+const { openLiveVoiceSession, formatCommentary, createCommentaryEvent } = clientMod.exports
+
 function seedState({ cloudRuntime } = {}) {
   return {
     version: 1,
@@ -272,29 +295,6 @@ test('host falls back to direct OpenAI /v1/live/sessions via credentials or secr
   const failCreate = await unconfiguredHost.call('voice-session-create', { sessionId: 'a', sdp: VALID_OFFER_SDP })
   assert.equal(failCreate.ok, false)
 })
-
-// Bundle client voice-live.js to test WebRTC, Standby, transcript concatenation, and client delegation.
-const clientBundle = await build({
-  stdin: { contents: "export * from './src/client/voice-live.js'", resolveDir: dirname(dirname(fileURLToPath(import.meta.url))) },
-  bundle: true, format: 'cjs', platform: 'node', write: false, logLevel: 'silent',
-})
-const clientMod = { exports: {} }
-runInNewContext(clientBundle.outputFiles[0].text, {
-  module: clientMod,
-  exports: clientMod.exports,
-  setTimeout,
-  clearTimeout,
-  Date,
-  Math,
-  JSON,
-  Promise,
-  Error,
-  Object,
-  String,
-  Number,
-  Array,
-})
-const { openLiveVoiceSession, formatCommentary, createCommentaryEvent } = clientMod.exports
 
 test('client openLiveVoiceSession handles WebRTC setup, Standby, exact transcript deltas, and delegation commentary', async () => {
   const track = { enabled: true, stopped: false, stop() { this.stopped = true } }

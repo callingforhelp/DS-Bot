@@ -140,6 +140,8 @@ class BrokerStore:
                 ("role", "TEXT"),
                 ("worktree_path", "TEXT"),
                 ("completed_at", "REAL"),
+                ("bot", "TEXT"),
+                ("group_name", "TEXT"),
             ]:
                 try:
                     self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
@@ -163,6 +165,8 @@ class BrokerStore:
                 pass
         if "local_only" in d and d["local_only"] is not None:
             d["local_only"] = bool(d["local_only"])
+        if d.get("group_name") and not d.get("group"):
+            d["group"] = d["group_name"]
         return d
 
     def is_mac_online(self, now: Optional[float] = None) -> tuple[bool, Optional[float]]:
@@ -216,6 +220,8 @@ class BrokerStore:
         cwd = str(payload.get("cwd") or "").strip() or None
         local_only = 1 if payload.get("local_only") else 0
         role = str(payload.get("role") or "worker").strip().lower() or "worker"
+        bot = str(payload.get("bot") or "").strip() or None
+        group_name = str(payload.get("group") or payload.get("group_name") or "").strip() or None
 
         now = time.time()
         expires_at = now + DEFAULT_JOB_EXPIRY_SEC
@@ -234,8 +240,8 @@ class BrokerStore:
                     job_id, idempotency_key, target, task, repo, branch,
                     timeout_sec, aws_session_id, status, attempt,
                     workspace_id, terminal_id, agent, cwd, local_only, role,
-                    created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bot, group_name, created_at, updated_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -252,6 +258,8 @@ class BrokerStore:
                     cwd,
                     local_only,
                     role,
+                    bot,
+                    group_name,
                     now,
                     now,
                     expires_at,

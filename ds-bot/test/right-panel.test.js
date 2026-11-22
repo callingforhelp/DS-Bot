@@ -13,65 +13,6 @@ const { JSDOM } = createRequire(join(process.env.DSH_HARNESS ?? join(PLUGIN, '..
 
 const document = attrs => new JSDOM(`<!doctype html><body><div ${attrs}><div data-rightbar-col></div></div></body>`).window.document
 
-// 公开#456: the Bot drawer and DSH's right column never share the window; whichever
-// the user asked for last wins. The column's state lives on the frame's attributes.
-test('the frame attributes read as the column state', () => {
-  assert.equal(rightColumnOpen(document('')), true)
-  assert.equal(rightColumnOpen(document('data-rightbar-collapsed')), false)
-  assert.equal(rightColumnOpen(document('data-rightbar-fullscreen')), true)
-  // A narrow window presents the panel fullscreen with no track: both marks.
-  assert.equal(rightColumnOpen(document('data-rightbar-collapsed data-rightbar-fullscreen')), true)
-  // No frame at all reads as closed.
-  assert.equal(rightColumnOpen(new JSDOM('<!doctype html><body></body>').window.document), false)
-})
-
-test('a drawer opening folds an open column back', () => {
-  assert.equal(drawerOpened(true), 'collapse-column')
-  assert.equal(drawerOpened(false), null)
-})
-
-test('a column the user opens takes the space from an open drawer', () => {
-  assert.equal(columnOpened(true, false), 'close-drawer')
-})
-
-test('a column a Session switch revealed yields to the open drawer', () => {
-  assert.equal(columnOpened(true, true), 'collapse-column')
-})
-
-test('with no drawer open the column opens on its own', () => {
-  assert.equal(columnOpened(false, false), null)
-  assert.equal(columnOpened(false, true), null)
-})
-
-// The switch window holds "the Session moved" until `settle` calls back: inside
-// it a column opening is the switch revealing that Session's own column, past
-// it the user's own. A newer move restarts it and a stale settle is ignored.
-test('the switch window steers the verdict while it is open', () => {
-  const ends = []
-  const window = createSwitchWindow(done => ends.push(done))
-  assert.equal(window.pending, false)
-  window.moved()
-  assert.equal(window.pending, true)
-  assert.equal(columnOpened(true, window.pending), 'collapse-column')
-  ends[0]()
-  assert.equal(window.pending, false)
-  assert.equal(columnOpened(true, window.pending), 'close-drawer')
-})
-
-test('a newer Session switch restarts the window and the old settle is stale', () => {
-  const ends = []
-  const window = createSwitchWindow(done => ends.push(done))
-  window.moved()
-  window.moved()
-  ends[0]()
-  assert.equal(window.pending, true)
-  assert.equal(columnOpened(true, window.pending), 'collapse-column')
-  ends[1]()
-  assert.equal(window.pending, false)
-})
-
-// The drawer's top row, bundled once and run with a minimal React stand-in; the
-// row's components are vnodes, so only the drawer's own body runs.
 const bundle = await build({
   entryPoints: [fileURLToPath(new URL('../src/client/details-drawer.js', import.meta.url))],
   bundle: true, format: 'cjs', platform: 'node', write: false,
@@ -132,6 +73,96 @@ const menuItem = (node, key) => {
   const button = moreButton(node)
   return [...(button?.children.flat(Infinity).find(child => child?.props?.items)?.props?.items ?? [])].find(item => item.key === key)
 }
+
+const runStatsBundle = await build({
+  entryPoints: [fileURLToPath(new URL('../src/client/details-drawer.js', import.meta.url))],
+  bundle: true, format: 'cjs', platform: 'node', write: false,
+  external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
+})
+let runStatsState
+const runStatsReact = {
+  createContext: (initial) => { const ctx = { value: initial }; ctx.Provider = ({ children }) => children; return ctx },
+  useContext: ctx => ctx.value, useId: () => 'rv-id',
+  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
+  useState: () => [runStatsState, value => { runStatsState = value }],
+  useEffect: effect => effect(), useRef: current => ({ current }), useLayoutEffect: () => {},
+  useMemo: make => make(), useCallback: fn => fn,
+  useSyncExternalStore: (_subscribe, get) => get(), Fragment: 'fragment',
+}
+const runStatsModule = { exports: {} }
+runInNewContext(runStatsBundle.outputFiles[0].text, {
+  module: runStatsModule, exports: runStatsModule.exports, URL, URLSearchParams, setTimeout, clearTimeout,
+  require: (name) => {
+    const platform = {
+      react: runStatsReact,
+      'react-dom': { createPortal: node => node },
+      '@deepseek-ai/dsh-client-ui-primitives': { MarkdownText: () => null },
+    }
+    if (!(name in platform)) throw new Error(`no platform module ${name}`)
+    return platform[name]
+  },
+})
+const { RunStats } = runStatsModule.exports
+
+// 公开#456: the Bot drawer and DSH's right column never share the window; whichever
+// the user asked for last wins. The column's state lives on the frame's attributes.
+test('the frame attributes read as the column state', () => {
+  assert.equal(rightColumnOpen(document('')), true)
+  assert.equal(rightColumnOpen(document('data-rightbar-collapsed')), false)
+  assert.equal(rightColumnOpen(document('data-rightbar-fullscreen')), true)
+  // A narrow window presents the panel fullscreen with no track: both marks.
+  assert.equal(rightColumnOpen(document('data-rightbar-collapsed data-rightbar-fullscreen')), true)
+  // No frame at all reads as closed.
+  assert.equal(rightColumnOpen(new JSDOM('<!doctype html><body></body>').window.document), false)
+})
+
+test('a drawer opening folds an open column back', () => {
+  assert.equal(drawerOpened(true), 'collapse-column')
+  assert.equal(drawerOpened(false), null)
+})
+
+test('a column the user opens takes the space from an open drawer', () => {
+  assert.equal(columnOpened(true, false), 'close-drawer')
+})
+
+test('a column a Session switch revealed yields to the open drawer', () => {
+  assert.equal(columnOpened(true, true), 'collapse-column')
+})
+
+test('with no drawer open the column opens on its own', () => {
+  assert.equal(columnOpened(false, false), null)
+  assert.equal(columnOpened(false, true), null)
+})
+
+// The switch window holds "the Session moved" until `settle` calls back: inside
+// it a column opening is the switch revealing that Session's own column, past
+// it the user's own. A newer move restarts it and a stale settle is ignored.
+test('the switch window steers the verdict while it is open', () => {
+  const ends = []
+  const window = createSwitchWindow(done => ends.push(done))
+  assert.equal(window.pending, false)
+  window.moved()
+  assert.equal(window.pending, true)
+  assert.equal(columnOpened(true, window.pending), 'collapse-column')
+  ends[0]()
+  assert.equal(window.pending, false)
+  assert.equal(columnOpened(true, window.pending), 'close-drawer')
+})
+
+test('a newer Session switch restarts the window and the old settle is stale', () => {
+  const ends = []
+  const window = createSwitchWindow(done => ends.push(done))
+  window.moved()
+  window.moved()
+  ends[0]()
+  assert.equal(window.pending, true)
+  assert.equal(columnOpened(true, window.pending), 'collapse-column')
+  ends[1]()
+  assert.equal(window.pending, false)
+})
+
+// The drawer's top row, bundled once and run with a minimal React stand-in; the
+// row's components are vnodes, so only the drawer's own body runs.
 
 test('the drawer `···` lists browser, a side chat, and the column tabs', () => {
   const picks = { openBrowser: 0, newSideChat: 0, newTerminal: 0, openFiles: 0 }
@@ -350,35 +381,6 @@ test('customer sessions open a read-only transcript without invoking a foregroun
 
 // A second instance of the drawer bundle whose React runs effects at once and keeps
 // one state slot, so the status line can resolve its host read and render.
-const runStatsBundle = await build({
-  entryPoints: [fileURLToPath(new URL('../src/client/details-drawer.js', import.meta.url))],
-  bundle: true, format: 'cjs', platform: 'node', write: false,
-  external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
-})
-let runStatsState
-const runStatsReact = {
-  createContext: (initial) => { const ctx = { value: initial }; ctx.Provider = ({ children }) => children; return ctx },
-  useContext: ctx => ctx.value, useId: () => 'rv-id',
-  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
-  useState: () => [runStatsState, value => { runStatsState = value }],
-  useEffect: effect => effect(), useRef: current => ({ current }), useLayoutEffect: () => {},
-  useMemo: make => make(), useCallback: fn => fn,
-  useSyncExternalStore: (_subscribe, get) => get(), Fragment: 'fragment',
-}
-const runStatsModule = { exports: {} }
-runInNewContext(runStatsBundle.outputFiles[0].text, {
-  module: runStatsModule, exports: runStatsModule.exports, URL, URLSearchParams, setTimeout, clearTimeout,
-  require: (name) => {
-    const platform = {
-      react: runStatsReact,
-      'react-dom': { createPortal: node => node },
-      '@deepseek-ai/dsh-client-ui-primitives': { MarkdownText: () => null },
-    }
-    if (!(name in platform)) throw new Error(`no platform module ${name}`)
-    return platform[name]
-  },
-})
-const { RunStats } = runStatsModule.exports
 
 test('the Bot status line needs the runStats action and then draws turns, speed, cache and context', () => {
   runStatsState = undefined

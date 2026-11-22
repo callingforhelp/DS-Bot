@@ -1393,9 +1393,296 @@ def default_git_sync_runner(
     }
 
 
-def default_dsbot_runner(
-    job: dict[str, Any], dsh_bin: str, headless_patch: str
+class _McpBeforeSendError(RuntimeError):
+    """Raised when local DS Bot MCP fails before send_to_bot/send_to_group delivers."""
+
+
+def _read_mcp_token(
+    mcp_token: Optional[str] = None, token_file: Optional[str] = None
+) -> str:
+    if mcp_token is not None and str(mcp_token).strip():
+        return str(mcp_token).strip()
+    env_tok = os.environ.get("LOCAL_DSBOT_MCP_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+    path = (
+        token_file
+        or os.environ.get(
+            "LOCAL_DSBOT_MCP_TOKEN_FILE",
+            "/Users/chief/.mac-job-worker/dsbot-mcp-token",
+        )
+    ).strip()
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+def _mcp_rpc(
+    url: str,
+    token: str,
+    method: str,
+    params: Optional[dict[str, Any]] = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params is not None:
+        payload["params"] = params
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            if resp.status != 200:
+                raise RuntimeError(f"MCP HTTP {resp.status} for {method}: {raw}")
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        finally:
+            exc.close()
+        raise RuntimeError(f"MCP HTTP {exc.code} for {method}: {err_body}") from exc
+    data = json.loads(raw)
+    if "error" in data:
+        raise RuntimeError(f"MCP JSON-RPC error for {method}: {data['error']}")
+    result = data.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Unexpected MCP result for {method}: {data!r}")
+    return result
+
+
+def _mcp_call_tool(
+    url: str,
+    token: str,
+    name: str,
+    arguments: Optional[dict[str, Any]] = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    res = _mcp_rpc(
+        url,
+        token,
+        "tools/call",
+        {"name": name, "arguments": arguments or {}},
+        timeout=timeout,
+    )
+    if res.get("isError"):
+        text = (res.get("content") or [{}])[0].get("text", "")
+        raise RuntimeError(f"MCP tool {name} returned isError=true: {text}")
+    structured = res.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    text = (res.get("content") or [{}])[0].get("text", "{}")
+    parsed = json.loads(text)
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def run_dsbot_via_local_mcp(
+    job: dict[str, Any], mcp_url: str, mcp_token: str
 ) -> dict[str, Optional[str]]:
+    task = str(job["task"])
+    timeout_sec = max(1, int(job.get("timeout_sec") or 900))
+    deadline = time.monotonic() + timeout_sec
+    group_target = str(job.get("group") or job.get("group_name") or "").strip()
+
+    if group_target:
+        try:
+            send_res = _mcp_call_tool(
+                mcp_url,
+                mcp_token,
+                "send_to_group",
+                {"group": group_target, "text": task},
+                timeout=30.0,
+            )
+        except Exception as exc:
+            raise _McpBeforeSendError(f"send_to_group failed: {exc}") from exc
+        if send_res.get("sent") is not True:
+            raise _McpBeforeSendError(
+                f"send_to_group did not confirm send: {send_res!r}"
+            )
+        wait_args: dict[str, Any] = {"group": group_target}
+        target_label = f"group:{group_target}"
+        match_key = ("group", group_target)
+    else:
+        bot_target = str(job.get("bot") or "").strip()
+        if not bot_target:
+            try:
+                bots_res = _mcp_call_tool(
+                    mcp_url, mcp_token, "list_bots", {}, timeout=15.0
+                )
+            except Exception as exc:
+                raise _McpBeforeSendError(f"list_bots failed: {exc}") from exc
+            bots = bots_res.get("bots") or []
+            chosen = next((b for b in bots if b.get("main") is True), None) or (
+                bots[0] if bots else None
+            )
+            bot_target = (
+                str(chosen.get("name") or chosen.get("id") or "Chief")
+                if chosen
+                else "Chief"
+            )
+        try:
+            send_res = _mcp_call_tool(
+                mcp_url,
+                mcp_token,
+                "send_to_bot",
+                {"bot": bot_target, "text": task},
+                timeout=30.0,
+            )
+        except Exception as exc:
+            raise _McpBeforeSendError(f"send_to_bot failed: {exc}") from exc
+        if send_res.get("sent") is not True:
+            raise _McpBeforeSendError(
+                f"send_to_bot did not confirm send: {send_res!r}"
+            )
+        wait_args = {"bot": bot_target}
+        target_label = f"bot:{bot_target}"
+        match_key = ("bot", bot_target)
+
+    after = int(send_res.get("after") or 0)
+    cur_after = after
+    collected: list[dict[str, Any]] = []
+    waiting_for_target: list[dict[str, Any]] = []
+
+    def _matching_waiting() -> list[dict[str, Any]]:
+        w_res = _mcp_call_tool(mcp_url, mcp_token, "list_waiting", {}, timeout=15.0)
+        wanted = match_key[1].lower()
+        return [
+            item
+            for item in (w_res.get("waiting") or [])
+            if str(item.get(match_key[0]) or "").strip().lower() == wanted
+        ]
+
+    while time.monotonic() < deadline:
+        wait_sec = min(25, max(1, int(deadline - time.monotonic())))
+        wait_res = _mcp_call_tool(
+            mcp_url,
+            mcp_token,
+            "wait_for_reply",
+            {**wait_args, "after": cur_after, "timeoutSeconds": wait_sec},
+            timeout=float(wait_sec + 15),
+        )
+        msgs = [
+            m
+            for m in (wait_res.get("messages") or [])
+            if m.get("kind") != "user"
+        ]
+        if msgs:
+            collected.extend(msgs)
+            cur_after = max(cur_after, int(wait_res.get("after") or cur_after))
+        if wait_res.get("done") is True:
+            if not collected:
+                chat_res = _mcp_call_tool(
+                    mcp_url, mcp_token, "read_chat", wait_args, timeout=15.0
+                )
+                collected.extend(
+                    m
+                    for m in (chat_res.get("messages") or [])
+                    if m.get("kind") != "user" and int(m.get("time") or 0) >= after
+                )
+            break
+        try:
+            matched = _matching_waiting()
+        except Exception:
+            matched = []
+        if matched:
+            waiting_for_target = matched
+            break
+
+    if not waiting_for_target:
+        try:
+            waiting_for_target = _matching_waiting()
+        except Exception:
+            pass
+
+    summary_parts: list[str] = []
+    for msg in collected:
+        txt = str(msg.get("text") or "").strip()
+        if txt:
+            summary_parts.append(f"[{msg.get('from') or target_label}] {txt}")
+    if waiting_for_target:
+        summary_parts.append(
+            "[LOCAL_DSBOT_WAITING] "
+            + json.dumps(waiting_for_target, ensure_ascii=False)
+        )
+
+    if not summary_parts:
+        return {
+            "status": "failed",
+            "result_summary": "",
+            "pr_url": None,
+            "error": f"Timed out waiting for local DS Bot ({target_label}) reply via MCP",
+        }
+
+    joined = "\n\n".join(summary_parts)
+    return {
+        "status": "succeeded",
+        "result_summary": redact_secrets(joined),
+        "pr_url": extract_pr_url(joined),
+        "error": None,
+    }
+
+
+def default_dsbot_runner(
+    job: dict[str, Any],
+    dsh_bin: str,
+    headless_patch: str,
+    mcp_url: Optional[str] = None,
+    mcp_token: Optional[str] = None,
+) -> dict[str, Optional[str]]:
+    resolved_url = (
+        mcp_url
+        if mcp_url is not None
+        else os.environ.get("LOCAL_DSBOT_MCP_URL", "http://127.0.0.1:8797/mcp")
+    ).strip()
+    resolved_token = _read_mcp_token(
+        mcp_token,
+        os.environ.get(
+            "LOCAL_DSBOT_MCP_TOKEN_FILE",
+            "/Users/chief/.mac-job-worker/dsbot-mcp-token",
+        ),
+    )
+    engine = str(
+        job.get("engine") or os.environ.get("LOCAL_DSBOT_ENGINE", "auto")
+    ).strip().lower()
+
+    if engine != "headless-cli" and resolved_url and resolved_token:
+        try:
+            return run_dsbot_via_local_mcp(job, resolved_url, resolved_token)
+        except _McpBeforeSendError as exc:
+            if engine == "local-mcp":
+                return {
+                    "status": "failed",
+                    "result_summary": "",
+                    "pr_url": None,
+                    "error": redact_secrets(str(exc)),
+                }
+            sys.stderr.write(
+                f"[worker] local-mcp unavailable before send ({exc}); falling back to headless dsh\n"
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "result_summary": "",
+                "pr_url": None,
+                "error": redact_secrets(str(exc)),
+            }
+    elif engine == "local-mcp":
+        return {
+            "status": "failed",
+            "result_summary": "",
+            "pr_url": None,
+            "error": "LOCAL_DSBOT_MCP_TOKEN is not configured for engine=local-mcp",
+        }
+
     task = str(job["task"])
     timeout_sec = int(job.get("timeout_sec") or 900)
     run_cwd: Optional[str] = None
