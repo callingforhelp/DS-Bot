@@ -266,6 +266,38 @@ try {
   assertPrivateCustomerCalls(allCustomerCalls)
   assertNoCustomerFileReads(allCustomerCalls)
   passed('A and B route to separate specialist customer tasks and each reply reaches only its original WeCom user')
+  message('customer-A', 'E2E_ASK_CARD_A')
+  await until(async () => (await state()).questions[a.sessionId]?.options?.length === 3
+    && sent.some(value => value.touser === 'customer-A' && value.text?.content?.includes('E2E_A_OPTION_ONE')), 'A customer question card')
+  const questionA = (await state()).questions[a.sessionId]
+  message('customer-B', 'E2E_ASK_CARD_B')
+  await until(async () => (await state()).questions[b.sessionId]?.options?.length === 3
+    && sent.some(value => value.touser === 'customer-B' && value.text?.content?.includes('E2E_B_OPTION_ONE')), 'B customer question card')
+  const questionB = (await state()).questions[b.sessionId]
+  const bCallsBeforeFreeText = (await calls()).filter(call => call.session === b.sessionId).length
+  const freeTextStart = sent.length
+  message('customer-B', '99')
+  await until(async () => (await state()).questions[b.sessionId] === undefined
+    && (await calls()).filter(call => call.session === b.sessionId).length > bCallsBeforeFreeText
+    && sent.slice(freeTextStart).some(value => value.touser === 'customer-B' && value.text?.content === 'E2E_FREE_TEXT_99_ACK'), 'out-of-range number handled as free text')
+  await settle()
+  assert.equal((await state()).questions[a.sessionId]?.id, questionA.id)
+  assert.equal((await state()).questions[b.sessionId], undefined)
+  assert.ok((await calls()).some(call => call.session === b.sessionId && call.customerRequest !== undefined
+    && JSON.stringify(call.customerRequest).includes('99')))
+  assert.ok(sent.slice(freeTextStart).every(value => value.touser === 'customer-B'))
+  passed('out-of-range numeric text follows free-text cancellation for B without affecting A')
+  const pickStart = sent.length
+  message('customer-B', 'E2E_ASK_CARD_B')
+  await until(async () => (await state()).questions[b.sessionId]?.id !== undefined
+    && (await state()).questions[b.sessionId].id !== questionB.id
+    && sent.slice(pickStart).some(value => value.touser === 'customer-B' && value.text?.content?.includes('E2E_B_OPTION_ONE')), 'replacement B question card')
+  message('customer-B', '1')
+  await until(async () => (await state()).questions[b.sessionId] === undefined, 'B numbered answer')
+  await settle()
+  assert.equal((await state()).questions[a.sessionId]?.id, questionA.id)
+  assert.ok(sent.slice(pickStart).every(value => value.touser === 'customer-B'))
+  passed('valid numbered answer resolves B only and leaves A question open')
   const replies = await customer('customer-A', { action: 'vote', summary: 'DISAGREE：客户需要确认责任归属', routes: ['quote', 'order_status'] })
   const handoff = (await state()).questions[foreground]
   assert.ok(handoff?.id.startsWith('triage-'))

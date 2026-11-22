@@ -141,10 +141,10 @@ async function start({ platform = 'telegram', adapter, seed, home, services = {}
   const flush = async () => { await delay(10) }
   // The host echoes an IM prompt as a user/message whose source carries the request it
   // came in on; the plugin takes the chat that request belongs to as the turn's origin.
-  const imTurn = (sessionId = 'a') => {
+  const imTurn = (sessionId = 'a', messageText = 'from the chat') => {
     const requestId = prompts.at(-1)?.requestId
     emitEvent(sessionId, 'turn/start', { turn: prompts.length })
-    emitEvent(sessionId, 'user/message', { source: { kind: 'user', rpcId: requestId }, content: [{ type: 'text', text: 'from the chat' }] })
+    emitEvent(sessionId, 'user/message', { source: { kind: 'user', rpcId: requestId }, content: [{ type: 'text', text: messageText }] })
   }
   return { ctx, rt, home, fake, prompts, agents, agentOf, emitEvent, fireApprovals, imTurn, close, stop, flush, platform }
 }
@@ -286,31 +286,44 @@ test('public platforms never receive approval cards during reconciliation', asyn
   assert.equal(s.fake.sent.length, 0)
 })
 
-test('public customers can answer numbered question cards but not control commands', async (t) => {
+test('public customer free text supersedes a question card and a number answers only its own card', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
   await add(s, { corpId: 'test', secret: 'test' })
   await dm(s, 'customer-A', 'hello')
   const otherSessionId = s.prompts.at(-1).sessionId
+  s.imTurn(otherSessionId)
+  const ask = s.rt.teamTools.find(tool => tool.name === 'ask_user')
+  await ask.execute({ question: 'Which A?', options: [{ label: 'yes' }, { label: 'no' }] }, { agent: s.agentOf(otherSessionId) })
+  const otherQuestionId = s.rt.state.questions[otherSessionId].id
+  await s.flush()
+  assert.equal(s.fake.sent.at(-1).chat.key, 'dm-customer-A')
   await dm(s, 'customer-B', 'hello')
   const sessionId = s.prompts.at(-1).sessionId
   s.imTurn(sessionId)
-  const ask = s.rt.teamTools.find(tool => tool.name === 'ask_user')
-  await ask.execute({ question: 'Which?', options: [{ label: 'yes' }, { label: 'no' }] }, { agent: s.agentOf(sessionId) })
+  await ask.execute({ question: 'Which B?', options: [{ label: 'yes' }, { label: 'no' }] }, { agent: s.agentOf(sessionId) })
   await s.flush()
   const question = s.fake.sent.at(-1)
   assert.equal(question.chat.key, 'dm-customer-B')
-  assert.match(question.text, /^Customer support asks: Which\?/)
+  assert.match(question.text, /^Customer support asks: Which B\?/)
   assert.match(question.text, /1\. yes/)
   assert.doesNotMatch(question.text, /Chief|Quote|(?:^|\s)[\w.-]+\/[\w.-]+/i)
-  await dm(s, 'customer-B', '9')
-  assert.ok(s.rt.state.questions[sessionId])
-  await dm(s, 'customer-B', '2')
+  assert.equal(s.rt.state.questions[sessionId].allowCustom, undefined)
+  const promptsBeforeFreeText = s.prompts.length
+  await dm(s, 'customer-B', '99')
+  assert.equal(s.prompts.length, promptsBeforeFreeText + 1)
+  s.imTurn(sessionId, '99')
   assert.equal(s.rt.state.questions[sessionId], undefined)
-  assert.equal(s.agentOf(sessionId).followed, 1)
+  assert.equal(s.rt.state.questions[otherSessionId].id, otherQuestionId)
+  await ask.execute({ question: 'Which B again?', options: [{ label: 'yes' }, { label: 'no' }] }, { agent: s.agentOf(sessionId) })
+  await s.flush()
+  assert.equal(s.fake.sent.at(-1).chat.key, 'dm-customer-B')
+  await dm(s, 'customer-B', '1')
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(s.rt.state.questions[otherSessionId].id, otherQuestionId)
   assert.equal(s.agentOf(otherSessionId).followed, undefined)
   assert.equal(s.agentOf('a').followed, undefined)
-  assert.equal(s.rt.state.questions[otherSessionId], undefined)
+  assert.equal(s.rt.state.questions.a, undefined)
   const sent = s.fake.sent.length
   await dm(s, 'customer-B', '/start')
   await dm(s, 'customer-B', '/stop')

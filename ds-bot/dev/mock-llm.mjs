@@ -159,6 +159,16 @@ function decide(body) {
     const latest = [...prompt.matchAll(/(?:^|\n)User: ([^\n]*)/g)].at(-1)
     const replied = latest !== undefined && /\n(?:Chief|Quote): /.test(prompt.slice(latest.index + latest[0].length))
     const currentUser = latest === undefined ? textBlocks(last?.content).at(-1)?.trim() : replied ? '' : latest[1].trim()
+    const questionCard = /^E2E_ASK_CARD_([AB])$/.exec(currentUser ?? '')
+    if (system.includes('# Customer service') && !result && questionCard) {
+      const customer = questionCard[1]
+      return [tool('ask_user', {
+        question: '请确认下一步服务安排',
+        options: [`E2E_${customer}_OPTION_ONE`, `E2E_${customer}_OPTION_TWO`, `E2E_${customer}_OPTION_THREE`],
+        multiSelect: true,
+      })]
+    }
+    if (system.includes('# Customer service') && currentUser === '99') return [text('E2E_FREE_TEXT_99_ACK')]
     const requestsRoster = messages.some(message => message.role === 'user' && textOf(message.content).includes('MOCK_ROSTER_GUARD'))
     const rosterAttempted = messages.some(message => message.role === 'assistant' && message.content?.some?.(block => block.type === 'tool_use' && block.name === 'list_bots'))
     if (system.includes('# Customer service') && requestsRoster && !rosterAttempted) {
