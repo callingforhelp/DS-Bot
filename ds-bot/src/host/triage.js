@@ -25,11 +25,14 @@ const validType = entry => {
 }
 const clean = value => String(value ?? '').trim().slice(0, 4000)
 const misrouteDetails = outcome => ({ at: outcome.at, correct_route: clean(outcome.correct_route), lesson: clean(outcome.lesson) })
-const recallFeedback = value => Object.fromEntries(
-  ['result', 'correct_route', 'corrected_to', 'lesson']
-    .filter(key => typeof value?.[key] === 'string' && value[key].trim())
-    .map(key => [key, clean(value[key])]),
-)
+const recallFeedback = (value, routes) => {
+  const feedback = {}
+  if (['correct', 'misrouted', 'resolved'].includes(value?.result)) feedback.result = value.result
+  for (const key of ['correct_route', 'corrected_to']) {
+    if (typeof value?.[key] === 'string' && routes.has(value[key])) feedback[key] = value[key]
+  }
+  return feedback
+}
 const terms = (value) => {
   const text = clean(value).toLowerCase()
   const chars = [...text.replace(/\s/g, '')]
@@ -147,7 +150,12 @@ export function triageBank(home, writable = () => {}, rt) {
       }
       let result
       let retained
-      const recall = () => {
+      const recall = async config => {
+        let registeredRoutes
+        if (customerSession) {
+          const recallConfig = config ?? await read('config.json', { judges: [], threshold: 0.7 })
+          registeredRoutes = new Set(typesOf(recallConfig).map(entry => entry.type))
+        }
         const query = terms(args.query ?? (args.action === 'vote' ? args.summary : undefined))
         const eligible = customerSession
           ? cases.filter(item => customerSource !== undefined && item.customer_source?.connId === customerSource.connId && item.customer_source?.chatKey === customerSource.chatKey)
@@ -157,8 +165,8 @@ export function triageBank(home, writable = () => {}, rt) {
         for (const rule of state.rules) if (overlap(query, terms(rule.text)) > 0) rule.hits++
         const visible = customerSession
           ? ranked.map(item => {
-            const outcome = recallFeedback(item.outcome)
-            const misroute = recallFeedback(item.misroute)
+            const outcome = recallFeedback(item.outcome, registeredRoutes)
+            const misroute = recallFeedback(item.misroute, registeredRoutes)
             return {
               summary: item.summary,
               ...(item.attachments_summary ? { attachments_summary: item.attachments_summary } : {}),
@@ -167,7 +175,7 @@ export function triageBank(home, writable = () => {}, rt) {
               score: item.score,
               ...(Object.keys(outcome).length ? { outcome } : {}),
               ...(Object.keys(misroute).length ? { misroute } : {}),
-              ...(typeof item.corrected_to === 'string' && item.corrected_to.trim() ? { corrected_to: clean(item.corrected_to) } : {}),
+              ...(typeof item.corrected_to === 'string' && registeredRoutes.has(item.corrected_to) ? { corrected_to: item.corrected_to } : {}),
             }
           })
           : ranked
@@ -217,7 +225,7 @@ export function triageBank(home, writable = () => {}, rt) {
       } else if (args.action === 'vote') {
         const config = await read('config.json', { judges: [], threshold: 0.7 })
         const routes = args.routes ?? typesOf(config).map(entry => entry.type)
-        result = await judgeVotes(rt, config, { ...args, routes }, context, recall())
+        result = await judgeVotes(rt, config, { ...args, routes }, context, await recall(config))
         if (result.decision === 'route') {
           const type = typesOf(config).find(entry => entry.type === result.route)
           if (type && (type.runtime === 'devin' || !type.target)) {
@@ -243,7 +251,7 @@ export function triageBank(home, writable = () => {}, rt) {
           result.holding_reply = '您好，已收到您的需求，正在为您安排专人跟进，请稍候。'
         }
       } else if (args.action === 'recall') {
-        result = recall()
+        result = await recall()
       } else if (args.action === 'log') {
         for (const key of ['customer', 'summary', 'routed_to', 'reason']) if (!clean(args[key])) throw new Error(`${key} is required`)
         const entry = { id: randomUUID(), created: now, ...(customerSource ? { customer_source: customerSource } : {}) }
@@ -264,7 +272,6 @@ export function triageBank(home, writable = () => {}, rt) {
         if (entry.outcome?.result === 'misrouted') entry.misroute = misrouteDetails(entry.outcome)
         entry.outcome = { result: args.result, correct_route: clean(args.correct_route), lesson: clean(args.lesson), at: now }
         if (args.result === 'misrouted') { entry.misrouted_at = now; delete entry.misroute }
-        if (args.result === 'misrouted' && clean(args.lesson)) addRule(args.lesson, entry.id)
         result = entry
       } else if (args.action === 'rules') {
         if (args.rule_action === 'add') result = addRule(args.text)
