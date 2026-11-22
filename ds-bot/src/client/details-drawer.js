@@ -246,13 +246,13 @@ function CustomerSessions({ bot, roster, actions }) {
   return h('div', { ref: body, className: 'bt-drawer-model' },
     h('div', { className: 'bt-agent-sessions-head' },
       h('div', { className: 'bt-section-title' }, t('Customer conversations'))),
-    h('div', { className: 'bt-agent-sessions' }, sessions.map((entry, index) => {
+    h('div', { className: 'bt-agent-sessions' }, sessions.map(entry => {
       const when = Number.isFinite(entry.updatedAt) ? new Date(entry.updatedAt).toLocaleString() : ''
       return h('button', {
         key: entry.sessionId, type: 'button', className: 'bt-agent-session',
         title: t('Customer conversation'), onClick: () => setCustomer(entry.sessionId),
       },
-        h('span', { className: 'bt-agent-session-name' }, `${t('Customer conversation')} ${index + 1}`),
+        h('span', { className: 'bt-agent-session-name' }, `${t('Customer conversation')} · #${entry.reference ?? ''}`),
         h('span', { className: 'bt-agent-session-meta' }, when))
     })))
 }

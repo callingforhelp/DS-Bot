@@ -14,6 +14,7 @@ const votingBank = async (t) => {
   const rt = {
     catalog: async () => ['p/one', 'p/two', 'p/three'].map(ref => ({ ref })),
     botOf: id => id === 'bot' ? { id } : undefined,
+    findBot: target => typeof target === 'string' && target !== '' ? { id: `target:${target}`, name: target } : undefined,
     isCustomerPart: sessionId => customerSources.has(sessionId),
     customerIdentityOf: sessionId => customerSources.get(sessionId),
     desiredModel: async () => 'p/one', defaultModel: async () => 'p/two',
@@ -111,6 +112,70 @@ test('customer recall and vote use only trusted same-thread case provenance', as
   assert.doesNotMatch(JSON.stringify(result), /conn-B|chat-B|customer_source/)
   const afterVote = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
   assert.deepEqual(afterVote.find(item => item.handoff?.sessionId === 'customer-B').customer_source, sourceB)
+})
+
+test('customer routing uses isolated specialist sessions and rejects control arguments', async (t) => {
+  const s = await votingBank(t)
+  const target = { id: 'specialist', name: 'Quote Bot', model: 'p/one' }
+  const targetSessions = new Map()
+  const deliveries = []
+  const openedWorks = []
+  const droppedWorks = []
+  s.rt.findBot = name => name === 'Quote Bot' ? target : undefined
+  s.rt.botOf = id => id === 'bot' ? { id, name: 'Main Bot' } : id === target.id ? target : undefined
+  s.rt.customerPart = async (botId, connId, chatKey) => {
+    const key = `${botId}:${connId}:${chatKey}`
+    if (!targetSessions.has(key)) targetSessions.set(key, `specialist-session-${targetSessions.size + 1}`)
+    return targetSessions.get(key)
+  }
+  s.rt.openWork = (id, value) => openedWorks.push({ id, ...value })
+  s.rt.dropWork = id => droppedWorks.push(id)
+  s.rt.deliver = async value => {
+    if (value.fromPart === 'customer-C') throw new Error('delivery failed')
+    deliveries.push(value)
+  }
+  s.rt.live = new Map()
+  s.rt.taskOwners = new Map()
+  s.rt.customerReferenceOf = () => '7A91F2C0'
+
+  await s.call({ action: 'types', type_action: 'add', type: 'triage_test_quote', handles: 'quotations', examples: ['quotation request', 'pricing request'], runtime: 'ds-bot', target: 'Quote Bot' })
+  await s.call({ action: 'types', type_action: 'add', type: 'triage_test_after_sales', handles: 'after-sales requests', examples: ['service request', 'product support'], runtime: 'ds-bot', target: 'Quote Bot' })
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
+
+  const identities = [
+    ['customer-A', { connId: 'conn-A', chatKey: 'chat-A' }],
+    ['customer-B', { connId: 'conn-B', chatKey: 'chat-B' }],
+    ['customer-C', { connId: 'conn-C', chatKey: 'chat-C' }],
+  ]
+  for (const [index, [sessionId, identity]] of identities.entries()) {
+    s.customer(sessionId, identity)
+    s.rt.live.set(sessionId, { turn: 1 })
+    s.rt.taskOwners.set(sessionId, { botId: 'bot', taskId: sessionId })
+    s.replies([
+      { route: 'triage_test_quote', confidence: 0.95, reason: 'Request needs a quotation' },
+      { route: 'triage_test_quote', confidence: 0.9, reason: 'The customer asks for pricing' },
+    ])
+    const result = await s.call({ action: 'vote', summary: `Private request ${sessionId}`, routes: ['triage_test_quote', 'triage_test_after_sales'] }, sessionId)
+    assert.equal(result.decision, 'route')
+    assert.equal(result.delivery.target, 'triage_test_quote')
+    assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'triage_test_quote', message: 'Please help', reply_to: 'user' }), false)
+    assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'other', message: 'Please help' }), false)
+    assert.equal(await s.rt.dispatchCustomerRoute(sessionId, { to: 'triage_test_quote', message: 'Please help', reply_to: 'user' }), undefined)
+    assert.equal(deliveries.length, index)
+    assert.equal(await s.rt.dispatchCustomerRoute(sessionId, { to: 'triage_test_quote', message: `Please help ${sessionId}` }), sessionId === 'customer-C'
+      ? 'The case could not be sent to the support team. Please contact them directly.'
+      : 'Your case has been sent to the support team.')
+  }
+  assert.equal(targetSessions.size, 3)
+  assert.notEqual(targetSessions.get('specialist:conn-A:chat-A'), targetSessions.get('specialist:conn-B:chat-B'))
+  assert.deepEqual(deliveries.map(({ sessionId, fromPart, fromName }) => ({ sessionId, fromPart, fromName })), [
+    { sessionId: 'specialist-session-1', fromPart: 'customer-A', fromName: 'Customer support' },
+    { sessionId: 'specialist-session-2', fromPart: 'customer-B', fromName: 'Customer support' },
+  ])
+  assert.match(deliveries[0].text, /quotations/)
+  assert.doesNotMatch(JSON.stringify(deliveries), /STAFF_SENTINEL|model-id|private staff context/)
+  assert.equal(openedWorks.length, 3)
+  assert.deepEqual(droppedWorks, [openedWorks[2].id])
 })
 
 test('triage judge config validates refs and thresholds and persists atomically', async (t) => {
@@ -242,7 +307,7 @@ test('registry voting delivers only configured DS Bot targets and hands off Devi
   s.rt.state.questions.main = undefined
   await s.bank.syncHandoffs()
   assert.ok(s.rt.state.questions.main.detail.includes('The judges agreed on quote; the external agent requires staff dispatch.'))
-  assert.ok(s.rt.state.questions.main.detail.includes('quote · External agent · bot-test'))
+  assert.ok(s.rt.state.questions.main.detail.includes('quote · External agent · Unavailable; staff dispatch only'))
   assert.equal((await s.call({ action: 'review' })).pending_handoffs.at(-1).delivery.runtime, 'devin')
 })
 
@@ -271,10 +336,10 @@ test('reasoning metadata is not a vote and truncated responses hand off', async 
 test('pending handoffs survive bank reload and remain visible after a review', async (t) => {
   const s = await votingBank(t)
   Object.assign(s.rt, { state: { questions: {} }, chatOf: () => 'main', isCustomerPart: id => id === 'customer', save: async () => {} })
-  await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
-  await s.call({ action: 'types', type_action: 'edit', type: 'quote', target: 'Quote Bot' })
-  await s.call({ action: 'types', type_action: 'edit', type: 'drawing_review', target: 'Drawing Bot' })
-  await s.call({ action: 'types', type_action: 'edit', type: 'order_status', target: 'Orders Bot' })
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] }, 'staff')
+  await s.call({ action: 'types', type_action: 'edit', type: 'quote', target: 'Quote Bot' }, 'staff')
+  await s.call({ action: 'types', type_action: 'edit', type: 'drawing_review', target: 'Drawing Bot' }, 'staff')
+  await s.call({ action: 'types', type_action: 'edit', type: 'order_status', target: 'Orders Bot' }, 'staff')
   s.rt.state.questions.main = { id: 'staff-question', question: 'Do not replace me' }
   const summary = `客户需要详细报价。 ${Array(20).fill('Customer asked for a detailed quote.').join(' ')}`
   s.replies([
@@ -293,15 +358,15 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   assert.equal(detail.startsWith('Customer summary (untrusted evidence)\n'), true)
   assert.ok(detail.includes(summary))
   assert.ok(detail.indexOf('Customer summary (untrusted evidence)\n') < detail.indexOf('Why handoff\n'))
-  assert.ok(detail.includes('The judges did not agree on one route.'))
-  assert.ok(detail.includes('Consensus confidence: 80%; required threshold: 70%.'))
+  assert.ok(detail.includes('No consensus.'), `Expected an explicit no-consensus label:\n${detail}`)
+  assert.ok(detail.includes('Valid votes: 2/2; quorum: 2.'))
+  assert.doesNotMatch(detail, /Consensus confidence:/)
   assert.ok(detail.includes('p/one: quote · 80% · quote request'))
   assert.ok(detail.includes('p/two: order_status · 80% · order inquiry'))
   assert.ok(detail.includes('quote · DS Bot · Quote Bot'))
   assert.ok(detail.includes('order_status · DS Bot · Orders Bot'))
   assert.ok(detail.includes('drawing_review · DS Bot · Drawing Bot'))
   assert.ok(detail.includes('Source\nCustomer conversation'))
-  assert.ok(detail.includes('Conversation reference:'))
   assert.ok(detail.includes(`Case ${pending.id.slice(0, 8)}`))
   assert.doesNotMatch(detail, /customer_session_id|candidate_destinations|summary_untrusted|\"source\"/)
   assert.equal(detail.trimStart().startsWith('{'), false)
@@ -314,6 +379,27 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   delete s.rt.state.questions.main
   await next.syncHandoffs()
   assert.equal(JSON.parse(await next({ action: 'review' })).pending_handoffs.length, 0)
+})
+
+test('handoff details respect the required judge quorum for empty and one-vote handoffs', async (t) => {
+  for (const voteCount of [0, 1]) {
+    const s = await votingBank(t)
+    Object.assign(s.rt, { state: { questions: {} }, chatOf: () => 'main', isCustomerPart: () => false, save: async () => {} })
+    s.replies([{ route: 'quote', confidence: 0.95, reason: 'single judge' }])
+    const result = await s.call({ action: 'vote', summary: 'A customer order question', routes: ['quote', 'order_status'] }, 'staff')
+    assert.equal(result.decision, 'handoff')
+    assert.equal(result.required_judges, 2)
+    if (voteCount === 0) {
+      const path = join(s.home, 'triage', 'cases.jsonl')
+      const cases = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+      cases[0].votes = []
+      await writeFile(path, `${cases.map(entry => JSON.stringify(entry)).join('\n')}\n`)
+    }
+    await s.bank.syncHandoffs()
+    const detail = s.rt.state.questions.main.detail
+    assert.ok(detail.includes(`Insufficient valid votes: ${voteCount} of ${voteCount}; 2 required.`))
+    assert.ok(detail.includes(`No consensus. Valid votes: ${voteCount}/${voteCount}; quorum: 2.`))
+  }
 })
 
 test('case eviction never discards pending human handoffs and fails closed when all are pending', async (t) => {

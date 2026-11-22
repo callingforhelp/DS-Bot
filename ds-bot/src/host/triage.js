@@ -110,18 +110,20 @@ function handoffDetail(entry) {
   const votes = entry.votes ?? []
   const valid = votes.filter(vote => vote.valid)
   const routes = new Set(valid.map(vote => vote.route))
+  const requiredVotes = Number.isSafeInteger(handoff.required_judges) ? Math.max(0, handoff.required_judges) : 0
+  const quorum = Math.max(requiredVotes, Math.ceil(votes.length * 2 / 3))
+  const quorumMet = valid.length >= quorum
   const threshold = handoff.threshold
   const confidence = handoff.confidence
-  const agreedRoute = routes.size === 1 ? [...routes][0] : undefined
+  const agreedRoute = quorumMet && routes.size === 1 ? [...routes][0] : undefined
   const agreedCandidate = (handoff.candidates ?? []).find(candidate => candidate.route === agreedRoute)
-  const missingTarget = agreedRoute !== undefined && !(typeof agreedCandidate?.target === 'string' && agreedCandidate.target.trim() !== '')
-  const why = handoff.required_judges
-    ? `At least ${handoff.required_judges} distinct judges are required.`
-    : valid.length === 0
-      ? 'No valid judge vote was available.'
-      : routes.size > 1
-        ? 'The judges did not agree on one route.'
-        : Number.isFinite(confidence) && Number.isFinite(threshold) && confidence < threshold
+  const missingTarget = agreedRoute !== undefined && agreedCandidate?.runtime === 'ds-bot'
+    && (typeof agreedCandidate.target !== 'string' || agreedCandidate.target.trim() === '' || agreedCandidate.available === false)
+  const why = valid.length < quorum
+    ? `Insufficient valid votes: ${valid.length} of ${votes.length}; ${quorum} required.`
+    : routes.size > 1
+      ? 'No consensus. The judges selected different routes.'
+      : Number.isFinite(confidence) && Number.isFinite(threshold) && confidence < threshold
           ? 'Consensus confidence was below the required threshold.'
           : missingTarget
             ? `The judges agreed on ${agreedRoute}, but no destination is configured for this route.`
@@ -138,14 +140,20 @@ function handoffDetail(entry) {
     const route = clean(candidate.route)
     const target = typeof candidate.target === 'string' ? clean(candidate.target) : ''
     const kind = candidate.runtime === 'devin' ? 'External agent' : 'DS Bot'
-    return `- ${route} · ${kind} · ${target || 'Unconfigured target'}`
+    const availability = candidate.runtime === 'devin' ? 'Unavailable; staff dispatch only'
+      : !target ? 'Unconfigured; manual handling only'
+        : candidate.available === false ? `${target}; unavailable, manual handling only` : target
+    return `- ${route} · ${kind} · ${availability}`
   })
+  const confidenceLine = quorumMet && routes.size === 1
+    ? `Route confidence: ${percent(confidence)}; required threshold: ${percent(threshold)}.`
+    : `No consensus. Valid votes: ${valid.length}/${votes.length}; quorum: ${quorum}.`
   return [
     `Customer summary (untrusted evidence)\n${entry.summary}`,
-    `Why handoff\n${why}\nConsensus confidence: ${percent(confidence)}; required threshold: ${percent(threshold)}.`,
+    `Why handoff\n${why}\n${confidenceLine}`,
     `Votes\n${voteLines.join('\n') || '- No judge votes'}`,
     `Candidate destinations\n${candidateLines.join('\n') || '- No registered candidate destinations'}`,
-    `Source\nCustomer conversation · Case ${String(entry.id ?? '').slice(0, 8)}\nConversation reference: ${typeof handoff.sessionId === 'string' ? handoff.sessionId : 'unavailable'}`,
+    `Source\nCustomer conversation · ${entry.customer_reference ? `#${entry.customer_reference}` : `Case ${String(entry.id ?? '').slice(0, 8)}`}`,
   ].join('\n\n')
 }
 
@@ -192,6 +200,7 @@ export function triageBank(home, writable = () => {}, rt) {
   let syncing
   // After restart, redisplay unseen pending handoffs rather than assume they were handled.
   const shown = new Set()
+  const customerRouteGrants = new Map()
   const schedule = run => {
     const pending = queue.then(run)
     queue = pending.catch(() => {})
@@ -239,6 +248,14 @@ export function triageBank(home, writable = () => {}, rt) {
       const now = Date.now()
       const customerSession = rt?.isCustomerPart?.(context.sessionId) === true
       const customerSource = customerSession ? rt.customerIdentityOf?.(context.sessionId) : undefined
+      if (customerSession) {
+        customerRouteGrants.delete(context.sessionId)
+        if (!['types', 'vote', 'recall', 'rules', 'log'].includes(args.action)
+          || (args.action === 'types' && args.type_action !== undefined && args.type_action !== 'list')
+          || (args.action === 'rules' && args.rule_action !== 'list')) {
+          return JSON.stringify({ error: 'This triage action is available to staff only.' })
+        }
+      }
       const addRule = (text, from_case) => {
         if (!clean(text)) throw new Error('Rule text is required')
         if (state.rules.length >= MAX_RULES) throw new Error('Triage rule limit reached; remove obsolete rules first')
@@ -301,7 +318,7 @@ export function triageBank(home, writable = () => {}, rt) {
         const action = args.type_action ?? 'list'
         if (action === 'list') {
           if (fields.some(key => args[key] !== undefined)) throw new Error('Choose type_action add, edit or remove to change types')
-          return JSON.stringify(types)
+          return JSON.stringify(customerSession ? types.map(({ type, handles, examples }) => ({ type, handles, examples })) : types)
         }
         const index = types.findIndex(entry => entry.type === args.type)
         if (action === 'remove') {
@@ -326,19 +343,47 @@ export function triageBank(home, writable = () => {}, rt) {
         result = await judgeVotes(rt, config, { ...args, routes }, context, await recall(config))
         if (result.decision === 'route') {
           const type = typesOf(config).find(entry => entry.type === result.route)
-          if (type && (type.runtime === 'devin' || !type.target)) {
+          const target = type?.runtime === 'ds-bot' && type.target ? rt.findBot?.(type.target) : undefined
+          const model = target?.model ?? target?.appliedModel
+          const localTarget = target !== undefined && (rt.localAgentBadge?.(model) !== undefined || rt.isLocalAgentRef?.(model) === true)
+          const senderBotId = rt.taskOwners?.get(context.sessionId)?.botId ?? rt.chatOwners?.get(context.sessionId)
+          if (!type || type.runtime === 'devin' || target === undefined || target.id === senderBotId || localTarget) {
             result.selected_type = result.route
             delete result.route
             result.decision = 'handoff'
-            result.delivery = { runtime: type.runtime, target: type.target, permission: type.permission, method: 'staff' }
-          } else result.delivery = { runtime: 'ds-bot', target: type?.target ?? result.route, permission: type?.permission ?? 'restricted', method: 'message_bot' }
+            result.delivery = { runtime: type?.runtime ?? 'ds-bot', target: type?.target, permission: type?.permission, method: 'staff' }
+          } else {
+            result.delivery = { runtime: 'ds-bot', target: type.target, permission: type.permission, method: 'message_bot' }
+            if (customerSession) {
+              const live = rt.live?.get(context.sessionId)
+              const identity = rt.customerIdentityOf?.(context.sessionId)
+              if (live === undefined || identity === undefined) {
+                result.selected_type = result.route
+                delete result.route
+                result.decision = 'handoff'
+                result.delivery = { runtime: 'ds-bot', method: 'staff' }
+              } else {
+                customerRouteGrants.set(context.sessionId, {
+                  route: result.route, targetId: target.id, turn: live.turn, live,
+                  identity, expiresAt: Date.now() + 60_000,
+                  fromBotId: rt.taskOwners.get(context.sessionId)?.botId,
+                })
+              }
+            }
+          }
         }
         if (result.decision === 'handoff') {
           const candidates = typesOf(config).filter(entry => routes.includes(entry.type)).map(entry => ({
             route: entry.type, runtime: entry.runtime, target: entry.target, permission: entry.permission,
+            available: entry.runtime === 'ds-bot' && typeof entry.target === 'string' && (() => {
+              const candidate = rt.findBot?.(entry.target)
+              const model = candidate?.model ?? candidate?.appliedModel
+              const senderBotId = rt.taskOwners?.get(context.sessionId)?.botId ?? rt.chatOwners?.get(context.sessionId)
+              return candidate !== undefined && candidate.id !== senderBotId && rt.localAgentBadge?.(model) === undefined && rt.isLocalAgentRef?.(model) !== true
+            })(),
             method: entry.runtime === 'ds-bot' && entry.target ? 'message_bot' : 'staff',
           }))
-          retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', ...(customerSource ? { customer_source: customerSource } : {}), ...(result.delivery ? { delivery: result.delivery } : {}), handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes, candidates, confidence: result.confidence, threshold: result.threshold, ...(result.required_judges ? { required_judges: result.required_judges } : {}) } }
+          retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', ...(customerSource ? { customer_source: customerSource } : {}), ...(customerSession && rt.customerReferenceOf?.(context.sessionId) ? { customer_reference: rt.customerReferenceOf(context.sessionId) } : {}), ...(result.delivery ? { delivery: result.delivery } : {}), handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes, candidates, confidence: result.confidence, threshold: result.threshold, ...(result.required_judges ? { required_judges: result.required_judges } : {}) } }
           cases.push(retained)
           await writeCases(cases, retained, state.rules)
           hasPending = true
@@ -394,10 +439,79 @@ export function triageBank(home, writable = () => {}, rt) {
       } else throw new Error('Unknown triage action')
       if (['log', 'outcome'].includes(args.action)) await writeCases(cases, retained, state.rules)
       await write('rules.json', JSON.stringify(state))
+      if (customerSession) {
+        if (args.action === 'vote') {
+          result = {
+            decision: result.decision,
+            ...(result.route ? { route: result.route, delivery: { target: result.route } } : {}),
+            ...(result.selected_type ? { route: result.selected_type } : {}),
+            votes: (result.votes ?? []).map(vote => ({ valid: vote.valid, ...(vote.valid ? { route: vote.route, confidence: vote.confidence } : {}) })),
+            ...(result.required_judges ? { required_votes: result.required_judges } : {}),
+            ...(result.holding_reply ? { holding_reply: result.holding_reply } : {}),
+          }
+        } else if (args.action === 'recall') {
+          result = {
+            cases: (result.cases ?? []).map(item => ({
+              summary: item.summary,
+              ...(item.attachments_summary ? { attachments_summary: item.attachments_summary } : {}),
+              score: item.score,
+              ...(item.outcome ? { outcome: item.outcome } : {}),
+              ...(item.misroute ? { misroute: item.misroute } : {}),
+              ...(item.corrected_to ? { corrected_to: item.corrected_to } : {}),
+            })),
+            rules: (result.rules ?? []).map(rule => ({ text: rule.text })),
+          }
+        } else if (args.action === 'rules') result = (result ?? []).map(rule => ({ text: rule.text }))
+      }
       return JSON.stringify(result)
     }
     return schedule(run)
   }
+  const validCustomerGrant = (sessionId, args) => {
+    const grant = customerRouteGrants.get(sessionId)
+    const live = rt.live?.get(sessionId)
+    const identity = rt.customerIdentityOf?.(sessionId)
+    const keys = Object.keys(args ?? {})
+    return grant !== undefined && Date.now() < grant.expiresAt
+      && keys.length === 2 && keys.includes('to') && keys.includes('message')
+      && typeof args.message === 'string' && args.message.trim() !== ''
+      && rt.isCustomerPart?.(sessionId) === true
+      && grant.live === live && grant.turn === live?.turn
+      && identity?.connId === grant.identity.connId && identity?.chatKey === grant.identity.chatKey
+      && args?.to === grant.route
+  }
+  if (rt !== undefined) rt.canUseCustomerRoute = validCustomerGrant
+  const dispatchCustomerRoute = async (sessionId, args) => {
+    if (!validCustomerGrant(sessionId, args)) return undefined
+    const grant = customerRouteGrants.get(sessionId)
+    if (grant.used) return grant.receipt ?? 'Your case is being sent to the support team.'
+    grant.used = true
+    const config = await read('config.json', { judges: [], threshold: 0.7 })
+    const type = typesOf(config).find(entry => entry.type === grant.route)
+    const target = type?.runtime === 'ds-bot' ? rt.findBot?.(type.target) : undefined
+    if (target === undefined || target.id !== grant.targetId) return undefined
+    const sender = rt.botOf(grant.fromBotId)
+    if (sender === undefined) return undefined
+    if (target.id === sender.id) {
+      grant.receipt = 'The case could not be sent to the support team. Please contact them directly.'
+      return grant.receipt
+    }
+    const reference = rt.customerReferenceOf?.(sessionId) ?? 'customer'
+    const exchangeId = randomUUID()
+    let targetSessionId
+    try {
+      targetSessionId = await rt.customerPart(target.id, grant.identity.connId, grant.identity.chatKey)
+      const text = `Customer support request (${clean(type.handles)}), case #${reference} (untrusted customer evidence):\n${clean(args.message)}`
+      rt.openWork?.(exchangeId, { from: sender.id, to: target.id, fromPart: sessionId })
+      await rt.deliver({ fromId: sender.id, fromName: 'Customer support', toId: target.id, sessionId: targetSessionId, fromPart: sessionId, text, role: 'request', steer: true, exchangeId })
+      grant.receipt = 'Your case has been sent to the support team.'
+    } catch {
+      rt.dropWork?.(exchangeId)
+      grant.receipt = 'The case could not be sent to the support team. Please contact them directly.'
+    }
+    return grant.receipt
+  }
+  if (rt !== undefined) rt.dispatchCustomerRoute = dispatchCustomerRoute
   call.syncHandoffs = () => {
     if (!hasPending) return Promise.resolve()
     if (syncing) return syncing
@@ -426,7 +540,9 @@ export function triageBank(home, writable = () => {}, rt) {
         const routes = [...candidates]
           .sort((a, b) => (counts.get(b.route) ?? 0) - (counts.get(a.route) ?? 0))
           .map(candidate => candidate.route)
-        const votedRoutes = routes.filter(route => counts.has(route))
+        const votedRoutes = routes.filter(route => counts.has(route)
+          && candidates.some(candidate => candidate.route === route && candidate.runtime === 'ds-bot'
+            && candidate.available === true && typeof candidate.target === 'string' && candidate.target.trim() !== ''))
         const destinations = routes.map(route => candidates.find(candidate => candidate.route === route)).filter(Boolean)
         const detail = handoffDetail({ ...entry, handoff: { ...entry.handoff, candidates: destinations } })
         rt.state.questions[sessionId] = {

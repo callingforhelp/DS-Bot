@@ -50453,7 +50453,7 @@ function CustomerSessions({ bot, roster, actions }) {
       { className: "bt-agent-sessions-head" },
       (0, import_react77.createElement)("div", { className: "bt-section-title" }, t("Customer conversations"))
     ),
-    (0, import_react77.createElement)("div", { className: "bt-agent-sessions" }, sessions.map((entry, index) => {
+    (0, import_react77.createElement)("div", { className: "bt-agent-sessions" }, sessions.map((entry) => {
       const when3 = Number.isFinite(entry.updatedAt) ? new Date(entry.updatedAt).toLocaleString() : "";
       return (0, import_react77.createElement)(
         "button",
@@ -50464,7 +50464,7 @@ function CustomerSessions({ bot, roster, actions }) {
           title: t("Customer conversation"),
           onClick: () => setCustomer(entry.sessionId)
         },
-        (0, import_react77.createElement)("span", { className: "bt-agent-session-name" }, `${t("Customer conversation")} ${index + 1}`),
+        (0, import_react77.createElement)("span", { className: "bt-agent-session-name" }, `${t("Customer conversation")} · #${entry.reference ?? ""}`),
         (0, import_react77.createElement)("span", { className: "bt-agent-session-meta" }, when3)
       );
     }))

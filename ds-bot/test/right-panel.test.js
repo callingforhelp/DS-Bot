@@ -347,7 +347,7 @@ test('customer tasks show a read-only transcript without foreground session cont
     ...roster, byId: { a: {
       ...bot,
       tasks: [{ id: 'customer-task', title: 'Customer conversation', origin: 'customer', customer: { connId: 'wecom', chatKey: 'customer-A' }, status: 'waiting_customer', sessionId: 'customer', segments: [] }],
-      customerSessions: [{ sessionId: 'customer', updatedAt: 1 }],
+      customerSessions: [{ sessionId: 'customer', reference: 'CAFE1234', updatedAt: 1 }],
     } },
   })
   const customer = buttonsOf(tree).find(button => button.props.title === 'Customer conversation')
