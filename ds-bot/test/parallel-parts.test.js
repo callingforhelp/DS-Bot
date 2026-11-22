@@ -12,6 +12,7 @@ import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { createRuntime } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
+import { pushThreadPart } from '../src/host/threads.js'
 
 // #1501: a Bot's own chat can keep a second part live. The current part stays
 // `chatOf`; parts opened while the Bot was busy stay live in `openParts` with their own
@@ -134,6 +135,52 @@ test('an earlier part of a background thread reads that thread\'s history', asyn
   }) }
   const page = await rt.earlierPage('w5')
   assert.deepEqual(page.items.map(item => [item.kind, item.text]), [['user', 'w4']])
+})
+
+test('customer pages read the whole rolled-over thread without switching or writing', async (t) => {
+  const seed = structuredClone(MOVED_BACK)
+  seed.bots.w1.openParts[0].customer = { connId: 'kf', chatKey: 'customer' }
+  const { ctx, call, rt } = await team(t, [], seed, ['m1', 'w1', 'w2', 'w3', 'w4', 'w5', 'w6'])
+  await call('state')
+  const bot = rt.botOf('w1')
+  pushThreadPart(bot, 'w3', 'w6', { sessionId: 'w3', endedAt: 8 })
+  rt.chatOwners.delete('w3')
+  rt.pastOwners.set('w3', { botId: 'w1' })
+  rt.chatOwners.set('w6', 'w1')
+  const before = JSON.stringify(bot)
+  let reads = 0
+  ctx.sessionController = { page: async ({ address, beforeSeq }) => {
+    reads++
+    const latest = address.sessionId === 'w6' && beforeSeq === undefined
+    return {
+      records: [{ event: { type: 'user/message', seq: latest ? 2 : 1, time: 1, data: { content: [{ type: 'text', text: latest ? 'latest' : address.sessionId }], source: { kind: 'user' } } } }],
+      hasMore: latest,
+    }
+  } }
+  rt.save = async () => { throw new Error('customer paging must not save') }
+  const newest = await call('customer-page', { sessionId: 'w3' })
+  assert.equal(newest.ok, true, JSON.stringify(newest))
+  assert.deepEqual(newest.value.items.filter(item => item.kind === 'user').map(item => item.text), ['latest'])
+  let cursor = newest.value.cursor
+  const messages = ['latest']
+  while (cursor) {
+    const page = await rt.customerPage('w6', cursor)
+    messages.push(...page.items.filter(item => item.kind === 'user').map(item => item.text))
+    cursor = page.cursor
+  }
+  assert.deepEqual(messages, ['latest', 'w6', 'w3', 'w5', 'w4'])
+  assert.equal(rt.chatOf('w1'), 'w2')
+  assert.equal(JSON.stringify(bot), before)
+  const readCount = reads
+  for (const id of ['w2', 'm1', 'missing']) {
+    const page = await rt.customerPage(id, { part: 0 })
+    assert.deepEqual(page.items, [])
+    assert.equal(page.cursor, null)
+  }
+  assert.deepEqual((await rt.customerPage('w6', { part: 100 })).items, [])
+  assert.equal(reads, readCount)
+  ctx.sessionController.page = async () => { throw new Error('history unavailable') }
+  await assert.rejects(rt.customerPage('w6'), /history unavailable/)
 })
 
 test('opening a live part swaps the threads and archives nothing', async (t) => {

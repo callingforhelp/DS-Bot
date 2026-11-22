@@ -20,6 +20,7 @@ import { PermissionPicker, presetDanger, presetName } from './permission-picker.
 import { TaskBoard } from './task-board.js'
 import { BotConnectors } from './connectors.js'
 import { ComputerView } from './computer.js'
+import { EarlierParts } from './cells.js'
 import { t } from './i18n.js'
 
 function transcriptOf(list, id, name, hiddenTurns = []) {
@@ -236,7 +237,10 @@ function GroupOverview({ room, roster, actions, usage, useWork, openSettings }) 
 // first. Every Bot's chat has parts, whether it answers with a DS Bot model or a local
 // CLI. A running part opened from here is read-only until its turn ends: two sessions
 // running at once means two model calls.
-function BotSessions({ bot, part, run, useSessions, actions, running }) {
+function BotSessions({ bot, part, run, useSessions, actions, running, roster }) {
+  const [customer, setCustomer] = useState(null)
+  const body = useRef(null)
+  useMorph(body, customer)
   const runningOf = id => running?.[id] === true
   const open = (bot.openParts ?? []).map(entry => ({ id: entry.sessionId, open: true, customer: entry.customer === true, running: runningOf(entry.sessionId) }))
   // Two sessions running at once means two model calls: shown only while a background
@@ -250,11 +254,17 @@ function BotSessions({ bot, part, run, useSessions, actions, running }) {
   const rows = useSessions(list => entries.map(entry => list.byId?.[entry.id]), rowsEqual)
   const total = entries.length
   const openPart = (entry) => {
-    if (entry.current || entry.customer) return undefined
+    if (entry.current) return undefined
+    if (entry.customer) return () => setCustomer(entry.id)
     if (entry.open && actions.openPart !== undefined) return () => run(actions.openPart(bot.id, entry.id, entry.running))
     return () => run(call('bot-open-part', { botId: bot.id, sessionId: entry.id }))
   }
-  return h('div', { className: 'bt-drawer-model' },
+  if (customer !== null) return h('div', { ref: body, className: 'bt-drawer-model' },
+    h('button', { type: 'button', className: 'bt-soft', onClick: () => setCustomer(null) }, h(ChevronLeftIcon), t('Back to details')),
+    h('div', { className: 'bt-section-title' }, t('Customer conversation')),
+    h('div', { className: 'bt-muted' }, t('Read only')),
+    h(EarlierParts, { key: customer, sessionId: customer, roster, actions, customer: true }))
+  return h('div', { ref: body, className: 'bt-drawer-model' },
     h('div', { className: 'bt-agent-sessions-head' },
       h('div', { className: 'bt-section-title' }, t('Sessions')),
       h('button', { type: 'button', className: 'bt-agent-sessions-new', onClick: () => run(actions.newPart !== undefined ? actions.newPart(bot.id) : call('bot-new-part', { botId: bot.id })) }, h(PlusIcon), t('New session'))),
@@ -269,7 +279,7 @@ function BotSessions({ bot, part, run, useSessions, actions, running }) {
       const label = row?.title && row.title.trim() !== '' ? row.title : t('Session {number}', { number: total - index })
       const title = entry.customer ? t('Customer conversation') : entry.current ? t('Current session') : entry.open && entry.running ? t('Open this running session') : entry.open ? t('Open this session') : t('Open this earlier session')
       return h('button', {
-        key: entry.id, type: 'button', disabled: entry.current || entry.customer,
+        key: entry.id, type: 'button', disabled: entry.current === true,
         className: `bt-agent-session${entry.current ? ' is-current' : ''}${entry.running ? ' is-running' : ''}`,
         title, onClick: openPart(entry),
       },
@@ -390,7 +400,7 @@ export function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, ro
           h(ModelMenu, { bot, roster, actions, run, wide: true, inline: true }),
           modelOf(bot, roster) ? null : h('div', { className: 'bt-note' }, t('Pick a model and {name} can start.', { name: bot.name })),
         ),
-        h(BotSessions, { key: 'sessions', bot, part, run, useSessions, actions, running: roster.partsRunning }),
+        h(BotSessions, { key: 'sessions', bot, part, run, useSessions, actions, running: roster.partsRunning, roster }),
         h(PermissionRow, { key: 'permission', bot, roster, actions, run }),
         h(BotConnectors, { key: 'connectors', bot, roster, actions, run }),
         h('div', { key: 'folder', className: 'bt-drawer-model' },

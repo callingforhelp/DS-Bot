@@ -15181,6 +15181,7 @@ function teamActions({ call: call2, after, partFor, roster, ui: ui2, live, cards
     roomProgress: (roomId) => call2("room-progress", { roomId }).catch(() => []),
     groupRows: (roomId, from, to, anchor) => call2("group-rows", { roomId, from, ...to === void 0 ? {} : { to }, ...anchor === void 0 ? {} : { anchor } }).catch(() => null),
     earlier: (sessionId, cursor) => call2("earlier", { sessionId, cursor: cursor ?? null }),
+    customerPage: (sessionId, cursor) => call2("customer-page", { sessionId, cursor: cursor ?? null }),
     // Hours come back in this browser's time zone, so days start at local midnight.
     usage: () => call2("usage", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     // The details panel's status line: turns, speed, cache hits and context for one Bot.
@@ -29528,7 +29529,7 @@ function EarlierUser({ row, actions }) {
     row.via ? (0, import_react35.createElement)("div", { className: "bt-utime" }, (0, import_react35.createElement)(ViaTag, { via: row.via }), Number.isFinite(row.time) ? messageClock(row.time) : null) : null
   );
 }
-function EarlierParts({ sessionId, roster, actions }) {
+function EarlierParts({ sessionId, roster, actions, customer = false }) {
   const [view, setView] = (0, import_react35.useState)({ pages: [], cursor: void 0, loading: true, failed: false, startedAt: null });
   const top = (0, import_react35.useRef)(null);
   const busy = (0, import_react35.useRef)(false);
@@ -29539,10 +29540,11 @@ function EarlierParts({ sessionId, roster, actions }) {
     const mine = generation.current;
     const room2 = roster.roomsById[sessionId];
     const owner = roster.byId[sessionId] ?? (room2 === void 0 ? void 0 : { parts: room2.ownParts, sessionId: room2.sessionId });
-    const partIndex = partIndexOf(owner, sessionId, cursor);
+    const partIndex = customer ? cursor?.part ?? Infinity : partIndexOf(owner, sessionId, cursor);
     busy.current = true;
     setView((current2) => ({ ...current2, loading: true, failed: false }));
-    actions.earlier(sessionId, cursor).then((page) => {
+    const pageOf = customer ? actions.customerPage : actions.earlier;
+    pageOf(sessionId, cursor).then((page) => {
       if (mine !== generation.current) return;
       busy.current = false;
       const scroller = top.current && scrollParent(top.current);
@@ -29563,7 +29565,7 @@ function EarlierParts({ sessionId, roster, actions }) {
       setView((current2) => ({ ...current2, loading: false, failed: true }));
     });
   };
-  const closedEarlier = JSON.stringify((roster.byId[sessionId]?.parts ?? []).map((part) => roster.closedCards?.[part] ?? null));
+  const closedEarlier = customer ? "" : JSON.stringify((roster.byId[sessionId]?.parts ?? []).map((part) => roster.closedCards?.[part] ?? null));
   (0, import_react35.useEffect)(() => {
     generation.current += 1;
     busy.current = false;
@@ -29572,7 +29574,7 @@ function EarlierParts({ sessionId, roster, actions }) {
     return () => {
       generation.current += 1;
     };
-  }, [sessionId, closedEarlier]);
+  }, [sessionId, closedEarlier, customer]);
   (0, import_react35.useLayoutEffect)(() => {
     const pending = restore.current;
     restore.current = null;
@@ -29595,14 +29597,14 @@ function EarlierParts({ sessionId, roster, actions }) {
   for (const page of view.pages) items.push(...withBtwRows(page.items, page.btw));
   return (0, import_react35.createElement)(
     "div",
-    { className: "bt-earlier", role: "feed", "aria-label": t("Earlier messages"), "aria-busy": view.loading },
+    { className: "bt-earlier", role: "feed", "aria-label": t(customer ? "Customer conversation" : "Earlier messages"), "aria-busy": view.loading },
     (0, import_react35.createElement)(
       "div",
       { ref: top, className: "bt-earlier-top" },
       view.loading ? (0, import_react35.createElement)(Shimmer, null, t("Loading earlier messages…")) : view.failed ? (0, import_react35.createElement)("button", { type: "button", className: "bt-soft", onClick: () => load(view.cursor) }, t("Couldn’t load earlier messages · Retry")) : view.cursor ? (0, import_react35.createElement)("button", { type: "button", className: "bt-soft", onClick: () => load(view.cursor) }, t("Load earlier")) : null
     ),
-    (0, import_react35.createElement)(ChatRows, { items, sessionId, roster, actions, onBtwDelete: removeBtw }),
-    (0, import_react35.createElement)(PartLine, { time: view.startedAt })
+    (0, import_react35.createElement)(ChatRows, { items, sessionId, roster: customer ? { ...roster, views: {} } : roster, actions, onBtwDelete: customer ? void 0 : removeBtw }),
+    customer ? null : (0, import_react35.createElement)(PartLine, { time: view.startedAt })
   );
 }
 function ChatRows({ items, sessionId, roster, actions, useUi, clock: clock4 = false, onBtwDelete }) {
@@ -43530,7 +43532,10 @@ function GroupOverview({ room: room2, roster, actions, usage, useWork, openSetti
     ) : null
   ];
 }
-function BotSessions({ bot, part, run: run2, useSessions, actions, running }) {
+function BotSessions({ bot, part, run: run2, useSessions, actions, running, roster }) {
+  const [customer, setCustomer] = (0, import_react69.useState)(null);
+  const body = (0, import_react69.useRef)(null);
+  useMorph(body, customer);
   const runningOf = (id) => running?.[id] === true;
   const open = (bot.openParts ?? []).map((entry) => ({ id: entry.sessionId, open: true, customer: entry.customer === true, running: runningOf(entry.sessionId) }));
   const backgroundRunning = open.some((entry) => entry.running);
@@ -43542,13 +43547,22 @@ function BotSessions({ bot, part, run: run2, useSessions, actions, running }) {
   const rows2 = useSessions((list) => entries2.map((entry) => list.byId?.[entry.id]), rowsEqual);
   const total = entries2.length;
   const openPart = (entry) => {
-    if (entry.current || entry.customer) return void 0;
+    if (entry.current) return void 0;
+    if (entry.customer) return () => setCustomer(entry.id);
     if (entry.open && actions.openPart !== void 0) return () => run2(actions.openPart(bot.id, entry.id, entry.running));
     return () => run2(call("bot-open-part", { botId: bot.id, sessionId: entry.id }));
   };
+  if (customer !== null) return (0, import_react69.createElement)(
+    "div",
+    { ref: body, className: "bt-drawer-model" },
+    (0, import_react69.createElement)("button", { type: "button", className: "bt-soft", onClick: () => setCustomer(null) }, (0, import_react69.createElement)(ChevronLeftIcon), t("Back to details")),
+    (0, import_react69.createElement)("div", { className: "bt-section-title" }, t("Customer conversation")),
+    (0, import_react69.createElement)("div", { className: "bt-muted" }, t("Read only")),
+    (0, import_react69.createElement)(EarlierParts, { key: customer, sessionId: customer, roster, actions, customer: true })
+  );
   return (0, import_react69.createElement)(
     "div",
-    { className: "bt-drawer-model" },
+    { ref: body, className: "bt-drawer-model" },
     (0, import_react69.createElement)(
       "div",
       { className: "bt-agent-sessions-head" },
@@ -43571,7 +43585,7 @@ function BotSessions({ bot, part, run: run2, useSessions, actions, running }) {
         {
           key: entry.id,
           type: "button",
-          disabled: entry.current || entry.customer,
+          disabled: entry.current === true,
           className: `bt-agent-session${entry.current ? " is-current" : ""}${entry.running ? " is-running" : ""}`,
           title,
           onClick: openPart(entry)
@@ -43721,7 +43735,7 @@ function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, roster, a
           (0, import_react69.createElement)(ModelMenu, { bot, roster, actions, run: run2, wide: true, inline: true }),
           modelOf(bot, roster) ? null : (0, import_react69.createElement)("div", { className: "bt-note" }, t("Pick a model and {name} can start.", { name: bot.name }))
         ),
-        (0, import_react69.createElement)(BotSessions, { key: "sessions", bot, part, run: run2, useSessions, actions, running: roster.partsRunning }),
+        (0, import_react69.createElement)(BotSessions, { key: "sessions", bot, part, run: run2, useSessions, actions, running: roster.partsRunning, roster }),
         (0, import_react69.createElement)(PermissionRow, { key: "permission", bot, roster, actions, run: run2 }),
         (0, import_react69.createElement)(BotConnectors, { key: "connectors", bot, roster, actions, run: run2 }),
         (0, import_react69.createElement)(

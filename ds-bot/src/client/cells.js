@@ -520,7 +520,7 @@ function EarlierUser({ row, actions }) {
 // The earlier parts of a Bot's own chat, above its current part as one conversation.
 // Pages load from the host as the user scrolls up; a thin line marks where each
 // part begins, the last one where the current part begins.
-function EarlierParts({ sessionId, roster, actions }) {
+export function EarlierParts({ sessionId, roster, actions, customer = false }) {
   const [view, setView] = useState({ pages: [], cursor: undefined, loading: true, failed: false, startedAt: null })
   const top = useRef(null)
   const busy = useRef(false)
@@ -533,10 +533,11 @@ function EarlierParts({ sessionId, roster, actions }) {
     // before this one. A group's own Session chains `room.ownParts` + `sessionId`.
     const room = roster.roomsById[sessionId]
     const owner = roster.byId[sessionId] ?? (room === undefined ? undefined : { parts: room.ownParts, sessionId: room.sessionId })
-    const partIndex = partIndexOf(owner, sessionId, cursor)
+    const partIndex = customer ? (cursor?.part ?? Infinity) : partIndexOf(owner, sessionId, cursor)
     busy.current = true
     setView(current => ({ ...current, loading: true, failed: false }))
-    actions.earlier(sessionId, cursor).then((page) => {
+    const pageOf = customer ? actions.customerPage : actions.earlier
+    pageOf(sessionId, cursor).then((page) => {
       if (mine !== generation.current) return
       busy.current = false
       // The chat's scroller does not anchor content prepended above the viewport,
@@ -560,14 +561,14 @@ function EarlierParts({ sessionId, roster, actions }) {
       setView(current => ({ ...current, loading: false, failed: true }))
     })
   }
-  const closedEarlier = JSON.stringify((roster.byId[sessionId]?.parts ?? []).map(part => roster.closedCards?.[part] ?? null))
+  const closedEarlier = customer ? '' : JSON.stringify((roster.byId[sessionId]?.parts ?? []).map(part => roster.closedCards?.[part] ?? null))
   useEffect(() => {
     generation.current += 1
     busy.current = false
     setView({ pages: [], cursor: undefined, loading: true, failed: false, startedAt: null })
     load(undefined)
     return () => { generation.current += 1 }
-  }, [sessionId, closedEarlier])
+  }, [sessionId, closedEarlier, customer])
   useLayoutEffect(() => {
     const pending = restore.current
     restore.current = null
@@ -588,13 +589,13 @@ function EarlierParts({ sessionId, roster, actions }) {
   }))
   const items = []
   for (const page of view.pages) items.push(...withBtwRows(page.items, page.btw))
-  return h('div', { className: 'bt-earlier', role: 'feed', 'aria-label': t('Earlier messages'), 'aria-busy': view.loading },
+  return h('div', { className: 'bt-earlier', role: 'feed', 'aria-label': t(customer ? 'Customer conversation' : 'Earlier messages'), 'aria-busy': view.loading },
     h('div', { ref: top, className: 'bt-earlier-top' },
       view.loading ? h(Shimmer, null, t('Loading earlier messages…'))
         : view.failed ? h('button', { type: 'button', className: 'bt-soft', onClick: () => load(view.cursor) }, t('Couldn’t load earlier messages · Retry'))
           : view.cursor ? h('button', { type: 'button', className: 'bt-soft', onClick: () => load(view.cursor) }, t('Load earlier')) : null),
-    h(ChatRows, { items, sessionId, roster, actions, onBtwDelete: removeBtw }),
-    h(PartLine, { time: view.startedAt }))
+    h(ChatRows, { items, sessionId, roster: customer ? { ...roster, views: {} } : roster, actions, onBtwDelete: customer ? undefined : removeBtw }),
+    customer ? null : h(PartLine, { time: view.startedAt }))
 }
 
 // A Bot chat's entries as the host lists them (the `earlier` and `chat` endpoints): the

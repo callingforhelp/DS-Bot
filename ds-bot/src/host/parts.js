@@ -1946,6 +1946,16 @@ export function install(rt) {
     return { ...(await partPage(parts, index, cursor)), btw, startedAt: parts[at].startedAt }
   }
 
+  async function customerPage(sessionId, cursor) {
+    if (!isCustomerPart(sessionId)) return { items: [], cursor: null, btw: [], startedAt: null }
+    const botId = rt.chatOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)?.botId
+    const parts = partsOfThread(botId, sessionId)
+    const index = Number.isInteger(cursor?.part) ? cursor.part : parts.length - 1
+    const startedAt = parts[0]?.startedAt ?? null
+    if (index < 0 || index >= parts.length) return { items: [], cursor: null, btw: [], startedAt }
+    return { ...(await partPage(parts, index, cursor)), btw: [], startedAt }
+  }
+
   // A Bot's whole own chat, newest page first: the current part, then the earlier
   // ones, for a window that draws the conversation itself.
   // The same short labels the client gives a tool (cells.js cannot be loaded
@@ -2208,5 +2218,5 @@ export function install(rt) {
     return true
   }
 
-  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, customerPart, isCustomerPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, customerPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, customerPart, isCustomerPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }

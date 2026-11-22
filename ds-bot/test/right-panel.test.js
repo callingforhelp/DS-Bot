@@ -78,13 +78,15 @@ const bundle = await build({
   external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
 })
 const module = { exports: {} }
+let drawerState
+let drawerUpdate
 runInNewContext(bundle.outputFiles[0].text, {
   module, exports: module.exports, URL, URLSearchParams, setTimeout, clearTimeout,
   require: (name) => {
     const platform = {
       react: { createContext: (initial) => { const ctx = { value: initial }; ctx.Provider = ({ value, children }) => { ctx.value = value; return children }; return ctx }, useContext: ctx => ctx.value, useId: () => 'dv-id', 
         createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
-        useState: initial => [initial, () => {}], useEffect: () => {}, useRef: current => ({ current }),
+        useState: initial => [drawerState ?? initial, value => { drawerUpdate = value }], useEffect: () => {}, useRef: current => ({ current }),
         useLayoutEffect: () => {}, useMemo: make => make(), useCallback: fn => fn,
         useSyncExternalStore: (_subscribe, get) => get(), Fragment: 'fragment',
       },
@@ -312,7 +314,7 @@ test('every Bot gets the Sessions section and New session, not only local-agent 
   assert.ok(engineEntry, 'the local-agent Bot still has it')
 })
 
-test('customer sessions are labelled and cannot invoke a foreground open action', () => {
+test('customer sessions open a read-only transcript without invoking a foreground open action', () => {
   let opened = 0
   const tree = drawer('a', { openPart: () => { opened++ } }, {
     ...roster, byId: { a: { ...bot, openParts: [{ sessionId: 'customer', customer: true }, { sessionId: 'background' }] } },
@@ -320,8 +322,26 @@ test('customer sessions are labelled and cannot invoke a foreground open action'
   const customer = buttonsOf(tree).find(button => button.props.title === 'Customer conversation')
   assert.ok(customer)
   assert.match(textOf(customer), /Customer conversation/)
-  assert.equal(customer.props.disabled, true)
-  assert.equal(customer.props.onClick, undefined)
+  assert.equal(customer.props.disabled, false)
+  customer.props.onClick()
+  assert.equal(drawerUpdate, 'customer')
+  assert.equal(opened, 0)
+  const component = (node, name) => {
+    if (Array.isArray(node)) return node.map(child => component(child, name)).find(Boolean)
+    if (!node || typeof node !== 'object') return undefined
+    return node.type?.name === name ? node : component(node.children ?? [], name)
+  }
+  const sessions = component(tree, 'BotSessions')
+  let reading
+  drawerState = drawerUpdate
+  try { reading = sessions.type(sessions.props) } finally { drawerState = undefined }
+  const transcript = component(reading, 'EarlierParts')
+  assert.equal(transcript.props.sessionId, 'customer')
+  assert.equal(transcript.props.customer, true)
+  assert.match(textOf(reading), /Customer conversation/)
+  assert.match(textOf(reading), /Read only/)
+  assert.equal(buttonsOf(reading).some(button => /Send|Open this/.test(textOf(button))), false)
+  assert.equal(opened, 0)
   const normal = buttonsOf(tree).find(button => button.props.title === 'Open this session')
   assert.equal(normal.props.disabled, false)
   normal.props.onClick()
