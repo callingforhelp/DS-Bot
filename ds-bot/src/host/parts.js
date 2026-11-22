@@ -2123,8 +2123,13 @@ export function install(rt) {
       const freshId = await rt.createSession(bot.name, { dir: rt.workDirOf({ botId }) })
       const picked = await freshRoute(bot, agent.session)
       if (picked !== undefined) await selectRoute({ name: bot.name }, freshId, picked)
-      await rt.applyPermission(bot, freshId, undefined)
-        .catch(error => rt.warn('ds-bot: permission for the customer part of %s not applied: %s', bot.name, error))
+      try {
+        await rt.applyPermission(bot, freshId, undefined)
+      } catch (error) {
+        await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true })
+          .catch(archiveError => rt.warn('ds-bot: unsafe customer part %s not archived: %s', freshId, archiveError))
+        throw error
+      }
       if (rt.botOf(botId) !== bot) {
         await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true })
         throw Object.assign(new Error('Unknown Bot'), { code: 'bot/not-found' })

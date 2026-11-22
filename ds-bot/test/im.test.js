@@ -342,6 +342,23 @@ test('customer thread creation errors are retryable without reserving a phantom 
   assert.equal(s.rt.botOf('a').openParts.length, 1)
 })
 
+test('customer permission failures archive the fresh session and never register it', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  const archived = []
+  s.ctx.workspaceRegistry.archiveSession = async (id, options) => { archived.push({ id, options }) }
+  const apply = s.rt.applyPermission
+  s.rt.applyPermission = async () => { throw new Error('permission unavailable') }
+  await assert.rejects(s.rt.customerPart('a', conn.id, 'dm-first'), /permission unavailable/)
+  assert.deepEqual(archived, [{ id: 'customer-1', options: { stopActivity: true } }])
+  assert.equal(s.rt.botOf('a').openParts?.length ?? 0, 0)
+  assert.equal(s.rt.chatOwners.has('customer-1'), false)
+  assert.equal(s.prompts.length, 0)
+  s.rt.applyPermission = apply
+  assert.equal(await s.rt.customerPart('a', conn.id, 'dm-first'), 'customer-2')
+})
+
 test('triage tools restrict current and historical customer parts but not normal conversations', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
