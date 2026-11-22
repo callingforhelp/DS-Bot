@@ -96,3 +96,38 @@ test('kf downloads customer media as images and original file bytes', async () =
     }
   } finally { conn.stop() }
 })
+
+test('kf skips permanently rejected media and advances the page, but retries transient errors', async () => {
+  for (const permanent of [true, false]) {
+    const env = fake({ sync_msg: [{ next_cursor: 'after-media', msg_list: [
+      { origin: 3, send_time: Date.now() / 1000, external_userid: 'customer', msgid: 'bad-media', msgtype: 'file', file: { media_id: 'invalid' } },
+      { origin: 3, send_time: Date.now() / 1000, external_userid: 'another', msgid: 'next', msgtype: 'text', text: { content: 'hello' } },
+    ] }] })
+    const originalFetch = env.fetch
+    env.fetch = async (url, options) => {
+      if (url.includes('/media/get')) {
+        if (permanent) return json({ errcode: 40007, errmsg: 'invalid media_id' })
+        throw new Error('temporary network outage')
+      }
+      return originalFetch(url, options)
+    }
+    const messages = []
+    let finish
+    const done = new Promise(resolve => { finish = resolve })
+    const conn = adapter.connect(fields, env, { onStatus(status) { if (['ready', 'error'].includes(status.state)) finish(status) }, async onMessage(msg) { messages.push(msg) } })
+    try {
+      const status = await done
+      if (permanent) {
+        assert.equal(status.state, 'ready')
+        assert.deepEqual(messages.map(msg => msg.messageId), ['bad-media', 'next'])
+        assert.match(messages[0].text, /Attachment could not be fetched/)
+        assert.deepEqual(messages[0].files, [])
+        assert.equal(env.runtime.get().cursor, 'after-media')
+      } else {
+        assert.equal(status.state, 'error')
+        assert.equal(env.runtime.get().cursor, undefined)
+        assert.deepEqual(messages, [])
+      }
+    } finally { conn.stop() }
+  }
+})

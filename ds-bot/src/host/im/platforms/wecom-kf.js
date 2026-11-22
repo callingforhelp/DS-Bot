@@ -98,16 +98,17 @@ export default {
           if (!user) continue
           const images = []
           const files = []
+          let text = msg.text?.content ?? ''
           if (['image', 'file', 'voice', 'video'].includes(msg.msgtype) && msg[msg.msgtype]?.media_id) {
             const got = await api.media(msg[msg.msgtype].media_id, (msg.msgtype === 'image' ? 20 : 100) * 1024 * 1024).catch(error => {
-              if (!error.overLimit) throw error
-              env.log?.warn?.('ds-bot im: wecom_kf attachment exceeds size limit, skipped')
+              if (!error.overLimit && !error.permanent) throw error
+              text = [text, '[Attachment could not be fetched.]'].filter(Boolean).join('\n')
               return undefined
             })
             if (got && msg.msgtype === 'image') images.push({ mediaType: got.mediaType, data: got.data.toString('base64') })
             else if (got) files.push({ name: msg[msg.msgtype].filename || got.name || `wecom-${msg.msgid}.${{ voice: 'amr', video: 'mp4' }[msg.msgtype] ?? 'bin'}`, data: got.data })
           }
-          await handlers.onMessage({ messageId: msg.msgid, chat: { key: user, kind: 'direct' }, sender: { id: user, name: user }, text: msg.text?.content ?? '', images, files })
+          await handlers.onMessage({ messageId: msg.msgid, chat: { key: user, kind: 'direct' }, sender: { id: user, name: user }, text, images, files })
         }
         if (stopped) return
         if (answer.next_cursor !== undefined) env.runtime.set({ cursor: answer.next_cursor })
