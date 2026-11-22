@@ -2464,7 +2464,7 @@ test('reply origin: unbinding or rebinding the chat stops a running group turn f
   assert.equal(s.fake.sent.length, 0, 'a rebound chat gets no lines from the old target')
 })
 
-test('reply origin: context before a member result that wakes the group preserves its chat', async (t) => {
+test('reply origin: runtime context does not consume a group pending reset before a late member result', async (t) => {
   const s = await start()
   t.after(s.stop)
   const { one } = await pairedConn(s)
@@ -2474,6 +2474,9 @@ test('reply origin: context before a member result that wakes the group preserve
   await gm(s, 'u1', 'hello group')
   s.imTurn('r1')
   s.emitEvent('r1', 'turn/end', {})
+  assert.equal(s.rt.roomActive('r1'), false)
+  assert.equal([...s.rt.groupOwners].some(([id, owner]) => owner.roomId === 'r1' && s.rt.live.get(id)?.turn !== undefined), false)
+  assert.equal([...s.rt.switchJobs()].some(job => job.roomId === 'r1'), false)
   s.fake.sent.length = 0
   // The last member finishes after the relay turn ended: the host posts its result into
   // the group's own Session and starts a turn for it. The turn starts (and looks idle)
