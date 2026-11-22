@@ -27,27 +27,42 @@ const TOOLS = [
   {
     name: 'mac_enqueue_job',
     description:
-      'Enqueue a Mac-specific job for the user Mac mini (Xcode, iOS simulator, Swift/macOS builds, ParaDev local coding agents, or local Mac DS Bot). Returns job_id and whether the Mac worker is currently online. Results are posted back into this conversation when finished.',
+      'Enqueue a Mac-specific job for the user Mac mini, routed directly to the local Mac DS Bot.app via MCP (target="dsbot", default) or fast local git sync (target="git_sync"). Returns job_id and whether the Mac worker is currently online. Results are posted back into this conversation when finished.',
     inputSchema: {
       type: 'object',
       properties: {
         target: {
           type: 'string',
-          enum: ['paradev', 'dsbot', 'git_sync'],
+          enum: ['dsbot', 'git_sync'],
           description:
-            'paradev for local Mac coding/Xcode/repo tasks via ParaDev agents; dsbot for local Mac DS Bot tasks; git_sync for fast local git push/pull/repo bootstrap.',
+            'dsbot (default) sends directly to local Mac DS Bot.app via MCP (target Bot or Group); git_sync runs fast local git push/pull.',
         },
         task: {
           type: 'string',
           description: 'Clear, self-contained task description for the Mac mini.',
         },
+        bot: {
+          type: 'string',
+          description:
+            'Optional target Bot name or ID on local Mac DS Bot when target="dsbot" (defaults to Main Bot, e.g. Chief).',
+        },
+        group: {
+          type: 'string',
+          description:
+            'Optional target Group name or ID on local Mac DS Bot when target="dsbot" (send_to_group).',
+        },
         repo: {
           type: 'string',
-          description: 'Optional repo or ParaDev workspace name/path.',
+          description: 'Optional repo name or local path.',
         },
         branch: {
           type: 'string',
           description: 'Optional git branch name.',
+        },
+        cwd: {
+          type: 'string',
+          description:
+            'Optional authorized local directory path on the Mac mini.',
         },
         timeout_sec: {
           type: 'integer',
@@ -57,52 +72,12 @@ const TOOLS = [
           type: 'string',
           description: 'Optional deduplication key for retries.',
         },
-        workspace_id: {
-          type: 'string',
-          description:
-            'Optional existing ParaDev workspace ID on the Mac mini to reuse (for follow-ups or launching a reviewer in the same workspace).',
-        },
-        terminal_id: {
-          type: 'string',
-          description:
-            'Optional existing ParaDev terminal/session ID inside workspace_id to send a follow-up message to.',
-        },
-        agent: {
-          type: 'string',
-          enum: ['codex', 'devin', 'claude', 'dsbot'],
-          description: 'Optional ParaDev agent preset (default codex).',
-        },
-        cwd: {
-          type: 'string',
-          description:
-            'Optional authorized local directory path on the Mac mini (for local-only or non-GitHub work).',
-        },
-        local_only: {
-          type: 'boolean',
-          description: 'Set true for local Mac folders/projects that do not exist on GitHub.',
-        },
-        role: {
-          type: 'string',
-          enum: ['worker', 'reviewer'],
-          description:
-            'Role in the ParaDev workspace: worker (default implementer) or reviewer (separate review terminal in the same workspace).',
-        },
-        bot: {
-          type: 'string',
-          description:
-            'Optional target Bot name or ID on local Mac DS Bot when target="dsbot" (defaults to Main Bot).',
-        },
-        group: {
-          type: 'string',
-          description:
-            'Optional target Group name or ID on local Mac DS Bot when target="dsbot" (send_to_group).',
-        },
         aws_session_id: {
           type: 'string',
           description: 'Optional AWS ds-bot session ID to receive completion callback.',
         },
       },
-      required: ['target', 'task'],
+      required: ['task'],
     },
   },
   {
@@ -142,31 +117,6 @@ const TOOLS = [
     },
   },
   {
-    name: 'mac_register_paradev_repo',
-    description:
-      'Check whether a repository is already registered in ParaDev on the Mac mini, and register/clone it if missing. Call this before operating on a repository so ParaDev on the Mac mini stays synced.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        repo: {
-          type: 'string',
-          description:
-            'Repository name, owner/repo (e.g. callingforhelp/Astra-Ares), GitHub URL, or Mac local path.',
-        },
-        cwd: {
-          type: 'string',
-          description:
-            'Optional authorized local directory path on the Mac mini (for local-only or non-GitHub work).',
-        },
-        local_only: {
-          type: 'boolean',
-          description: 'Set true for local Mac folders/projects that do not exist on GitHub.',
-        },
-      },
-      required: ['repo'],
-    },
-  },
-  {
     name: 'mac_git_sync',
     description:
       'Run a fast local git sync job on the Mac mini: push uncommitted/unpushed local commits (auto-committing a WIP branch if dirty, and creating a private GitHub remote via gh repo create if create_if_missing is true) OR pull remote cloud changes down to the Mac mini.',
@@ -192,17 +142,6 @@ const TOOLS = [
         },
       },
       required: ['repo'],
-    },
-  },
-  {
-    name: 'mac_list_paradev_sessions',
-    description:
-      'List active ParaDev workspace and terminal mappings (workspace_id, worker_terminal_id, reviewer_terminal_id, repo, cwd, branch) persisted from Mac mini jobs.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'integer', description: 'Max sessions to return (default 20).' },
-      },
     },
   },
   {
@@ -298,18 +237,13 @@ function replyError(id, code, message) {
 async function handleToolCall(name, args) {
   if (name === 'mac_enqueue_job') {
     const res = await brokerRequest('POST', '/v1/jobs', {
-      target: args?.target || 'paradev',
+      target: args?.target || 'dsbot',
       task: args?.task || '',
       repo: args?.repo,
       branch: args?.branch,
       timeout_sec: args?.timeout_sec,
       idempotency_key: args?.idempotency_key,
-      workspace_id: args?.workspace_id,
-      terminal_id: args?.terminal_id,
-      agent: args?.agent,
       cwd: args?.cwd,
-      local_only: Boolean(args?.local_only),
-      role: args?.role,
       bot: args?.bot,
       group: args?.group,
       aws_session_id: args?.aws_session_id || DEFAULT_SESSION_ID,
@@ -346,22 +280,6 @@ async function handleToolCall(name, args) {
       isError: res.status >= 400,
     };
   }
-  if (name === 'mac_register_paradev_repo') {
-    const repo = String(args?.repo || '').trim();
-    const res = await brokerRequest('POST', '/v1/jobs', {
-      target: 'paradev_register',
-      task: `Ensure ParaDev repo registered: ${repo}`,
-      repo,
-      cwd: args?.cwd,
-      local_only: Boolean(args?.local_only),
-      timeout_sec: 120,
-      aws_session_id: DEFAULT_SESSION_ID,
-    });
-    return {
-      content: [{ type: 'text', text: JSON.stringify(res.data, null, 2) }],
-      isError: res.status >= 400,
-    };
-  }
   if (name === 'mac_git_sync') {
     const action = args?.action === 'pull' ? 'pull' : 'push';
     const repo = String(args?.repo || '').trim();
@@ -379,16 +297,6 @@ async function handleToolCall(name, args) {
       timeout_sec: 180,
       aws_session_id: DEFAULT_SESSION_ID,
     });
-    return {
-      content: [{ type: 'text', text: JSON.stringify(res.data, null, 2) }],
-      isError: res.status >= 400,
-    };
-  }
-  if (name === 'mac_list_paradev_sessions') {
-    const params = new URLSearchParams();
-    if (args?.limit) params.set('limit', String(args.limit));
-    const q = params.toString();
-    const res = await brokerRequest('GET', `/v1/paradev/sessions${q ? `?${q}` : ''}`);
     return {
       content: [{ type: 'text', text: JSON.stringify(res.data, null, 2) }],
       isError: res.status >= 400,
