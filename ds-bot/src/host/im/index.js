@@ -47,6 +47,7 @@ export function install(rt) {
         unboundGroup: 'This group is not bound yet; pick a group or a Bot for it in DS Bot Settings → IM.',
         readonly: 'This DS Bot window is read-only because the team is open somewhere else. Nothing was sent to the Bot; close the other window and send again.',
         uncertain: 'This message was received earlier, but DS Bot could not confirm that it finished. Check this chat on the computer; send it again only if the reply is missing.',
+        unavailable: 'Sorry, your conversation could not be opened. Please try sending your message again later.',
         connected: `Connected — you can talk to ${values.target} now.`,
         stopped: 'Stopped.',
         idle: 'Nothing is running.',
@@ -69,6 +70,7 @@ export function install(rt) {
         unboundGroup: '这个群还没绑定，请在 DS Bot 设置 → IM 里给它选一个群或 Bot。',
         readonly: '这个 DS Bot 窗口处于只读状态，因为团队正在别处打开。消息没有发给 Bot，请关掉另一个窗口后重发。',
         uncertain: '这条消息之前已经收到，但 DS Bot 无法确认它是否完成。请先在电脑上查看这个对话；只有回复确实缺失时再发一次。',
+        unavailable: '抱歉，暂时无法打开您的会话，请稍后重新发送消息。',
         connected: `已连接，现在可以和 ${values.target} 说话了。`,
         stopped: '已停下。',
         idle: '现在没有在做的活。',
@@ -864,6 +866,7 @@ export function install(rt) {
     }
     await send()
   }
+  const customerFailures = new Map()
   const onMessage = (conn) => async (msg) => {
     if (msg.sender.bot === true) return
     if (!paired(conn, msg.sender.id)) {
@@ -882,6 +885,26 @@ export function install(rt) {
     if (rt.readOnly() !== undefined) {
       await sendText(conn, msg.chat, text('readonly'))
       return
+    }
+    if (imPlatform(conn.platform)?.public === true && msg.chat.kind === 'direct') {
+      const target = resolveTarget(conn, conn.chats[msg.chat.key])
+      if (target?.botId !== undefined) {
+        const key = JSON.stringify([conn.id, msg.chat.key])
+        try {
+          await rt.customerPart(target.botId, conn.id, msg.chat.key)
+          customerFailures.delete(key)
+        } catch (error) {
+          const attempts = (customerFailures.get(key) ?? 0) + 1
+          if (attempts < 3 && error?.permanent !== true) {
+            customerFailures.set(key, attempts)
+            throw Object.assign(new Error('Customer conversation could not be opened', { cause: error }), { retryInbound: true })
+          }
+          customerFailures.delete(key)
+          rt.warn('ds-bot: customer conversation failed: %s', reasonOf(error))
+          await sendText(conn, msg.chat, text('unavailable'))
+          return
+        }
+      }
     }
     if (typeof msg.messageId === 'string' && msg.messageId !== '') {
       const event = rt.requestIdentity({ caller: `im:${conn.id}`, context: msg.chat.key, name: msg.messageId, payload: msg.sender.id })
@@ -1117,7 +1140,10 @@ export function install(rt) {
       const handle = adapter.connect(fieldsOf(conn), env, {
         onMessage: (msg) => {
           const current = fresh(conn.id)
-          return current === undefined ? undefined : onMessage(current)(msg).catch(error => rt.warn('ds-bot: im message failed: %s', error))
+          return current === undefined ? undefined : onMessage(current)(msg).catch(error => {
+            rt.warn('ds-bot: im message failed: %s', reasonOf(error))
+            if (error?.retryInbound === true) throw error
+          })
         },
         onAction: (action) => {
           const current = fresh(conn.id)

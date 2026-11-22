@@ -71,6 +71,30 @@ test('kf pages sync, filters origins and old backlog, persists cursor', async ()
   } finally { clearTimeout(timeout); conn.stop() }
 })
 
+test('kf retries the same page after inbound delivery fails without advancing its cursor', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const page = { next_cursor: 'delivered', msg_list: [{ origin: 3, send_time: Date.now() / 1000, msgid: 'first', external_userid: 'customer', msgtype: 'text', text: { content: 'hello' } }] }
+  const env = fake({ sync_msg: [page, page] })
+  let failed, delivered
+  const failure = new Promise(resolve => { failed = resolve })
+  const success = new Promise(resolve => { delivered = resolve })
+  let attempts = 0
+  const conn = adapter.connect(fields, env, {
+    onStatus(status) { if (status.state === 'error') failed(); if (status.state === 'ready') delivered() },
+    async onMessage() { if (++attempts === 1) throw new Error('thread setup failed') },
+  })
+  try {
+    await failure
+    assert.equal(env.runtime.get().cursor, undefined)
+    await new Promise(setImmediate)
+    t.mock.timers.tick(6000)
+    await success
+    assert.equal(attempts, 2)
+    assert.deepEqual(env.calls.filter(call => call.path === 'sync_msg').map(call => call.body.cursor), ['', ''])
+    assert.equal(env.runtime.get().cursor, 'delivered')
+  } finally { conn.stop() }
+})
+
 test('kf downloads customer media as images and original file bytes', async () => {
   const env = fake()
   env.runtime.set({ cursor: 'previous', cursorAccountId: 'kf-test' })

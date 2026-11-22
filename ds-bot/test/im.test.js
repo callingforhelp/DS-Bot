@@ -359,6 +359,36 @@ test('customer permission failures archive the fresh session and never register 
   assert.equal(await s.rt.customerPart('a', conn.id, 'dm-first'), 'customer-2')
 })
 
+test('failed customer setup leaves no receipt and retries the same inbound message', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  const create = s.rt.customerPart
+  s.rt.customerPart = async () => { throw new Error('temporarily unavailable') }
+  await assert.rejects(dm(s, 'customer', 'first message', { messageId: 'first' }), /could not be opened/)
+  assert.equal(Object.keys(s.rt.state.requests ?? {}).length, 0)
+  assert.equal(s.prompts.length, 0)
+  s.rt.customerPart = create
+  await dm(s, 'customer', 'first message', { messageId: 'first' })
+  assert.equal(s.prompts.length, 1)
+  assert.match(s.prompts[0].content[0].text, /first message/)
+})
+
+test('persistent customer setup failure reports an apology instead of blocking the inbox forever', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  const warnings = []
+  s.rt.warn = (...args) => warnings.push(args)
+  s.rt.customerPart = async () => { throw new Error('unavailable') }
+  for (let i = 0; i < 2; i++) await assert.rejects(dm(s, 'customer', 'first', { messageId: 'first' }), /could not be opened/)
+  await dm(s, 'customer', 'first', { messageId: 'first' })
+  await s.flush()
+  assert.match(s.fake.sent.at(-1).text, /Sorry.*try sending your message again later/)
+  assert.ok(warnings.some(args => args[0].includes('customer conversation failed')))
+  assert.equal(s.prompts.length, 0)
+})
+
 test('triage tools restrict current and historical customer parts but not normal conversations', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
