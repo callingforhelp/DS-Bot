@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -133,6 +133,53 @@ const dm = (s, senderId, text, extra = {}) => s.fake.handlers.onMessage({
 })
 const gm = (s, senderId, text, { mentioned = true, chat = { key: 'g1', kind: 'group', title: 'Group One' }, ...extra } = {}) => s.fake.handlers.onMessage({
   chat, sender: { id: senderId, name: `User ${senderId}` }, text, mentioned, ...extra,
+})
+
+test('WeCom startup seeds once through secret-set and sign-in never writes the env file', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ds-im-seed-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, '.env')
+  const content = 'OTHER=kept\nWECOM_CORP_ID=fake-corp\nWECOM_KF_SECRET=fake-seed-secret\nWECOM_KF_OPEN_KFID=fake-account\n'
+  writeFileSync(path, content)
+  const previous = process.env.DSBOT_ENV_FILE
+  process.env.DSBOT_ENV_FILE = path
+  t.after(() => { process.env.DSBOT_ENV_FILE = previous })
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  for (let i = 0; i < 100 && !s.fake.handlers; i++) await s.flush()
+  const conns = Object.values(s.rt.state.im.connections)
+  assert.equal(conns.length, 1)
+  const conn = conns[0]
+  assert.equal(conn.platform, 'wecom_kf')
+  assert.equal(conn.botId, 'a')
+  assert.deepEqual(conn.settings, { corpId: 'fake-corp', openKfId: 'fake-account' })
+  assert.equal(s.rt.secretValue(conn.secrets.secret), 'fake-seed-secret')
+  assert.equal(JSON.stringify(s.rt.imView()).includes('fake-seed-secret'), false)
+  assert.equal(readFileSync(join(s.home, 'state.json'), 'utf8').includes('fake-seed-secret'), false)
+  await s.rt.imEndpoint('im-update', { id: conn.id, fields: { secret: 'fake-updated-secret' } })
+  assert.equal(s.rt.secretValue(conn.secrets.secret), 'fake-updated-secret')
+  assert.equal(readFileSync(path, 'utf8'), content)
+  await s.rt.imEndpoint('im-add', { platform: 'wecom_kf', botId: 'a', fields: { corpId: 'manual', secret: 'fake-manual-secret' } })
+  assert.equal(readFileSync(path, 'utf8'), content)
+})
+
+test('WeCom startup never replaces an existing connection with an env seed', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ds-im-existing-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, '.env')
+  writeFileSync(path, 'WECOM_CORP_ID=unused\nWECOM_KF_SECRET=fake-unused-secret\n')
+  const previous = process.env.DSBOT_ENV_FILE
+  process.env.DSBOT_ENV_FILE = path
+  t.after(() => { process.env.DSBOT_ENV_FILE = previous })
+  const seed = TEAM()
+  seed.im = { connections: { existing: { id: 'existing', platform: 'wecom_kf', botId: 'b', enabled: false, settings: { corpId: 'keep' }, secrets: {} } } }
+  const s = await start({ platform: 'wecom_kf', seed })
+  t.after(s.stop)
+  await s.rt.load()
+  await s.flush()
+  assert.deepEqual(Object.keys(s.rt.state.im.connections), ['existing'])
+  assert.equal(s.rt.state.im.connections.existing.settings.corpId, 'keep')
+  assert.equal(s.rt.state.im.connections.existing.botId, 'b')
 })
 
 test('public customer platforms admit strangers but refuse control commands and card answers', async (t) => {

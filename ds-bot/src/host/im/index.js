@@ -13,6 +13,7 @@ import { adapters } from './platforms/index.js'
 import { summarizeStep } from './step.js'
 import { imText } from './texts.js'
 import { CustomerFailures } from './customer-failures.js'
+import { readWecomEnv } from './env.js'
 
 const RECONCILE_MS = 15_000
 const RUNTIME_SAVE_MS = 400
@@ -1106,6 +1107,26 @@ export function install(rt) {
     }
   }
 
+  const seedWecom = async () => {
+    const exists = () => Object.values(connections()).some(conn => conn.platform === 'wecom_kf')
+    if (stopped || rt.readOnly() !== undefined || exists()) return
+    const fields = await readWecomEnv()
+    if (!fields || stopped || rt.readOnly() !== undefined || exists()) return
+    const botId = state.mainBotIds.find(id => rt.botOf(id)) ?? Object.keys(state.bots)[0] ?? null
+    const conn = {
+      id: `im_${randomBytes(4).toString('hex')}`, platform: 'wecom_kf', botId,
+      settings: { corpId: fields.corpId, openKfId: fields.openKfId }, secrets: {},
+      enabled: botId !== null, paired: [], requests: [], chats: {}, createdAt: Date.now(),
+    }
+    await saveSecrets(conn, imPlatform('wecom_kf'), fields)
+    if (stopped || rt.readOnly() !== undefined || exists()) {
+      for (const name of Object.values(conn.secrets)) await rt.secretEndpoint('secret-delete', { name }).catch(() => {})
+      return
+    }
+    connections()[conn.id] = conn
+    await rt.save({ required: true })
+  }
+
   const viewOf = (conn) => ({
     id: conn.id,
     platform: conn.platform,
@@ -1452,12 +1473,14 @@ export function install(rt) {
       void rt.refresh().then(() => sync()).catch(() => {})
     }, RECONCILE_MS)
     interval.unref?.()
-    void rt.load().then(() => sync()).catch(() => {})
+    const startup = rt.load().then(seedWecom).catch(() => {
+      rt.warn('ds-bot: WeCom environment seed could not be initialized; check IM settings and the secret store')
+    }).then(() => sync()).catch(() => {})
     return () => {
       stopped = true
       clearInterval(interval)
       resumedOrigins.clear()
-      return Promise.all([...runners.keys()].map(stop)).then(async () => {
+      return startup.then(() => Promise.all([...runners.keys()].map(stop))).then(async () => {
         for (const held of runtimes.values()) if (held.timer !== undefined) clearTimeout(held.timer)
         await Promise.all([...runtimes.keys()].map(writeRuntime)).catch(() => {})
       })
