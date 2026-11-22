@@ -19,6 +19,7 @@ const RETRY_MS = 5_000
 // message cannot hold every later message in the same chat forever (#1417).
 const RETRY_MAX_MS = 30_000
 const SEND_ATTEMPTS = 4
+const CUSTOMER_ATTEMPTS = 3
 const TYPING_MS = 4_000
 const NUMBERS = /^\s*\d+(\s+\d+)*\s*$/
 
@@ -889,17 +890,20 @@ export function install(rt) {
     if (imPlatform(conn.platform)?.public === true && msg.chat.kind === 'direct') {
       const target = resolveTarget(conn, conn.chats[msg.chat.key])
       if (target?.botId !== undefined) {
-        const key = JSON.stringify([conn.id, msg.chat.key])
+        const key = typeof msg.messageId === 'string' && msg.messageId !== ''
+          ? JSON.stringify([conn.id, msg.chat.key, msg.sender.id, msg.messageId]) : undefined
+        if (key !== undefined && customerFailures.get(key) >= CUSTOMER_ATTEMPTS) return
         try {
           await rt.customerPart(target.botId, conn.id, msg.chat.key)
-          customerFailures.delete(key)
+          if (key !== undefined) customerFailures.delete(key)
         } catch (error) {
           const attempts = (customerFailures.get(key) ?? 0) + 1
-          if (attempts < 3 && error?.permanent !== true) {
+          if (key !== undefined && attempts < CUSTOMER_ATTEMPTS && error?.permanent !== true) {
             customerFailures.set(key, attempts)
             throw Object.assign(new Error('Customer conversation could not be opened', { cause: error }), { retryInbound: true })
           }
-          customerFailures.delete(key)
+          // A sync-page replay must not renew an exhausted message's retry budget.
+          if (key !== undefined) customerFailures.set(key, CUSTOMER_ATTEMPTS)
           rt.warn('ds-bot: customer conversation failed: %s', reasonOf(error))
           await sendText(conn, msg.chat, text('unavailable'))
           return

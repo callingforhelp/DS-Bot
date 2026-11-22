@@ -390,6 +390,52 @@ test('persistent customer setup failure reports an apology instead of blocking t
   assert.equal(s.prompts.length, 0)
 })
 
+test('replaying a page with several failing messages still reaches later customers within bounded polls', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  const create = s.rt.customerPart
+  let failures = 0
+  s.rt.customerPart = async (botId, connId, chatKey) => {
+    if (chatKey === 'dm-broken') { failures++; throw new Error('setup unavailable') }
+    return create(botId, connId, chatKey)
+  }
+  const page = [
+    ...['first', 'second', 'third'].map(messageId => ({ sender: 'broken', messageId })),
+    { sender: 'healthy', messageId: 'fourth' },
+  ]
+  let polls = 0
+  let advanced = false
+  while (!advanced && polls < 7) {
+    polls++
+    try {
+      for (const msg of page) await dm(s, msg.sender, msg.messageId, { messageId: msg.messageId })
+      advanced = true
+    } catch (error) { assert.equal(error.retryInbound, true) }
+  }
+  assert.equal(advanced, true)
+  assert.equal(polls, 7)
+  assert.equal(failures, 9)
+  assert.equal(s.prompts.length, 1)
+  assert.match(s.prompts[0].content[0].text, /fourth/)
+  for (const msg of page) await dm(s, msg.sender, msg.messageId, { messageId: msg.messageId })
+  await s.flush()
+  assert.equal(failures, 9, 'exhausted messages stay exhausted on later replays')
+  assert.equal(s.prompts.length, 1)
+  assert.equal(s.fake.sent.length, 3, 'each exhausted message receives only one apology')
+})
+
+test('customer messages without IDs fail visibly without an unidentifiable retry budget', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  s.rt.customerPart = async () => { throw new Error('setup unavailable') }
+  await dm(s, 'customer', 'first')
+  await s.flush()
+  assert.match(s.fake.sent.at(-1).text, /Sorry/)
+  assert.equal(s.prompts.length, 0)
+})
+
 test('triage tools restrict current and historical customer parts but not normal conversations', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
