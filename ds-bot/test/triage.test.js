@@ -347,6 +347,22 @@ test('triage ranks Chinese cases, publishes sanitized rules and reviews once', a
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test('triage outcome rejects an unregistered correction route without changing stored cases', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  const bank = triageBank(dir)
+  const call = async args => JSON.parse(await bank(args))
+  try {
+    const { id } = await call({ action: 'log', customer: 'Customer', summary: 'Quote request', routed_to: 'Sales', reason: 'Quotation' })
+    const path = join(dir, 'triage', 'cases.jsonl')
+    const before = await readFile(path, 'utf8')
+    await assert.rejects(
+      bank({ action: 'outcome', id, result: 'misrouted', correct_route: 'Quote Bot', lesson: 'Move to quotation team' }),
+      /correct_route must be a registered agent type ID\. Available types: quote, drawing_review, order_status, after_sales/,
+    )
+    assert.equal(await readFile(path, 'utf8'), before)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test('pending case lessons survive review and clear only after a later linked rule', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: 1000 })
   const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
@@ -442,7 +458,7 @@ test('triage review retains misroutes that were subsequently resolved', async (t
     t.mock.timers.setTime(1500)
     await call({ action: 'review' })
     t.mock.timers.setTime(2000)
-    await call({ action: 'outcome', id, result: 'misrouted', correct_route: 'engineering', lesson: 'Check the drawing' })
+    await call({ action: 'outcome', id, result: 'misrouted', correct_route: 'drawing_review', lesson: 'Check the drawing' })
     t.mock.timers.setTime(3000)
     await call({ action: 'outcome', id, result: 'resolved' })
     t.mock.timers.setTime(4000)
@@ -451,7 +467,7 @@ test('triage review retains misroutes that were subsequently resolved', async (t
     assert.equal(review.misroutes.length, 1)
     assert.equal(review.misroutes[0].outcome.result, 'resolved')
     assert.equal(review.misroutes[0].misrouted_at, 2000)
-    assert.deepEqual(review.misroutes[0].misroute, { at: 2000, correct_route: 'engineering', lesson: 'Check the drawing' })
+    assert.deepEqual(review.misroutes[0].misroute, { at: 2000, correct_route: 'drawing_review', lesson: 'Check the drawing' })
     const stored = JSON.parse((await readFile(join(dir, 'triage', 'cases.jsonl'), 'utf8')).trim())
     assert.deepEqual(stored.misroute, review.misroutes[0].misroute)
     assert.equal(stored.misroute.result, undefined)
@@ -470,7 +486,7 @@ test('triage outcome writes evict oldest cases and compact legacy misroute recor
     const path = join(dir, 'triage', 'cases.jsonl')
     await mkdir(join(dir, 'triage'))
     await writeFile(path, line.repeat(count) + JSON.stringify({ id: 'padding', summary: 'x'.repeat(padding) }) + '\n' + target)
-    await triageBank(dir)({ action: 'outcome', id: 'target', result: 'misrouted', correct_route: 'r'.repeat(4000), lesson: 'l'.repeat(4000) })
+    await triageBank(dir)({ action: 'outcome', id: 'target', result: 'misrouted', correct_route: 'drawing_review', lesson: 'l'.repeat(4000) })
     const stored = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     assert.ok((await stat(path)).size <= limit)
     assert.equal(stored.filter(item => item.id === 'oldest').length, count - 1)

@@ -281,10 +281,15 @@ export function triageBank(home, writable = () => {}, rt) {
       } else if (args.action === 'outcome') {
         const entry = cases.find(item => item.id === args.id)
         if (!entry) throw new Error('Triage case not found')
-        retained = entry
         if (!['correct', 'misrouted', 'resolved'].includes(args.result)) throw new Error('Invalid outcome')
+        const correctRoute = clean(args.correct_route)
+        if (correctRoute) {
+          const registered = new Set(typesOf(await read('config.json', { judges: [], threshold: 0.7 })).map(type => type.type))
+          if (!registered.has(correctRoute)) throw new Error(`correct_route must be a registered agent type ID. Available types: ${[...registered].join(', ')}`)
+        }
+        retained = entry
         if (entry.outcome?.result === 'misrouted') entry.misroute = misrouteDetails(entry.outcome)
-        entry.outcome = { result: args.result, correct_route: clean(args.correct_route), lesson: clean(args.lesson), at: now }
+        entry.outcome = { result: args.result, correct_route: correctRoute, lesson: clean(args.lesson), at: now }
         if (args.result === 'misrouted') { entry.misrouted_at = now; delete entry.misroute }
         result = entry
       } else if (args.action === 'rules') {
