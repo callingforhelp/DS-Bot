@@ -100,3 +100,38 @@ test('triage outcome writes evict oldest cases and compact legacy misroute recor
     assert.equal(stored.at(-1).outcome.result, 'misrouted')
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+
+test('triage outcome eviction preserves the oldest case being updated', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  try {
+    const limit = 16 * 1024 * 1024
+    const target = JSON.stringify({ id: 'target', outcome: { result: 'misrouted', at: 100, correct_route: 'engineering', lesson: 'Inspect the drawing' } }) + '\n'
+    const line = JSON.stringify({ id: 'other', summary: 'x'.repeat(20000) }) + '\n'
+    const count = Math.floor((limit - 1000 - Buffer.byteLength(target)) / Buffer.byteLength(line))
+    const padding = limit - 1000 - Buffer.byteLength(target) - count * Buffer.byteLength(line)
+    const path = join(dir, 'triage', 'cases.jsonl')
+    await mkdir(join(dir, 'triage'))
+    await writeFile(path, target + line.repeat(count) + JSON.stringify({ id: 'padding', summary: 'x'.repeat(padding) }) + '\n')
+    await triageBank(dir)({ action: 'outcome', id: 'target', result: 'resolved', lesson: 'l'.repeat(4000) })
+    const stored = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    assert.ok((await stat(path)).size <= limit)
+    assert.equal(stored[0].id, 'target')
+    assert.equal(stored[0].outcome.result, 'resolved')
+    assert.equal(stored[0].misroute.lesson, 'Inspect the drawing')
+    assert.equal(stored.filter(item => item.id === 'other').length, count - 1)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('triage rejects an outcome that cannot fit alone without changing stored cases', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  try {
+    const limit = 16 * 1024 * 1024
+    const base = JSON.stringify({ id: 'target', summary: '' }) + '\n'
+    const source = JSON.stringify({ id: 'target', summary: 'x'.repeat(limit - Buffer.byteLength(base) - 100) }) + '\n'
+    const path = join(dir, 'triage', 'cases.jsonl')
+    await mkdir(join(dir, 'triage'))
+    await writeFile(path, source)
+    await assert.rejects(triageBank(dir)({ action: 'outcome', id: 'target', result: 'resolved', lesson: 'l'.repeat(4000) }), /size limit/)
+    assert.equal(await readFile(path, 'utf8'), source)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})

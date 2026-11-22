@@ -39,14 +39,17 @@ export function triageBank(home, writable = () => {}) {
     writable()
     await replaceFile(temp, path, writable)
   }
-  const writeCases = async (cases) => {
+  const writeCases = async (cases, retained) => {
     for (const entry of cases) {
       if (entry.misroute !== undefined) entry.misroute = misrouteDetails(entry.misroute)
     }
     const lines = cases.map(item => JSON.stringify(item) + '\n')
     let bytes = lines.reduce((size, line) => size + Buffer.byteLength(line), 0)
     while ((bytes > MAX_BYTES || lines.length > MAX_CASES) && lines.length > 1) {
-      bytes -= Buffer.byteLength(lines.shift())
+      const index = cases.findIndex(entry => entry !== retained)
+      if (index === -1) break
+      bytes -= Buffer.byteLength(lines.splice(index, 1)[0])
+      cases.splice(index, 1)
     }
     await write('cases.jsonl', lines.join(''))
   }
@@ -64,6 +67,7 @@ export function triageBank(home, writable = () => {}) {
         return rule
       }
       let result
+      let retained
       if (args.action === 'recall') {
         const query = terms(args.query)
         const ranked = cases.map(item => ({ ...item, score: overlap(query, terms([item.summary, item.attachments_summary, item.reason].join(' '))) }))
@@ -75,10 +79,12 @@ export function triageBank(home, writable = () => {}) {
         const entry = { id: randomUUID(), created: now }
         for (const key of ['customer', 'summary', 'attachments_summary', 'routed_to', 'reason']) entry[key] = clean(args[key])
         cases.push(entry)
+        retained = entry
         result = { id: entry.id }
       } else if (args.action === 'outcome') {
         const entry = cases.find(item => item.id === args.id)
         if (!entry) throw new Error('Triage case not found')
+        retained = entry
         if (!['correct', 'misrouted', 'resolved'].includes(args.result)) throw new Error('Invalid outcome')
         if (entry.outcome?.result === 'misrouted') entry.misroute = misrouteDetails(entry.outcome)
         entry.outcome = { result: args.result, correct_route: clean(args.correct_route), lesson: clean(args.lesson), at: now }
@@ -96,7 +102,7 @@ export function triageBank(home, writable = () => {}) {
         result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes, rules: state.rules }
         state.reviewed = now
       } else throw new Error('Unknown triage action')
-      if (['log', 'outcome'].includes(args.action)) await writeCases(cases)
+      if (['log', 'outcome'].includes(args.action)) await writeCases(cases, retained)
       await write('rules.json', JSON.stringify(state))
       return JSON.stringify(result)
     }
