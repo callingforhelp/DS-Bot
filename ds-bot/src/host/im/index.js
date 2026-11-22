@@ -696,7 +696,7 @@ export function install(rt) {
 
   // One card this chat was sent and has not answered yet. A button names its own
   // card, so it must never fall through to a newer card of the same kind.
-  const wasDelivered = entry => entry.delivered === true || entry.messageId !== undefined
+  const wasDelivered = entry => entry.delivered !== false
   const openCard = (conn, chatKey, cardKey) => {
     const entries = runtimes.get(conn.id)?.data?.cards[cardKey]
     const entry = entries?.find(item => item.chatKey === chatKey && item.answer === undefined && wasDelivered(item))
@@ -942,7 +942,7 @@ export function install(rt) {
     const pending = targets.filter(({ chatKey }) => !recorded.has(chatKey))
     if (pending.length === 0) return
     // Reserve pending chats synchronously before enqueueing so concurrent diffs cannot double-send.
-    for (const { chatKey } of pending) entries.push({ chatKey, messageId: undefined, text: body })
+    for (const { chatKey } of pending) entries.push({ chatKey, messageId: undefined, text: body, delivered: false })
     scheduleWrite(conn.id)
     for (const { chatKey, chat } of pending) {
       enqueue(conn, chatKey, {

@@ -64,9 +64,11 @@ const TEAM = () => ({
   revision: 0,
 })
 
-async function start({ platform = 'telegram', adapter, seed, services = {} } = {}) {
+async function start({ platform = 'telegram', adapter, seed, services = {}, runtime = {} } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'dsb-im-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(seed ?? TEAM()))
+  mkdirSync(join(home, 'im'))
+  for (const [id, data] of Object.entries(runtime)) writeFileSync(join(home, 'im', `${id}.json`), JSON.stringify(data))
   const ctx = fakeContext({ services })
   const prompts = []
   const agents = new Map()
@@ -226,6 +228,40 @@ test('replayed customer message IDs cannot answer twice or become prompts after 
   await dm(s, 'customer', '1', { messageId: 'answer-two' })
   assert.equal(s.rt.state.questions.a, undefined)
   assert.equal(s.agentOf('a').followed, 2)
+  assert.equal(s.prompts.length, 1)
+})
+
+test('legacy question cards without delivery flags or message IDs remain answerable', async (t) => {
+  const seed = TEAM()
+  seed.questions.a = { id: 'legacy-question', question: 'Which?', options: [{ label: 'yes' }] }
+  seed.im = { connections: { legacy: { id: 'legacy', platform: 'wecom_kf', botId: 'a', settings: {}, secrets: {}, enabled: true, paired: [], chats: { 'dm-customer': { kind: 'direct' } } } } }
+  const s = await start({ platform: 'wecom_kf', seed, runtime: { legacy: { cards: { 'q:legacy-question': [{ chatKey: 'dm-customer', text: '1. yes' }] } } } })
+  t.after(s.stop)
+  await s.rt.load()
+  await dm(s, 'customer', '1')
+  assert.equal(s.rt.state.questions.a, undefined)
+  assert.equal(s.agentOf('a').followed, 1)
+  assert.equal(s.prompts.length, 0)
+})
+
+test('a successful question send without a message ID remains answerable', async (t) => {
+  const adapter = fakeAdapter({ buttons: false })
+  const connect = adapter.connect
+  adapter.connect = (...args) => {
+    const handle = connect(...args)
+    return { ...handle, send: async (...args) => { await handle.send(...args) } }
+  }
+  const s = await start({ platform: 'wecom_kf', adapter })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer', 'hello')
+  s.imTurn('a')
+  s.rt.state.questions.a = { id: 'idless-question', question: 'Which?', options: [{ label: 'yes' }] }
+  await s.rt.save()
+  await s.flush()
+  await dm(s, 'customer', '1')
+  assert.equal(s.rt.state.questions.a, undefined)
+  assert.equal(s.agentOf('a').followed, 1)
   assert.equal(s.prompts.length, 1)
 })
 
