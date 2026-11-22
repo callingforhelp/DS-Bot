@@ -73,7 +73,7 @@ test('kf pages sync, filters origins and old backlog, persists cursor', async ()
 
 test('kf downloads customer media as images and original file bytes', async () => {
   const env = fake()
-  env.runtime.set({ cursor: 'previous' })
+  env.runtime.set({ cursor: 'previous', cursorAccountId: 'kf-test' })
   const originalFetch = env.fetch
   const types = ['image', 'file', 'voice', 'video']
   env.fetch = async (url, options) => {
@@ -149,6 +149,24 @@ test('kf marks failures after a delivered chunk permanent to prevent duplicate r
         return true
       })
       assert.equal(sends, failAt)
+    } finally { conn.stop() }
+  }
+})
+
+test('kf reuses a cursor only for the account that produced it', async () => {
+  for (const previousAccount of ['kf-test', 'old-account', undefined]) {
+    const env = fake()
+    env.runtime.set({ cursor: 'saved-cursor', cursorAccountId: previousAccount })
+    let finish
+    const done = new Promise(resolve => { finish = resolve })
+    const conn = adapter.connect(fields, env, { onStatus(status) { if (status.state === 'ready') finish() }, onMessage() {} })
+    try {
+      await done
+      const sync = env.calls.find(call => call.path === 'sync_msg')
+      assert.equal(sync.body.cursor, previousAccount === 'kf-test' ? 'saved-cursor' : '')
+      assert.equal(sync.body.open_kfid, 'kf-test')
+      assert.equal(env.runtime.get().cursorAccountId, 'kf-test')
+      assert.equal(env.runtime.get().cursor, 'idle')
     } finally { conn.stop() }
   }
 })

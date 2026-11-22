@@ -80,7 +80,7 @@ export default {
     let stopped = false
     let timer
     let delay = 3000
-    const cutoff = env.runtime.get().cursor === undefined ? Date.now() / 1000 - 86400 : 0
+    let cutoff
     let selected
     const select = () => {
       selected ??= api.account().catch(error => { selected = undefined; throw error })
@@ -89,7 +89,10 @@ export default {
     const poll = async () => {
       try {
         const account = await select()
-        const answer = await api.call('kf/sync_msg', { cursor: env.runtime.get().cursor ?? '', open_kfid: account.open_kfid, limit: 1000 })
+        const runtime = env.runtime.get()
+        const cursor = runtime.cursorAccountId === account.open_kfid ? runtime.cursor ?? '' : ''
+        cutoff ??= cursor ? 0 : Date.now() / 1000 - 86400
+        const answer = await api.call('kf/sync_msg', { cursor, open_kfid: account.open_kfid, limit: 1000 })
         if (!Array.isArray(answer.msg_list) || typeof answer.next_cursor !== 'string') throw new Error('WeCom Customer Service returned an unreadable sync response')
         for (const msg of answer.msg_list ?? []) {
           if (stopped) return
@@ -111,7 +114,7 @@ export default {
           await handlers.onMessage({ messageId: msg.msgid, chat: { key: user, kind: 'direct' }, sender: { id: user, name: user }, text, images, files })
         }
         if (stopped) return
-        if (answer.next_cursor !== undefined) env.runtime.set({ cursor: answer.next_cursor })
+        if (answer.next_cursor !== undefined) env.runtime.set({ cursor: answer.next_cursor, cursorAccountId: account.open_kfid })
         handlers.onStatus({ state: 'ready' })
         delay = answer.has_more ? 0 : (answer.msg_list?.length ? 3000 : Math.min(15000, Math.max(3000, delay * 2)))
       } catch (error) {
