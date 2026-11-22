@@ -771,20 +771,6 @@ export function install(rt) {
   }
 
   const receiveMessage = (conn) => async (msg) => {
-    if (msg.sender.bot === true) return
-    if (!paired(conn, msg.sender.id)) {
-      if (msg.chat.kind === 'group' && !msg.mentioned) return
-      if (!requested(conn, msg)) return
-      await rt.save()
-      await sendText(conn, msg.chat, text('requested'))
-      return
-    }
-    conn.chats ??= {}
-    if (msg.chat.kind === 'group' && !msg.mentioned) return
-    if (conn.chats[msg.chat.key] === undefined) {
-      conn.chats[msg.chat.key] = { kind: msg.chat.kind, title: msg.chat.title, at: Date.now() }
-      await rt.save()
-    }
     const body = String(msg.text ?? '').trim()
     const chat = conn.chats[msg.chat.key]
     const target = resolveTarget(conn, chat)
@@ -870,8 +856,24 @@ export function install(rt) {
     await send()
   }
   const onMessage = (conn) => async (msg) => {
-    if (msg.sender.bot === true || !paired(conn, msg.sender.id)
-      || (msg.chat.kind === 'group' && !msg.mentioned)) return receiveMessage(conn)(msg)
+    if (msg.sender.bot === true) return
+    if (!paired(conn, msg.sender.id)) {
+      if (msg.chat.kind === 'group' && !msg.mentioned) return
+      if (!requested(conn, msg)) return
+      await rt.save()
+      await sendText(conn, msg.chat, text('requested'))
+      return
+    }
+    conn.chats ??= {}
+    if (msg.chat.kind === 'group' && !msg.mentioned) return
+    if (conn.chats[msg.chat.key] === undefined) {
+      conn.chats[msg.chat.key] = { kind: msg.chat.kind, title: msg.chat.title, at: Date.now() }
+      await rt.save()
+    }
+    if (rt.readOnly() !== undefined) {
+      await sendText(conn, msg.chat, text('readonly'))
+      return
+    }
     if (typeof msg.messageId === 'string' && msg.messageId !== '') {
       const event = rt.requestIdentity({ caller: `im:${conn.id}`, context: msg.chat.key, name: msg.messageId, payload: msg.sender.id })
       // The lock can move between the check above and the admission; no receipt was
