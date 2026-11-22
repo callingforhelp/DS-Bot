@@ -24,9 +24,10 @@ const validType = entry => {
   return { ...entry, type: entry.type.trim(), handles: entry.handles.trim(), target: entry.target.trim(), permission: entry.permission.trim(), examples: entry.examples.map(example => example.trim()) }
 }
 const clean = value => String(value ?? '').trim().slice(0, 4000)
-const messageBotTargetAvailable = (rt, target, context) => {
+const messageBotTargetAvailable = (rt, target, context, { groupScoped = true } = {}) => {
   const senderBotId = context.botId ?? rt.taskOwners?.get(context.sessionId)?.botId ?? rt.chatOwners?.get(context.sessionId)
   if (target === undefined || target.id === senderBotId) return false
+  if (!groupScoped) return true
   const room = rt.roomOf?.(rt.groupOwners?.get(context.sessionId)?.roomId)
   return room === undefined || room.members?.includes(target.id) === true
 }
@@ -384,7 +385,7 @@ export function triageBank(home, writable = () => {}, rt) {
               const candidate = rt.findBot?.(entry.target)
               const model = candidate?.model ?? candidate?.appliedModel
               const localTarget = rt.localAgentBadge?.(model) !== undefined || rt.isLocalAgentRef?.(model) === true
-              return messageBotTargetAvailable(rt, candidate, context) && (!customerSession || !localTarget)
+              return messageBotTargetAvailable(rt, candidate, context, { groupScoped: false }) && (!customerSession || !localTarget)
             })(),
             method: entry.runtime === 'ds-bot' && entry.target ? 'message_bot' : 'staff',
           }))

@@ -250,9 +250,11 @@ test('staff votes may route to a local specialist while customer votes hand off'
   assert.equal(customer.decision, 'handoff')
   assert.equal(customer.route, 'triage_test_local')
   assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'triage_test_local', message: 'Please help' }), false)
+  const cases = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.equal(cases.at(-1).handoff.candidates.find(candidate => candidate.route === 'triage_test_local').available, false)
 })
 
-test('staff group votes hand off outside targets and mark only message_bot destinations available', async (t) => {
+test('staff group votes hand off outside targets but keep main-chat destinations available', async (t) => {
   const s = await votingBank(t)
   const sessionId = 'staff-group-session'
   const targets = new Map([
@@ -266,6 +268,12 @@ test('staff group votes hand off outside targets and mark only message_bot desti
   s.rt.groupOwners = new Map([[sessionId, { roomId: room.id }]])
   s.rt.roomOf = roomId => roomId === room.id ? room : undefined
   s.rt.localAgentBadge = model => model === 'local/model' ? { name: 'Local agent' } : undefined
+  Object.assign(s.rt, {
+    state: { questions: {} },
+    chatOf: botId => botId === 'bot' ? 'main' : undefined,
+    isCustomerPart: () => false,
+    save: async () => {},
+  })
 
   const definitions = [
     ['triage_test_local_outside', 'Local outside', 'local specialist work'],
@@ -283,7 +291,7 @@ test('staff group votes hand off outside targets and mark only message_bot desti
     { route, confidence: 0.9, reason: 'Matching route' },
   ]
 
-  for (const route of routes.slice(0, 2).concat(routes[3])) {
+  for (const route of routes.slice(0, 2)) {
     s.replies(votesFor(route))
     const result = await s.call({ action: 'vote', summary: `Group request for ${route}`, routes }, sessionId)
     assert.equal(result.decision, 'handoff')
@@ -292,12 +300,24 @@ test('staff group votes hand off outside targets and mark only message_bot desti
     const cases = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     const candidates = Object.fromEntries(cases.at(-1).handoff.candidates.map(candidate => [candidate.route, candidate.available]))
     assert.deepEqual(candidates, {
-      triage_test_local_outside: false,
-      triage_test_hosted_outside: false,
+      triage_test_local_outside: true,
+      triage_test_hosted_outside: true,
       triage_test_member: true,
       triage_test_self: false,
     })
+    await s.bank.syncHandoffs()
+    assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), [route, "I'll handle it myself"])
+    assert.equal(s.rt.state.questions[sessionId], undefined)
+    s.rt.state.questions.main = undefined
   }
+
+  s.replies(votesFor('triage_test_self'))
+  const self = await s.call({ action: 'vote', summary: 'Group request for self', routes }, sessionId)
+  assert.equal(self.decision, 'handoff')
+  const cases = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.equal(cases.at(-1).handoff.candidates.find(candidate => candidate.route === 'triage_test_self').available, false)
+  await s.bank.syncHandoffs()
+  assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), ["I'll handle it myself"])
 
   s.replies(votesFor('triage_test_member'))
   const member = await s.call({ action: 'vote', summary: 'Group member request', routes }, sessionId)
