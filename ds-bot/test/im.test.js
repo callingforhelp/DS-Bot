@@ -149,6 +149,14 @@ async function start({ platform = 'telegram', adapter, seed, home, services = {}
   return { ctx, rt, home, fake, prompts, agents, agentOf, emitEvent, fireApprovals, imTurn, close, stop, flush, platform }
 }
 
+const waitFor = async (condition, label) => {
+  const deadline = Date.now() + 2_000
+  while (!condition()) {
+    if (Date.now() >= deadline) assert.fail(`Timed out: ${label}`)
+    await delay(10)
+  }
+}
+
 const FIELDS = { telegram: { token: 'tok-1234' }, dingtalk: { clientId: 'cli-1', clientSecret: 'sec-1234' } }
 const add = (s, fields = FIELDS[s.platform]) => s.rt.imEndpoint('im-add', { platform: s.platform, botId: 'a', fields })
 const dm = (s, senderId, text, extra = {}) => s.fake.handlers.onMessage({
@@ -413,7 +421,7 @@ test('legacy question cards without delivery flags or message IDs remain answera
   const s = await start({ platform: 'dingtalk', seed, runtime: { legacy: { cards: { 'q:legacy-question': [{ chatKey: 'dm-customer', text: '1. yes' }] } } } })
   t.after(s.stop)
   await s.rt.load()
-  await s.flush()
+  await waitFor(() => s.fake.handlers !== null, 'the legacy IM adapter is ready')
   await dm(s, 'customer', '1')
   assert.equal(s.rt.state.questions.a, undefined)
   assert.equal(s.agentOf('a').followed, 1)
@@ -3538,24 +3546,23 @@ test('reply origin: cards and approvals leave only on the connection whose chat 
   s.imTurn('a')
   telegram.sent.length = 0
   dingtalk.sent.length = 0
-
   s.rt.state.questions.a = { id: 'q1', question: 'Which?', options: [{ label: 'yes' }, { label: 'no' }] }
   await s.rt.save()
-  await s.flush()
+  await waitFor(() => telegram.sent.some(entry => entry.buttons?.[0]?.data.startsWith('q:')), 'the asking chat got the question card')
   assert.equal(telegram.sent.filter(entry => entry.buttons?.[0]?.data.startsWith('q:')).length, 1, 'the asking chat got its question card')
   assert.equal(dingtalk.sent.filter(entry => entry.buttons?.[0]?.data.startsWith('q:')).length, 0, 'the other connection got no question card')
   delete s.rt.state.questions.a
 
   s.rt.state.secretRequests = { a: [{ id: 's1', name: 'MY_KEY', purpose: 'for tests', status: 'pending', askedAt: 1 }] }
   await s.rt.save()
-  await s.flush()
+  await waitFor(() => telegram.sent.some(entry => entry.text.includes('MY_KEY')), 'the asking chat got the secret request')
   assert.equal(telegram.sent.filter(entry => entry.text.includes('MY_KEY')).length, 1, 'the asking chat got the secret request')
   assert.equal(dingtalk.sent.filter(entry => entry.text.includes('MY_KEY')).length, 0, 'the other connection got no secret request')
   s.rt.state.secretRequests = {}
 
   s.rt.state.views.a = { id: 'v1', title: 'Pick', view: { type: 'text', text: 'Answer me' } }
   await s.rt.save()
-  await s.flush()
+  await waitFor(() => telegram.sent.some(entry => entry.text.includes('Pick')), 'the asking chat got the view card')
   assert.equal(telegram.sent.filter(entry => entry.text.includes('Pick')).length, 1, 'the asking chat got the view card')
   assert.equal(dingtalk.sent.filter(entry => entry.text.includes('Pick')).length, 0, 'the other connection got no view card')
   delete s.rt.state.views.a
@@ -3563,7 +3570,7 @@ test('reply origin: cards and approvals leave only on the connection whose chat 
   telegram.sent.length = 0
   dingtalk.sent.length = 0
   void s.fireApprovals({ agent: { id: 'a' }, toolName: 'bash', reason: 'run it', signal: new AbortController().signal }, () => new Promise(() => {}))
-  await s.flush()
+  await waitFor(() => telegram.sent.some(entry => entry.buttons?.[0]?.data.startsWith('a:')), 'the asking chat got the approval card')
   assert.equal(telegram.sent.filter(entry => entry.buttons?.[0]?.data.startsWith('a:')).length, 1, 'the asking chat got the approval card')
   assert.equal(dingtalk.sent.filter(entry => entry.buttons?.[0]?.data.startsWith('a:')).length, 0, 'the other connection got no approval card')
 })
