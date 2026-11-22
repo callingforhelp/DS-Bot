@@ -29,6 +29,8 @@ import { viaOf } from '../shared/im-platforms.js'
 import { isCustomerTask, ownChatSessions, pushThreadPart, successorOfMovedPart, threadCurrent, threadCurrentOfPart, threadOf, threadOfPart } from './threads.js'
 import { checkShownView, normalizeView, readViewReply, viewCardText, viewReply, viewReplyText } from 'deep-view/core'
 
+const CUSTOMER_CONTEXT_POLICY_VERSION = 1
+
 // An ask_user card as the user saw it. The user's reply is often just an option label,
 // which means nothing without the card. Arguments the tool would refuse (no question,
 // options that are not { label } objects) showed no card, so they give no text.
@@ -1333,8 +1335,14 @@ export function install(rt) {
       : room !== undefined ? partsOf(bot.id, room.id) : partsOfThread(bot.id, agent.id)
     const number = parts.length
     const taskEntry = rt.taskBySession?.(agent.id)?.task
+    const customerTask = bot === undefined ? undefined : customerTaskOf(agent.id)
+    const customerPolicyUpgrade = customerTask !== undefined && customerTask.customerContextPolicyVersion !== CUSTOMER_CONTEXT_POLICY_VERSION
     const taskRoom = taskEntry?.roomId !== undefined ? rt.roomOf(taskEntry.roomId) : undefined
     const effectiveRoom = room ?? taskRoom
+    if (customerPolicyUpgrade) {
+      job.bare = true
+      job.folder = undefined
+    }
     const budget = Math.min(RECENT_TOKENS, Math.floor((lines?.check ?? 4 * RECENT_TOKENS) / 4))
     const readLines = () => (job.bare ? { recent: [], earlier: [], unlisted: 0, complete: true } : handoffLines(agent.id, { budget, group: effectiveRoom !== undefined, number }))
     let carried = job.folder ? await readLines() : undefined
@@ -1344,7 +1352,7 @@ export function install(rt) {
     let failure
     const local = localPart(session)
     // The group's own Session only relays; it has no route a note could be written with.
-    if (!job.engine && !job.overflow && job.cutoff !== true && job.failed === undefined && !whole && bot !== undefined) {
+    if (!customerPolicyUpgrade && !job.engine && !job.overflow && job.cutoff !== true && job.failed === undefined && !whole && bot !== undefined) {
       try {
         const noteSignal = AbortSignal.any([signal, AbortSignal.timeout(NOTE_TIMEOUT_MS)])
         written = local ? await writeLocalNote(agent, noteSignal, { folder: job.folder }) : await writeNote(agent, noteSignal, { folder: job.folder })
@@ -1366,7 +1374,7 @@ export function install(rt) {
     }
     if (failure !== undefined) rt.warn('ds-bot: handoff note for %s failed past the hard line; moving on with the earlier note: %s', name, failure)
     const previous = parts.at(-2)
-    const earlierNote = previous?.note ? { note: previous.note, noteFrom: previous.noteFrom ?? previous.number } : {}
+    const earlierNote = !customerPolicyUpgrade && previous?.note ? { note: previous.note, noteFrom: previous.noteFrom ?? previous.number } : {}
     const noted = written !== undefined ? { note: written.note }
       : job.engine ? { fallback: 'engine', ...earlierNote }
       : { fallback: whole ? 'whole' : job.failed !== undefined ? 'failure' : job.overflow ? 'overflow' : job.cutoff === true ? 'cutoff' : 'failed', ...earlierNote }
@@ -1377,13 +1385,48 @@ export function install(rt) {
       : rt.workDirOf(effectiveRoom !== undefined && job.roomId === undefined ? { ...job, roomId: effectiveRoom.id } : job)
     const intended = dir !== undefined && await rt.isFolder(dir) ? dir : rt.teamFolder()
     const freshId = await rt.createSession(effectiveRoom === undefined ? name : bot === undefined ? effectiveRoom.name : `${name} · ${effectiveRoom.name}`, { dir })
+    if (customerTask !== undefined) {
+      pendingCustomerSessions.set(freshId, customerTask)
+      rt.chatOwners.set(freshId, bot.id)
+      rt.taskOwners.set(freshId, { botId: bot.id, taskId: customerTask.id })
+    }
     // The group's own Session never asks the model, so selectRoomSession picks an
     // image-capable route when available; the earlier part's route may no longer be served (#1310).
-    if (bot === undefined) await rt.selectRoomSession(freshId, room)
-    const picked = bot === undefined ? undefined : await freshRoute(bot, session)
-    if (picked !== undefined && !await selectRoute({ name }, freshId, picked) && job.engine) engineRetry.set(freshId, Date.now() + FOLDER_RETRY_MS)
-    if (bot !== undefined) await rt.applyPermission(bot, freshId, effectiveRoom)
-      .catch(error => rt.warn('ds-bot: permission for the fresh part of %s not applied: %s', name, error))
+    let picked
+    let latestCustomerRoute
+    try {
+      const model = bot?.model ?? bot?.appliedModel
+      if (customerTask !== undefined && (localPart(session) || rt.localAgentBadge?.(model) !== undefined || rt.isLocalAgentRef?.(model) === true)) {
+        throw new Error('Customer conversations require an isolated hosted model route')
+      }
+      if (bot === undefined) await rt.selectRoomSession(freshId, room)
+      picked = bot === undefined ? undefined : await freshRoute(bot, session)
+      if (customerTask !== undefined && picked !== undefined
+        && (rt.localAgentBadge?.(picked.ref) !== undefined || rt.isLocalAgentRef?.(picked.ref) === true)) {
+        throw new Error('Customer conversations require an isolated hosted model route')
+      }
+      if (picked !== undefined && !await selectRoute({ name }, freshId, picked) && job.engine) engineRetry.set(freshId, Date.now() + FOLDER_RETRY_MS)
+      if (bot !== undefined) {
+        if (customerTask !== undefined) await rt.applyPermission(bot, freshId, effectiveRoom, { customer: true })
+        else await rt.applyPermission(bot, freshId, effectiveRoom)
+          .catch(error => rt.warn('ds-bot: permission for the fresh part of %s not applied: %s', name, error))
+      }
+      if (customerTask !== undefined) {
+        latestCustomerRoute = await freshRoute(bot, session)
+        if (latestCustomerRoute !== undefined
+          && (rt.localAgentBadge?.(latestCustomerRoute.ref) !== undefined || rt.isLocalAgentRef?.(latestCustomerRoute.ref) === true)) {
+          throw new Error('Customer conversations require an isolated hosted model route')
+        }
+      }
+    } catch (error) {
+      if (customerTask !== undefined) {
+        pendingCustomerSessions.delete(freshId)
+        rt.chatOwners.delete(freshId)
+        rt.taskOwners.delete(freshId)
+        await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true }).catch(archiveError => rt.warn('ds-bot: unused customer part of %s not archived: %s', name, archiveError))
+      }
+      throw error
+    }
     // The fresh part took several awaits: a Bot or group deleted meanwhile, a member that
     // left, or a part that is no longer the current one gets no fresh part.
     const current = bot === undefined ? rt.sessionOfRoom(room)
@@ -1392,6 +1435,11 @@ export function install(rt) {
     const gone = bot === undefined ? rt.roomOf(room.id) !== room
       : rt.botOf(bot.id) === undefined || (effectiveRoom !== undefined && (rt.roomOf(effectiveRoom.id) !== effectiveRoom || !effectiveRoom.members.includes(bot.id)))
     if (gone || current !== agent.id) {
+      if (customerTask !== undefined) {
+        pendingCustomerSessions.delete(freshId)
+        rt.chatOwners.delete(freshId)
+        rt.taskOwners.delete(freshId)
+      }
       await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true })
         .catch(error => rt.warn('ds-bot: unused fresh part of %s not archived: %s', name, error))
       return
@@ -1407,6 +1455,16 @@ export function install(rt) {
       room.sessions[bot.id] = freshId
     } else {
       pushThreadPart(bot, agent.id, freshId, segment)
+      if (customerTask !== undefined) {
+        customerTask.startedAt = Date.now()
+        customerTask.customerContextPolicyVersion = CUSTOMER_CONTEXT_POLICY_VERSION
+        customerTask.status = 'running'
+        customerTask.updatedAt = Date.now()
+        pendingCustomerSessions.delete(freshId)
+        rt.taskOwners.set(agent.id, { botId: bot.id, taskId: customerTask.id })
+        rt.taskOwners.set(freshId, { botId: bot.id, taskId: customerTask.id })
+        rt.chatOwners.set(freshId, bot.id)
+      }
       // Read the thread again: a part the user opened meanwhile turned this one into a
       // background thread, whose successor must be recorded for its own thread.
       const successor = successorOfMovedPart(bot, freshId)
@@ -1431,7 +1489,9 @@ export function install(rt) {
     await rt.save()
     // A model the user picked until now went to the earlier part, which was still the
     // Bot's; from here on a change goes to the fresh one.
-    const now = bot === undefined ? undefined : await freshRoute(bot, session)
+    const now = customerTask === undefined
+      ? bot === undefined ? undefined : await freshRoute(bot, session)
+      : latestCustomerRoute
     if (now !== undefined && (now.ref !== picked?.ref || now.effort !== picked?.effort)) await selectRoute({ name }, freshId, now)
     if (job.failed !== undefined) rescued.set(freshId, job.bare ? 'bare' : 'carried')
     job.moved = true
@@ -2079,7 +2139,7 @@ export function install(rt) {
 
   async function customerPage(sessionId, cursor) {
     if (!isCustomerPart(sessionId)) return { items: [], cursor: null, btw: [], startedAt: null }
-    const botId = rt.taskOwners.get(sessionId)?.botId ?? rt.chatOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)?.botId
+    const botId = rt.taskOwners?.get(sessionId)?.botId ?? rt.chatOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)?.botId
     const parts = partsOfThread(botId, sessionId)
     const index = Number.isInteger(cursor?.part) ? cursor.part : parts.length - 1
     const startedAt = parts[0]?.startedAt ?? null
@@ -2088,8 +2148,11 @@ export function install(rt) {
   }
 
   const customerParts = new Map()
+  const pendingCustomerSessions = new Map()
   const customerTaskOf = sessionId => {
-    const taskOwner = rt.taskOwners.get(sessionId)
+    const pending = pendingCustomerSessions.get(sessionId)
+    if (pending !== undefined) return pending
+    const taskOwner = rt.taskOwners?.get(sessionId)
     const botId = taskOwner?.botId ?? rt.chatOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)?.botId
     const bot = rt.botOf(botId)
     return (bot?.tasks ?? []).find(task => isCustomerTask(task)
@@ -2102,6 +2165,10 @@ export function install(rt) {
     if (typeof customer?.connId !== 'string' || customer.connId === '' || typeof customer.chatKey !== 'string' || customer.chatKey === '') return undefined
     return { connId: customer.connId, chatKey: customer.chatKey }
   }
+  const customerReferenceOf = sessionId => {
+    const id = customerTaskOf(sessionId)?.id
+    return typeof id === 'string' ? id.slice(-8).toUpperCase() : undefined
+  }
 
   async function customerPart(botId, connId, chatKey) {
     await rt.load()
@@ -2110,29 +2177,56 @@ export function install(rt) {
     if (typeof connId !== 'string' || connId === '' || typeof chatKey !== 'string' || chatKey === '') {
       throw Object.assign(new Error('Customer identity is unavailable'), { code: 'bot/invalid' })
     }
+    const key = JSON.stringify([botId, connId, chatKey])
+    if (customerParts.has(key)) return customerParts.get(key)
     const existing = (bot.tasks ?? []).find(task => isCustomerTask(task)
       && task.customer?.connId === connId && task.customer?.chatKey === chatKey)
     if (existing !== undefined) {
-      existing.status = 'running'
-      existing.updatedAt = Date.now()
-      rt.chatOwners.set(existing.sessionId, botId)
-      rt.taskOwners.set(existing.sessionId, { botId, taskId: existing.id })
-      await rt.save()
-      return existing.sessionId
+      const pending = (async () => {
+        const model = bot.model ?? bot.appliedModel
+        if (rt.localAgentBadge?.(model) !== undefined || rt.isLocalAgentRef?.(model) === true) {
+          throw Object.assign(new Error('Customer conversations require an isolated hosted model route'), { code: 'bot/invalid' })
+        }
+        if (existing.customerContextPolicyVersion !== CUSTOMER_CONTEXT_POLICY_VERSION) {
+          const now = Date.now()
+          const upgraded = {
+            ...existing,
+            customerContextPolicyVersion: CUSTOMER_CONTEXT_POLICY_VERSION,
+            status: 'running',
+            startedAt: now,
+            updatedAt: now,
+            segments: [...(existing.segments ?? []), {
+              sessionId: existing.sessionId,
+              startedAt: existing.startedAt,
+              endedAt: now,
+            }],
+          }
+          const opened = await openTaskPart(bot, undefined, upgraded, { fresh: true })
+          return opened.sessionId
+        }
+        await rt.applyPermission(bot, existing.sessionId, undefined, { customer: true })
+        existing.status = 'running'
+        existing.updatedAt = Date.now()
+        rt.chatOwners.set(existing.sessionId, botId)
+        rt.taskOwners.set(existing.sessionId, { botId, taskId: existing.id })
+        await rt.save()
+        return existing.sessionId
+      })()
+      customerParts.set(key, pending)
+      try { return await pending } finally { customerParts.delete(key) }
     }
-    const key = JSON.stringify([botId, connId, chatKey])
-    if (customerParts.has(key)) return customerParts.get(key)
     const pending = (async () => {
       const task = {
         id: `customer_${randomUUID()}`,
         title: 'Customer conversation',
         origin: 'customer',
         customer: { connId, chatKey },
+        customerContextPolicyVersion: CUSTOMER_CONTEXT_POLICY_VERSION,
         status: 'running',
         startedAt: Date.now(),
         updatedAt: Date.now(),
       }
-      const opened = await openTaskPart(bot, rt.chatOf(botId), task, { fresh: true })
+      const opened = await openTaskPart(bot, undefined, task, { fresh: true })
       return opened.sessionId
     })()
     customerParts.set(key, pending)
@@ -2272,7 +2366,10 @@ export function install(rt) {
     const room = task.roomId !== undefined ? rt.roomOf(task.roomId) : undefined
     const defaultDir = rt.workDirOf({ botId: bot.id, ...(room ? { roomId: room.id } : {}) })
     const dir = workDir !== undefined ? (workDir ?? undefined) : defaultDir
-    const isLocal = rt.localAgentBadge?.(bot.model ?? bot.appliedModel) !== undefined
+    const model = bot.model ?? bot.appliedModel
+    const isLocal = rt.localAgentBadge?.(model) !== undefined || rt.isLocalAgentRef?.(model) === true
+    const customer = isCustomerTask(task)
+    if (customer && isLocal) throw Object.assign(new Error('Customer conversations require an isolated hosted model route'), { code: 'bot/invalid' })
     let sessionId
     let forked = false
     if (!fresh && !isLocal && dir === defaultDir && typeof ctx.sessionController?.fork === 'function') {
@@ -2289,34 +2386,76 @@ export function install(rt) {
     if (sessionId === undefined) {
       sessionId = await rt.createSession(`${bot.name} · ${task.title}`, { dir })
     }
-    const sourceAgent = fresh ? undefined : ctx.get('agents')?.get(fromSessionId)
-    const picked = await freshRoute(bot, sourceAgent?.session)
-    if (picked !== undefined) await selectRoute({ name: bot.name }, sessionId, picked)
-    await rt.applyPermission(bot, sessionId, room)
-      .catch(error => rt.warn('ds-bot: permission for task %s of %s not applied: %s', task.id, bot.name, error))
-    if (rt.botOf(bot.id) !== bot || (room !== undefined && (rt.roomOf(room.id) !== room || !room.members.includes(bot.id)))) {
-      await ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true })
-        .catch(error => rt.warn('ds-bot: unused task part of %s not archived: %s', bot.name, error))
-      throw Object.assign(new Error(room !== undefined ? 'Bot is no longer in this group' : 'Bot no longer exists'), { code: 'bot/not-found' })
+    const previous = (bot.tasks ?? []).find(item => item.id === task.id)
+    if (customer) {
+      pendingCustomerSessions.set(sessionId, task)
+      rt.chatOwners.set(sessionId, bot.id)
+      rt.taskOwners.set(sessionId, { botId: bot.id, taskId: task.id })
     }
-    let startSeq = 0
-    if (forked) {
-      const forkedAgent = await rt.resolveAgent(sessionId).catch(() => undefined)
-      const inherited = forkedAgent?.session?.inheritedEventCount
-      const seq = forkedAgent?.session?.seq
-      if (Number.isInteger(inherited) && inherited > 0) startSeq = inherited
-      else if (Number.isInteger(seq) && seq > 0) startSeq = seq
+    let stored
+    try {
+      const sourceAgent = fresh ? undefined : ctx.get('agents')?.get(fromSessionId)
+      const picked = await freshRoute(bot, sourceAgent?.session)
+      if (customer && picked !== undefined
+        && (rt.localAgentBadge?.(picked.ref) !== undefined || rt.isLocalAgentRef?.(picked.ref) === true)) {
+        throw Object.assign(new Error('Customer conversations require an isolated hosted model route'), { code: 'bot/invalid' })
+      }
+      if (picked !== undefined) await selectRoute({ name: bot.name }, sessionId, picked)
+      try {
+        await rt.applyPermission(bot, sessionId, room, { customer })
+      } catch (error) {
+        if (customer) throw error
+        rt.warn('ds-bot: permission for task %s of %s not applied: %s', task.id, bot.name, error)
+      }
+      if (rt.botOf(bot.id) !== bot || (room !== undefined && (rt.roomOf(room.id) !== room || !room.members.includes(bot.id)))) {
+        throw Object.assign(new Error(room !== undefined ? 'Bot is no longer in this group' : 'Bot no longer exists'), { code: 'bot/not-found' })
+      }
+      const now = await freshRoute(bot, sourceAgent?.session)
+      if (customer && now !== undefined
+        && (rt.localAgentBadge?.(now.ref) !== undefined || rt.isLocalAgentRef?.(now.ref) === true)) {
+        throw Object.assign(new Error('Customer conversations require an isolated hosted model route'), { code: 'bot/invalid' })
+      }
+      if (now !== undefined && (now.ref !== picked?.ref || now.effort !== picked?.effort)) {
+        await selectRoute({ name: bot.name }, sessionId, now)
+      }
+      let startSeq = 0
+      if (forked) {
+        const forkedAgent = await rt.resolveAgent(sessionId).catch(() => undefined)
+        const inherited = forkedAgent?.session?.inheritedEventCount
+        const seq = forkedAgent?.session?.seq
+        if (Number.isInteger(inherited) && inherited > 0) startSeq = inherited
+        else if (Number.isInteger(seq) && seq > 0) startSeq = seq
+      }
+      stored = { ...task, sessionId, segments: task.segments ?? [], startSeq, ...(workDir !== undefined ? { workDir } : {}) }
+      bot.tasks ??= []
+      const index = bot.tasks.findIndex(item => item.id === task.id)
+      if (index < 0) bot.tasks.push(stored)
+      else bot.tasks[index] = stored
+      rt.chatOwners.set(sessionId, bot.id)
+      rt.taskOwners.set(sessionId, { botId: bot.id, taskId: task.id, ...(room ? { roomId: room.id } : {}) })
+      await rt.save()
+      pendingCustomerSessions.delete(sessionId)
+      return { sessionId, forked, task: stored }
+    } catch (error) {
+      if (customer) {
+        pendingCustomerSessions.delete(sessionId)
+        if (stored !== undefined) {
+          const index = bot.tasks?.findIndex(item => item.id === task.id && item.sessionId === sessionId) ?? -1
+          if (index >= 0) {
+            if (previous === undefined) bot.tasks.splice(index, 1)
+            else bot.tasks[index] = previous
+          }
+        }
+        rt.chatOwners.delete(sessionId)
+        rt.taskOwners.delete(sessionId)
+        await ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true })
+          .catch(archiveError => rt.warn('ds-bot: unused customer part of %s not archived: %s', bot.name, archiveError))
+      } else if (rt.botOf(bot.id) !== bot || (room !== undefined && (rt.roomOf(room.id) !== room || !room.members.includes(bot.id)))) {
+        await ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true })
+          .catch(archiveError => rt.warn('ds-bot: unused task part of %s not archived: %s', bot.name, archiveError))
+      }
+      throw error
     }
-    const stored = { ...task, sessionId, segments: [], startSeq, ...(workDir !== undefined ? { workDir } : {}) }
-    ;(bot.tasks ??= []).push(stored)
-    rt.chatOwners.set(sessionId, bot.id)
-    rt.taskOwners.set(sessionId, { botId: bot.id, taskId: task.id, ...(room ? { roomId: room.id } : {}) })
-    await rt.save()
-    const now = await freshRoute(bot, sourceAgent?.session)
-    if (now !== undefined && (now.ref !== picked?.ref || now.effort !== picked?.effort)) {
-      await selectRoute({ name: bot.name }, sessionId, now)
-    }
-    return { sessionId, forked, task: stored }
   }
 
   // Creates a fresh foreground Session for `bot` when its currently busy foreground
@@ -2399,5 +2538,5 @@ export function install(rt) {
     }
   }
 
-  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, customerPage, chatPage, agentPage, taskPage, displayItems, applySteps, followFolder, followEngine, heldBack, customerPart, isCustomerPart, customerIdentityOf, openTaskPart, forkForegroundPart, isSwitchingPart: id => switches.has(id), sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, customerPage, chatPage, agentPage, taskPage, displayItems, applySteps, followFolder, followEngine, heldBack, customerPart, isCustomerPart, customerIdentityOf, customerReferenceOf, openTaskPart, forkForegroundPart, isSwitchingPart: id => switches.has(id), sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }

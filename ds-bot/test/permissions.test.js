@@ -67,6 +67,13 @@ test('a fresh Session gets the Bot\'s preset, and a Bot without one keeps the de
   assert.deepEqual(writes, ['fresh=workspace-write'])
 })
 
+test('customer sessions fail closed when a configured preset has no permission service', async () => {
+  const { rt, writes } = runtime({ presets: false })
+  await assert.rejects(rt.applyPermission({ id: 'b1', permission: 'workspace-write' }, 'customer', undefined, { customer: true }), /cannot be enforced/)
+  await rt.applyPermission({ id: 'b1', permission: 'workspace-write' }, 'ordinary')
+  assert.deepEqual(writes, [])
+})
+
 test('an unknown preset is refused and the Bot keeps its own', async () => {
   const { rt, writes } = runtime()
   const bot = { id: 'b1', permission: 'workspace-write' }
@@ -226,8 +233,33 @@ test('a stricter preset reaches active background tasks too', async () => {
   // Active background tasks must not keep the old, wider preset after the user was told
   // the Bot was made stricter.
   const { rt, writes } = runtime()
-  const bot = { id: 'b1', name: 'Ada', tasks: [{ id: 't1', sessionId: 'b1-task', status: 'running', segments: [] }] }
+  const bot = { id: 'b1', name: 'Ada', tasks: [
+    { id: 't1', sessionId: 'b1-task', status: 'running', segments: [] },
+    { id: 'customer-a', origin: 'customer', sessionId: 'b1-customer', status: 'waiting_customer', segments: [] },
+  ] }
   await rt.setPermission(bot, 'workspace-write')
   assert.equal(bot.permission, 'workspace-write')
-  assert.deepEqual(writes, ['b1-chat=workspace-write', 'b1-task=workspace-write', 'b1-group=workspace-write'])
+  assert.deepEqual(writes, ['b1-chat=workspace-write', 'b1-task=workspace-write', 'b1-customer=workspace-write', 'b1-group=workspace-write'])
+})
+
+test('a failed permission update restores waiting customer sessions too', async () => {
+  const { rt, writes, releases, settle, control } = runtime({ hold: true })
+  const bot = { id: 'b1', name: 'Ada', permission: 'workspace-write', tasks: [
+    { id: 'customer-a', origin: 'customer', sessionId: 'b1-customer', status: 'waiting_customer', segments: [] },
+  ] }
+  const change = rt.setPermission(bot, 'danger-full-access')
+  const refused = assert.rejects(change, /rejected/)
+  await settle(0)
+  control.fail = session => session === 'b1-customer'
+  await settle(0)
+  control.fail = false
+  while (releases.length) await settle(0)
+  await refused
+  assert.equal(bot.permission, 'workspace-write')
+  assert.deepEqual(writes, [
+    'b1-chat=danger-full-access',
+    'b1-chat=workspace-write',
+    'b1-customer=workspace-write',
+    'b1-group=workspace-write',
+  ])
 })
