@@ -438,6 +438,23 @@ test('customer messages without IDs fail visibly without an unidentifiable retry
   assert.equal(s.prompts.length, 0)
 })
 
+test('replaying an evicted customer failure logs without sending another quota-consuming apology', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  let warnings = 0
+  s.rt.warn = () => { warnings++ }
+  s.rt.customerPart = async () => { throw Object.assign(new Error('setup unavailable'), { permanent: true }) }
+  for (let i = 0; i <= 1024; i++) await dm(s, 'customer', 'first', { messageId: String(i) })
+  await s.flush()
+  assert.equal(s.fake.sent.length, 1025)
+  for (let replay = 0; replay < 3; replay++) await dm(s, 'customer', 'first', { messageId: '0' })
+  await s.flush()
+  assert.equal(s.fake.sent.length, 1025, 'an evicted message does not consume the reply quota again')
+  assert.equal(warnings, 1028, 'suppressed failures are still logged')
+  assert.equal(s.prompts.length, 0)
+})
+
 test('stopping a connection clears its customer retry budgets before reconnecting', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)

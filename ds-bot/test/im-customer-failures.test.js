@@ -8,6 +8,8 @@ test('customer failure eviction is oldest-first and cannot renew an evicted retr
   assert.equal(failures.fail('two', 'second'), true)
   assert.equal(failures.fail('two', 'newest'), true)
   assert.deepEqual([...failures.entries.keys()], ['second', 'newest'])
+  assert.equal(failures.shouldReply('one', 'oldest'), false)
+  assert.equal(failures.shouldReply('two', 'newest'), true)
   for (let page = 0; page < 5; page++) {
     assert.equal(failures.fail('one', 'oldest'), false)
     assert.equal(failures.fail('one', `other-${page}`), false)
@@ -16,6 +18,7 @@ test('customer failure eviction is oldest-first and cannot renew an evicted retr
   failures.success('second')
   assert.equal(failures.fail('one', 'oldest'), false, 'free space does not renew evicted budgets')
   failures.clear('one')
+  assert.equal(failures.shouldReply('one', 'oldest'), true)
   assert.equal(failures.fail('one', 'oldest'), true, 'stopping the connection resets its retry state')
 })
 

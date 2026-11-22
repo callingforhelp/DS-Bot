@@ -723,7 +723,7 @@ export function install(rt) {
             throw Object.assign(new Error('Customer conversation could not be opened', { cause: error }), { retryInbound: true })
           }
           rt.warn('ds-bot: customer conversation failed: %s', reasonOf(error))
-          await sendText(conn, msg.chat, text('unavailable'))
+          if (customerFailures.shouldReply(conn.id, key)) await sendText(conn, msg.chat, text('unavailable'))
           return
         }
       }

@@ -11,6 +11,10 @@ export class CustomerFailures {
     return (this.entries.get(key)?.attempts ?? 0) >= ATTEMPTS
   }
 
+  shouldReply(connId, key) {
+    return !this.limited.has(connId) || this.entries.has(key)
+  }
+
   success(key) {
     this.entries.delete(key)
   }
