@@ -22,6 +22,7 @@ class BrokerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmpdir.name, "jobs.db")
+        self.team_mem_dir = os.path.join(self.tmpdir.name, "team_mem")
         self.store = BrokerStore(self.db_path)
         self.delivered = []
         handler = make_handler(
@@ -32,6 +33,7 @@ class BrokerTest(unittest.TestCase):
                 self.delivered.append(job["job_id"]),
                 self.store.mark_delivery(job["job_id"], True),
             ),
+            team_memory_dir=self.team_mem_dir,
         )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
@@ -367,6 +369,110 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(claim["job"]["job_id"], job_id)
         self.assertEqual(claim["job"]["bot"], "Coder")
         self.assertEqual(claim["job"]["group"], "Ops")
+
+    def test_long_poll_claim_wakes_immediately_on_enqueue(self) -> None:
+        results: dict[str, object] = {}
+
+        def poll_worker() -> None:
+            t0 = time.monotonic()
+            st, data = self._req(
+                "POST",
+                "/v1/worker/claim",
+                {"worker_id": "mac-lp", "hostname": "mini", "wait_sec": 5.0},
+                token="work-secret",
+            )
+            results["elapsed"] = time.monotonic() - t0
+            results["status"] = st
+            results["data"] = data
+
+        wt = threading.Thread(target=poll_worker, daemon=True)
+        wt.start()
+        time.sleep(0.15)
+        st, created = self._req(
+            "POST",
+            "/v1/jobs",
+            {"target": "dsbot", "task": "wake up fast", "aws_session_id": "s-lp"},
+            token="prod-secret",
+        )
+        self.assertEqual(st, 201)
+        wt.join(timeout=3.0)
+        self.assertFalse(wt.is_alive())
+        self.assertEqual(results["status"], 200)
+        self.assertLess(results["elapsed"], 1.5)
+        self.assertEqual(results["data"]["job"]["job_id"], created["job"]["job_id"])
+
+    def test_context_snapshot_scrubs_secrets_and_links_memory_md(self) -> None:
+        os.makedirs(self.team_mem_dir, exist_ok=True)
+        mem_md = os.path.join(self.team_mem_dir, "MEMORY.md")
+        with open(mem_md, "w", encoding="utf-8") as f:
+            f.write("# Memory\n\n## Index\n- [[shared]]\n")
+
+        payload = {
+            "markdown": "# Mac Mirror\n- Project: DS-Bot\n- Bad: xoxb-123456789012345678 xapp-1-ABCDEF-1234567890 sk-abcdefghijklmnopqrst\n"
+        }
+        st, res = self._req(
+            "POST", "/v1/worker/context-snapshot", payload, token="work-secret"
+        )
+        self.assertEqual(st, 200)
+        self.assertTrue(res["written"])
+        # Repeat write to confirm idempotent linking in MEMORY.md.
+        st2, _ = self._req(
+            "POST", "/v1/worker/context-snapshot", payload, token="work-secret"
+        )
+        self.assertEqual(st2, 200)
+
+        with open(os.path.join(self.team_mem_dir, "mac-mirror.md"), "r", encoding="utf-8") as f:
+            mirrored = f.read()
+        self.assertIn("Project: DS-Bot", mirrored)
+        self.assertNotIn("xoxb-123456789012345678", mirrored)
+        self.assertNotIn("xapp-1-ABCDEF-1234567890", mirrored)
+        self.assertNotIn("sk-abcdefghijklmnopqrst", mirrored)
+
+        with open(mem_md, "r", encoding="utf-8") as f:
+            idx = f.read()
+        self.assertIn("- [[shared]]", idx)
+        self.assertEqual(idx.count("- [[mac-mirror]]"), 1)
+
+    def test_cloud_notes_roundtrip_and_ack(self) -> None:
+        st, created = self._req(
+            "POST",
+            "/v1/cloud-notes",
+            {
+                "channel": "D0CKFEVJF0X",
+                "thread_ts": "1700.1",
+                "bot_name": "Chief",
+                "prompt_excerpt": "Check repo with Bearer secret_token_abcdef123456",
+                "reply_excerpt": "PR merged with sk-abcdefghijklmnopqrstuv",
+            },
+            token="prod-secret",
+        )
+        self.assertEqual(st, 201)
+        nid = created["note"]["note_id"]
+
+        st, listed = self._req(
+            "GET", "/v1/worker/cloud-notes?since_id=0&limit=10", token="work-secret"
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(len(listed["notes"]), 1)
+        self.assertEqual(listed["latest_id"], nid)
+        self.assertNotIn("secret_token_abcdef123456", listed["recent_markdown"])
+        self.assertNotIn("sk-abcdefghijklmnopqrstuv", listed["recent_markdown"])
+        self.assertIn("PR merged", listed["recent_markdown"])
+
+        st, ack = self._req(
+            "POST",
+            "/v1/worker/cloud-notes/ack",
+            {"up_to_id": nid},
+            token="work-secret",
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(ack["acked"], 1)
+
+        st, listed2 = self._req(
+            "GET", f"/v1/worker/cloud-notes?since_id={nid}&limit=10", token="work-secret"
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(listed2["notes"], [])
 
 
 if __name__ == "__main__":

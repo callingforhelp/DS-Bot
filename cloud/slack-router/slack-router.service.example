@@ -1,0 +1,15 @@
+[Unit]
+Description=Thin Stateless Slack Socket Mode Router (Mac priority + EC2 /cloud)
+After=network-online.target mac-job-broker.service
+Wants=mac-job-broker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mac-job-broker/env
+EnvironmentFile=/etc/mac-job-broker/slack.env
+ExecStart=/usr/bin/python3 /opt/slack-router/slack_router.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
