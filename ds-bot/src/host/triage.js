@@ -242,14 +242,14 @@ export function triageBank(home, writable = () => {}, rt) {
   }
   const call = (args, context = {}) => {
     const run = async () => {
+      const customerSession = rt?.isCustomerPart?.(context.sessionId) === true
+      if (customerSession && args.action === 'vote') customerRouteGrants.delete(context.sessionId)
       writable()
       const cases = await read('cases.jsonl', [], true)
       const state = await read('rules.json', { rules: [], reviewed: 0 })
       const now = Date.now()
-      const customerSession = rt?.isCustomerPart?.(context.sessionId) === true
       const customerSource = customerSession ? rt.customerIdentityOf?.(context.sessionId) : undefined
       if (customerSession) {
-        if (args.action === 'vote') customerRouteGrants.delete(context.sessionId)
         if (!['types', 'vote', 'recall', 'rules', 'log'].includes(args.action)
           || (args.action === 'types' && args.type_action !== undefined && args.type_action !== 'list')
           || (args.action === 'rules' && args.rule_action !== 'list')) {

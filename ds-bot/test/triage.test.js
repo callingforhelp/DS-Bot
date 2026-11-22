@@ -188,6 +188,41 @@ test('customer routing uses isolated specialist sessions and rejects control arg
   assert.deepEqual(droppedWorks, [openedWorks[2].id])
 })
 
+test('new customer votes revoke unused grants even when preparation or validation fails', async (t) => {
+  const s = await votingBank(t)
+  const sessionId = 'customer-unused-grant'
+  const identity = { connId: 'conn-unused', chatKey: 'chat-unused' }
+  s.customer(sessionId, identity)
+  s.rt.live = new Map([[sessionId, { turn: 1 }]])
+  s.rt.taskOwners = new Map([[sessionId, { botId: 'bot', taskId: sessionId }]])
+  for (const [type, handles, examples] of [
+    ['triage_test_unused', 'unused-grant work', ['unused grant request', 'grant routing']],
+    ['triage_test_unused_other', 'other work', ['other support request', 'another route']],
+  ]) await s.call({ action: 'types', type_action: 'add', type, handles, examples, runtime: 'ds-bot', target: 'Quote Bot' })
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
+  const vote = { action: 'vote', summary: 'unused grant request', routes: ['triage_test_unused', 'triage_test_unused_other'] }
+  const args = { to: 'triage_test_unused', message: 'Please help' }
+
+  s.replies([
+    { route: 'triage_test_unused', confidence: 0.95, reason: 'Request matches' },
+    { route: 'triage_test_unused', confidence: 0.9, reason: 'Request matches' },
+  ])
+  assert.equal((await s.call(vote, sessionId)).decision, 'route')
+  assert.equal(s.rt.canUseCustomerRoute(sessionId, args), true)
+  await assert.rejects(s.call({ ...vote, summary: '' }, sessionId), /summary is required/)
+  assert.equal(s.rt.canUseCustomerRoute(sessionId, args), false)
+
+  s.replies([
+    { route: 'triage_test_unused', confidence: 0.95, reason: 'Request matches' },
+    { route: 'triage_test_unused', confidence: 0.9, reason: 'Request matches' },
+  ])
+  assert.equal((await s.call(vote, sessionId)).decision, 'route')
+  assert.equal(s.rt.canUseCustomerRoute(sessionId, args), true)
+  await writeFile(join(s.home, 'triage', 'cases.jsonl'), '{invalid bank data')
+  await assert.rejects(s.call({ ...vote, summary: '' }, sessionId), SyntaxError)
+  assert.equal(s.rt.canUseCustomerRoute(sessionId, args), false)
+})
+
 test('staff votes may route to a local specialist while customer votes hand off', async (t) => {
   const s = await votingBank(t)
   const target = { id: 'local-specialist', name: 'Local specialist', model: 'local/model' }
