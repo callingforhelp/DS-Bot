@@ -204,6 +204,31 @@ test('a failed customer question card cannot consume a number until delivery suc
   assert.equal(s.prompts.length, 2)
 })
 
+test('replayed customer message IDs cannot answer twice or become prompts after a card closes', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer', 'hello', { messageId: 'greeting' })
+  s.imTurn('a')
+  s.rt.state.questions.a = { id: 'first-question', question: 'Which?', options: [{ label: 'yes' }] }
+  await s.rt.save()
+  await s.flush()
+  await Promise.all([dm(s, 'customer', '1', { messageId: 'answer-one' }), dm(s, 'customer', '1', { messageId: 'answer-one' })])
+  assert.equal(s.rt.state.questions.a, undefined)
+  assert.equal(s.agentOf('a').followed, 1)
+  await dm(s, 'customer', '1', { messageId: 'answer-one' })
+  assert.equal(s.prompts.length, 1)
+  s.rt.state.questions.a = { id: 'second-question', question: 'Again?', options: [{ label: 'yes' }] }
+  await s.rt.save()
+  await s.flush()
+  await dm(s, 'customer', '1', { messageId: 'answer-one' })
+  assert.ok(s.rt.state.questions.a)
+  await dm(s, 'customer', '1', { messageId: 'answer-two' })
+  assert.equal(s.rt.state.questions.a, undefined)
+  assert.equal(s.agentOf('a').followed, 2)
+  assert.equal(s.prompts.length, 1)
+})
+
 test('two concurrent syncs start exactly one adapter', async (t) => {
   const s = await start()
   t.after(s.stop)

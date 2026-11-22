@@ -770,7 +770,7 @@ export function install(rt) {
     return undefined
   }
 
-  const onMessage = (conn) => async (msg) => {
+  const receiveMessage = (conn) => async (msg) => {
     if (msg.sender.bot === true) return
     if (!paired(conn, msg.sender.id)) {
       if (msg.chat.kind === 'group' && !msg.mentioned) return
@@ -867,16 +867,24 @@ export function install(rt) {
       await rt.sendUser({ sessionId, content, requestId })
       return 'accepted'
     }
+    await send()
+  }
+  const onMessage = (conn) => async (msg) => {
+    if (msg.sender.bot === true || !paired(conn, msg.sender.id)
+      || (msg.chat.kind === 'group' && !msg.mentioned)) return receiveMessage(conn)(msg)
     if (typeof msg.messageId === 'string' && msg.messageId !== '') {
       const event = rt.requestIdentity({ caller: `im:${conn.id}`, context: msg.chat.key, name: msg.messageId, payload: msg.sender.id })
       // The lock can move between the check above and the admission; no receipt was
       // written in that case, so the user can send the platform event again later.
-      const admitted = await rt.admitRequest(event, send)
+      const admitted = await rt.admitRequest(event, async () => {
+        await receiveMessage(conn)(msg)
+        return 'accepted'
+      })
       if (admitted?.status === 'readonly') await sendText(conn, msg.chat, text('readonly'))
       // A receipt from an earlier run left the outcome unknown: the message may have
       // run, so sending it again could repeat the work. Tell the user where to look.
       else if (admitted?.status === 'uncertain') await sendText(conn, msg.chat, text('uncertain'))
-    } else await send()
+    } else await receiveMessage(conn)(msg)
   }
 
   const onAction = (conn) => async (action) => {
