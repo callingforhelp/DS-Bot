@@ -47,32 +47,37 @@ test('customer recall and vote use only trusted same-thread case provenance', as
   assert.deepEqual(stored.find(item => item.summary.startsWith('B_PRIVATE')).customer_source, sourceB)
   assert.equal(stored.find(item => item.id === legacy.id).customer_source, undefined)
 
-  const publishedLesson = 'PUBLISHED_MISROUTE_LESSON_SENTINEL'
+  const misrouteLesson = 'PRIVATE_MISROUTE_LESSON_SENTINEL'
   const privateLesson = 'PRIVATE_RESOLVED_LESSON_SENTINEL'
-  await s.call({ action: 'outcome', id: caseA.id, result: 'misrouted', correct_route: 'drawing_review', lesson: publishedLesson }, 'staff')
-  assert.deepEqual((await s.call({ action: 'rules', rule_action: 'list' }, 'staff')).map(rule => rule.text), [publishedLesson])
+  const privateBmisrouteLesson = 'PRIVATE_B_MISROUTE_LESSON_SENTINEL'
+  const caseB = stored.find(item => item.summary.startsWith('B_PRIVATE'))
+  await s.call({ action: 'outcome', id: caseA.id, result: 'misrouted', correct_route: 'drawing_review', lesson: misrouteLesson }, 'staff')
+  assert.deepEqual(await s.call({ action: 'rules', rule_action: 'list' }, 'staff'), [])
   const firstCorrection = await s.call({ action: 'recall', query: matching }, 'customer-A-old')
   assert.deepEqual(firstCorrection.cases[0].outcome, { result: 'misrouted', correct_route: 'drawing_review' })
-  assert.deepEqual(firstCorrection.rules, [{ text: publishedLesson }])
-  assert.doesNotMatch(JSON.stringify(firstCorrection.cases), /PUBLISHED_MISROUTE_LESSON_SENTINEL/)
-  await s.call({ action: 'outcome', id: caseA.id, result: 'resolved', correct_route: 'PRIVATE_ROUTE_SENTINEL', lesson: privateLesson }, 'staff')
+  assert.deepEqual(firstCorrection.rules, [])
+  assert.doesNotMatch(JSON.stringify(firstCorrection), /PRIVATE_MISROUTE_LESSON_SENTINEL/)
+  await s.call({ action: 'outcome', id: caseA.id, result: 'resolved', correct_route: 'after_sales', lesson: privateLesson }, 'staff')
+  await s.call({ action: 'outcome', id: caseB.id, result: 'misrouted', correct_route: 'order_status', lesson: privateBmisrouteLesson }, 'staff')
   const ownA = await s.call({ action: 'recall', query: matching }, 'customer-A-old')
   assert.deepEqual(ownA.cases.map(item => item.summary), [`A_PRIVATE_${matching}`])
-  assert.deepEqual(ownA.cases[0].outcome, { result: 'resolved' })
+  assert.deepEqual(ownA.cases[0].outcome, { result: 'resolved', correct_route: 'after_sales' })
   assert.deepEqual(ownA.cases[0].misroute, { correct_route: 'drawing_review' })
-  assert.deepEqual(ownA.rules, [{ text: publishedLesson }])
-  assert.doesNotMatch(JSON.stringify(ownA.cases), /PUBLISHED_MISROUTE_LESSON_SENTINEL|PRIVATE_RESOLVED_LESSON_SENTINEL|PRIVATE_ROUTE_SENTINEL/)
+  assert.deepEqual(ownA.rules, [])
+  assert.doesNotMatch(JSON.stringify(ownA), /PRIVATE_MISROUTE_LESSON_SENTINEL|PRIVATE_RESOLVED_LESSON_SENTINEL/)
   assert.equal('id' in ownA.cases[0], false)
   assert.equal('customer' in ownA.cases[0], false)
   assert.equal('customer_source' in ownA.cases[0], false)
   const ownB = await s.call({ action: 'recall', query: matching }, 'customer-B')
   assert.deepEqual(ownB.cases.map(item => item.summary), [`B_PRIVATE_${matching}`])
-  assert.equal('outcome' in ownB.cases[0], false)
+  assert.deepEqual(ownB.cases[0].outcome, { result: 'misrouted', correct_route: 'order_status' })
   assert.equal('misroute' in ownB.cases[0], false)
+  assert.deepEqual(ownB.rules, [])
+  assert.doesNotMatch(JSON.stringify(ownB), /PRIVATE_B_MISROUTE_LESSON_SENTINEL/)
   const staffCase = (await s.call({ action: 'recall', query: matching }, 'staff')).cases.find(item => item.summary.startsWith('A_PRIVATE'))
-  assert.equal(staffCase.outcome.correct_route, 'PRIVATE_ROUTE_SENTINEL')
+  assert.equal(staffCase.outcome.correct_route, 'after_sales')
   assert.equal(staffCase.outcome.lesson, privateLesson)
-  assert.equal(staffCase.misroute.lesson, publishedLesson)
+  assert.equal(staffCase.misroute.lesson, misrouteLesson)
   s.customer('customer-unattributed', undefined)
   assert.deepEqual((await s.call({ action: 'recall', query: matching }, 'customer-unattributed')).cases, [])
   assert.deepEqual((await s.call({ action: 'recall', query: matching }, 'staff')).cases.map(item => item.summary).sort(), [`A_PRIVATE_${matching}`, `B_PRIVATE_${matching}`, `LEGACY_PRIVATE_${matching}`])
@@ -85,11 +90,10 @@ test('customer recall and vote use only trusted same-thread case provenance', as
   const promptStartA = s.calls.length
   const resultA = await s.call({ action: 'vote', summary: matching, routes: ['quote', 'after_sales'] }, 'customer-A')
   const promptA = JSON.parse(s.calls[promptStartA].messages[0].content[0].text)
-  assert.deepEqual(promptA.recalled.cases[0].outcome, { result: 'resolved' })
+  assert.deepEqual(promptA.recalled.cases[0].outcome, { result: 'resolved', correct_route: 'after_sales' })
   assert.deepEqual(promptA.recalled.cases[0].misroute, { correct_route: 'drawing_review' })
-  assert.deepEqual(promptA.recalled.rules, [{ text: publishedLesson }])
-  assert.doesNotMatch(JSON.stringify(promptA.recalled.cases), /PUBLISHED_MISROUTE_LESSON_SENTINEL|PRIVATE_RESOLVED_LESSON_SENTINEL|PRIVATE_ROUTE_SENTINEL/)
-  assert.doesNotMatch(JSON.stringify(promptA), /PRIVATE_RESOLVED_LESSON_SENTINEL|PRIVATE_ROUTE_SENTINEL/)
+  assert.deepEqual(promptA.recalled.rules, [])
+  assert.doesNotMatch(JSON.stringify(promptA), /PRIVATE_MISROUTE_LESSON_SENTINEL|PRIVATE_RESOLVED_LESSON_SENTINEL|PRIVATE_B_MISROUTE_LESSON_SENTINEL/)
   assert.equal(resultA.case_id, undefined)
 
   s.replies([
@@ -100,9 +104,9 @@ test('customer recall and vote use only trusted same-thread case provenance', as
   const result = await s.call({ action: 'vote', summary: matching, routes: ['quote', 'after_sales'] }, 'customer-B')
   const promptB = JSON.parse(s.calls[promptStartB].messages[0].content[0].text)
   assert.match(JSON.stringify(promptB.recalled.cases), /B_PRIVATE_MATCHTOKEN/)
-  assert.doesNotMatch(JSON.stringify(promptB.recalled.cases), /A_PRIVATE_MATCHTOKEN|LEGACY_PRIVATE_MATCHTOKEN|drawing_review/)
-  assert.deepEqual(promptB.recalled.rules, [{ text: publishedLesson }])
-  assert.doesNotMatch(JSON.stringify(promptB), /PRIVATE_RESOLVED_LESSON_SENTINEL|PRIVATE_ROUTE_SENTINEL/)
+  assert.doesNotMatch(JSON.stringify(promptB.recalled.cases), /A_PRIVATE_MATCHTOKEN|LEGACY_PRIVATE_MATCHTOKEN/)
+  assert.deepEqual(promptB.recalled.rules, [])
+  assert.doesNotMatch(JSON.stringify(promptB), /PRIVATE_MISROUTE_LESSON_SENTINEL|PRIVATE_RESOLVED_LESSON_SENTINEL|PRIVATE_B_MISROUTE_LESSON_SENTINEL/)
   assert.equal(result.case_id, undefined)
   assert.doesNotMatch(JSON.stringify(result), /conn-B|chat-B|customer_source/)
   const afterVote = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
@@ -313,7 +317,7 @@ test('case eviction never discards pending human handoffs and fails closed when 
   assert.equal(saved.at(-1).id, result.id)
 })
 
-test('triage ranks Chinese cases, learns misroutes and reviews once', async () => {
+test('triage ranks Chinese cases, publishes sanitized rules and reviews once', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
   const bank = triageBank(dir)
   const call = async args => JSON.parse(await bank(args))
@@ -324,11 +328,14 @@ test('triage ranks Chinese cases, learns misroutes and reviews once', async () =
     await call({ ...entry, summary: '机械零件加工报价' })
     const recalled = await call({ action: 'recall', query: '退款申请' })
     assert.equal(recalled.cases[0].id, first.id)
-    await call({ action: 'outcome', id: first.id, result: 'misrouted', lesson: '退款申请交给财务', correct_route: '财务' })
+    await call({ action: 'outcome', id: first.id, result: 'misrouted', lesson: 'PRIVATE_REFUND_LESSON', correct_route: 'after_sales' })
+    assert.equal((await call({ action: 'recall', query: '退款申请' })).rules.length, 0)
+    await call({ action: 'rules', rule_action: 'add', id: first.id, text: '退款类咨询交由售后团队审核' })
     assert.equal((await call({ action: 'recall', query: '退款申请' })).rules.length, 1)
     const review = await call({ action: 'review' })
     assert.equal(review.cases.length, 2)
     assert.equal(review.misroutes.length, 1)
+    assert.deepEqual(review.pending_lessons, [])
     assert.equal(review.rules[0].hits, 1)
     assert.equal((await call({ action: 'review' })).cases.length, 0)
     const persisted = triageBank(dir)
@@ -337,6 +344,71 @@ test('triage ranks Chinese cases, learns misroutes and reviews once', async () =
     assert.deepEqual(await call({ action: 'rules', rule_action: 'list' }), [])
     await assert.rejects(bank({ action: 'outcome', id: 'missing', result: 'correct' }), /not found/)
     await assert.rejects(bank({ action: 'log' }), /required/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('pending case lessons survive review and clear only after a later linked rule', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1000 })
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  const bank = triageBank(dir)
+  const call = async args => JSON.parse(await bank(args))
+  try {
+    const caseA = await call({ action: 'log', customer: 'A', summary: 'drawing review', routed_to: 'Sales', reason: 'misroute' })
+    const caseB = await call({ action: 'log', customer: 'B', summary: 'order status', routed_to: 'Sales', reason: 'misroute' })
+    await assert.rejects(call({ action: 'rules', rule_action: 'add', id: 'missing-case', text: 'Sanitized rule' }), /case.*not found/i)
+    t.mock.timers.setTime(1100)
+    const oldRule = await call({ action: 'rules', rule_action: 'add', id: caseA.id, text: 'Earlier linked guidance' })
+    assert.equal(oldRule.from_case, caseA.id)
+    t.mock.timers.setTime(1200)
+    await call({ action: 'outcome', id: caseA.id, result: 'misrouted', correct_route: 'drawing_review', lesson: 'PRIVATE_A_MISROUTE' })
+    t.mock.timers.setTime(1300)
+    await call({ action: 'outcome', id: caseA.id, result: 'resolved', correct_route: 'after_sales', lesson: 'PRIVATE_A_RESOLVED' })
+    t.mock.timers.setTime(1400)
+    await call({ action: 'outcome', id: caseB.id, result: 'misrouted', correct_route: 'order_status', lesson: 'PRIVATE_B_MISROUTE' })
+    const expected = [
+      { id: caseA.id, source: 'outcome', lesson: 'PRIVATE_A_RESOLVED', correct_route: 'after_sales', at: 1300 },
+      { id: caseA.id, source: 'misroute', lesson: 'PRIVATE_A_MISROUTE', correct_route: 'drawing_review', at: 1200 },
+      { id: caseB.id, source: 'outcome', lesson: 'PRIVATE_B_MISROUTE', correct_route: 'order_status', at: 1400 },
+    ]
+    assert.deepEqual((await call({ action: 'review' })).pending_lessons, expected)
+    assert.deepEqual(JSON.parse(await triageBank(dir)({ action: 'review' })).pending_lessons, expected)
+    t.mock.timers.setTime(1500)
+    const published = await call({ action: 'rules', rule_action: 'add', id: caseA.id, text: 'Sanitized drawing requests go to drawing review.' })
+    assert.equal(published.from_case, caseA.id)
+    assert.deepEqual((await call({ action: 'review' })).pending_lessons, [expected[2]])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('a full rule bank does not block recording a corrected outcome', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  const bank = triageBank(dir)
+  const call = async args => JSON.parse(await bank(args))
+  try {
+    const { id } = await call({ action: 'log', customer: 'Customer', summary: 'Drawing question', routed_to: 'Sales', reason: 'Misroute' })
+    const rules = Array.from({ length: 200 }, (_, index) => ({ id: `rule-${index}`, text: `Rule ${index}`, created: 0, hits: 0 }))
+    await writeFile(join(dir, 'triage', 'rules.json'), JSON.stringify({ rules, reviewed: 0 }))
+    await call({ action: 'outcome', id, result: 'misrouted', correct_route: 'drawing_review', lesson: 'PRIVATE_FULL_BANK_LESSON' })
+    const stored = JSON.parse((await readFile(join(dir, 'triage', 'cases.jsonl'), 'utf8')).trim())
+    assert.equal(stored.outcome.lesson, 'PRIVATE_FULL_BANK_LESSON')
+    assert.equal(JSON.parse(await readFile(join(dir, 'triage', 'rules.json'), 'utf8')).rules.length, 200)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('case retention preserves unpublished lesson cases', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  try {
+    const path = join(dir, 'triage', 'cases.jsonl')
+    const cases = [
+      { id: 'pending-lesson', created: 1, summary: 'drawing case', outcome: { result: 'misrouted', at: 1, correct_route: 'drawing_review', lesson: 'PRIVATE_RETENTION_LESSON' } },
+      ...Array.from({ length: 1999 }, (_, index) => ({ id: `old-${index}`, created: index + 2, summary: `case ${index}` })),
+    ]
+    await mkdir(join(dir, 'triage'))
+    await writeFile(path, cases.map(entry => JSON.stringify(entry)).join('\n') + '\n')
+    await triageBank(dir)({ action: 'log', customer: 'new', summary: 'new case', routed_to: 'Sales', reason: 'new' })
+    const stored = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    assert.equal(stored.length, 2000)
+    assert.ok(stored.some(entry => entry.id === 'pending-lesson'))
+    assert.equal(stored.some(entry => entry.id === 'old-0'), false)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 

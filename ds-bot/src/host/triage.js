@@ -25,6 +25,20 @@ const validType = entry => {
 }
 const clean = value => String(value ?? '').trim().slice(0, 4000)
 const misrouteDetails = outcome => ({ at: outcome.at, correct_route: clean(outcome.correct_route), lesson: clean(outcome.lesson) })
+const caseLessons = entry => [
+  { source: 'outcome', value: entry.outcome },
+  { source: 'misroute', value: entry.misroute },
+].flatMap(({ source, value }) => {
+  const lesson = clean(value?.lesson)
+  if (!lesson) return []
+  const at = Number.isFinite(value.at) ? value.at : Number.isFinite(entry.misrouted_at) ? entry.misrouted_at : Number.isFinite(entry.created) ? entry.created : 0
+  return [{ source, lesson, correct_route: clean(value.correct_route), at }]
+})
+const publishedLesson = (entry, note, rules) => rules.some(rule => rule.from_case === entry.id && Number.isFinite(rule.created) && rule.created >= note.at)
+const hasPendingLessons = (entry, rules) => caseLessons(entry).some(note => !publishedLesson(entry, note, rules))
+const pendingLessons = (cases, rules) => cases.flatMap(entry => caseLessons(entry)
+  .filter(note => !publishedLesson(entry, note, rules))
+  .map(note => ({ id: entry.id, source: note.source, lesson: note.lesson, correct_route: note.correct_route, at: note.at })))
 const recallFeedback = (value, routes) => {
   const feedback = {}
   if (['correct', 'misrouted', 'resolved'].includes(value?.result)) feedback.result = value.result
@@ -118,19 +132,19 @@ export function triageBank(home, writable = () => {}, rt) {
     writable()
     await replaceFile(temp, path, writable)
   }
-  const writeCases = async (cases, retained) => {
+  const writeCases = async (cases, retained, rules = []) => {
     for (const entry of cases) {
       if (entry.misroute !== undefined) entry.misroute = misrouteDetails(entry.misroute)
     }
     const lines = cases.map(item => JSON.stringify(item) + '\n')
     let bytes = lines.reduce((size, line) => size + Buffer.byteLength(line), 0)
     while ((bytes > MAX_BYTES || lines.length > MAX_CASES) && lines.length > 1) {
-      const index = cases.findIndex(entry => entry !== retained && entry.handoff?.status !== 'pending')
+      const index = cases.findIndex(entry => entry !== retained && entry.handoff?.status !== 'pending' && !hasPendingLessons(entry, rules))
       if (index === -1) break
       bytes -= Buffer.byteLength(lines.splice(index, 1)[0])
       cases.splice(index, 1)
     }
-    if (lines.length > MAX_CASES) throw new Error('Triage case limit reached; handle pending handoffs first')
+    if (lines.length > MAX_CASES) throw new Error('Triage case limit reached; handle pending handoffs or publish pending lessons first')
     await write('cases.jsonl', lines.join(''))
   }
   const call = (args, context = {}) => {
@@ -272,20 +286,23 @@ export function triageBank(home, writable = () => {}, rt) {
         if (entry.outcome?.result === 'misrouted') entry.misroute = misrouteDetails(entry.outcome)
         entry.outcome = { result: args.result, correct_route: clean(args.correct_route), lesson: clean(args.lesson), at: now }
         if (args.result === 'misrouted') { entry.misrouted_at = now; delete entry.misroute }
-        if (args.result === 'misrouted' && clean(args.lesson)) addRule(args.lesson, entry.id)
         result = entry
       } else if (args.action === 'rules') {
-        if (args.rule_action === 'add') result = addRule(args.text)
+        if (args.rule_action === 'add') {
+          const source = args.id === undefined ? undefined : cases.find(item => item.id === args.id)
+          if (args.id !== undefined && !source) throw new Error('Triage case not found for rule source')
+          result = addRule(args.text, source?.id)
+        }
         else if (args.rule_action === 'remove') { state.rules = state.rules.filter(rule => rule.id !== args.id); result = state.rules }
         else if (args.rule_action === 'list') result = state.rules
         else throw new Error('rule_action must be add, remove or list')
       } else if (args.action === 'review') {
         const misroutes = cases.filter(item => (item.misrouted_at ?? item.misroute?.at ?? (item.outcome?.result === 'misrouted' ? item.outcome.at : 0)) > state.reviewed)
           .map(item => ({ ...item, misroute: misrouteDetails(item.outcome?.result === 'misrouted' ? item.outcome : item.misroute ?? { at: item.misrouted_at }) }))
-        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes, rules: state.rules, pending_handoffs: cases.filter(item => item.handoff?.status === 'pending') }
+        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes, rules: state.rules, pending_handoffs: cases.filter(item => item.handoff?.status === 'pending'), pending_lessons: pendingLessons(cases, state.rules) }
         state.reviewed = now
       } else throw new Error('Unknown triage action')
-      if (['log', 'outcome'].includes(args.action)) await writeCases(cases, retained)
+      if (['log', 'outcome'].includes(args.action)) await writeCases(cases, retained, state.rules)
       await write('rules.json', JSON.stringify(state))
       return JSON.stringify(result)
     }
@@ -339,7 +356,10 @@ export function triageBank(home, writable = () => {}, rt) {
         cards = true
         rt.cardShown?.(sessionId, 'question', rt.state.questions[sessionId].question)
       }
-      if (changed) await writeCases(cases)
+      if (changed) {
+        const state = await read('rules.json', { rules: [], reviewed: 0 })
+        await writeCases(cases, undefined, state.rules)
+      }
       hasPending = cases.some(entry => entry.handoff?.status === 'pending')
       if (cards) await rt.save({ required: true })
     }).finally(() => { syncing = undefined })

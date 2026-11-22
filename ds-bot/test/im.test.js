@@ -766,10 +766,14 @@ test('triage tools restrict current and historical customer parts but not normal
   const normal = await call('a', log)
   assert.ok((await call('a', { action: 'recall', query: 'drawing' })).cases.length)
   await call('a', { action: 'outcome', id: normal.id, result: 'misrouted', lesson: 'Inspect drawings' })
-  const rule = await call('a', { action: 'rules', rule_action: 'add', text: 'Check dimensions' })
-  assert.equal((await call('a', { action: 'rules', rule_action: 'list' })).length, 2)
+  const firstReview = await call('a', { action: 'review' })
+  assert.equal(firstReview.misroutes.length, 1)
+  assert.equal(firstReview.pending_lessons[0].lesson, 'Inspect drawings')
+  const rule = await call('a', { action: 'rules', rule_action: 'add', id: normal.id, text: 'Check dimensions' })
+  assert.equal((await call('a', { action: 'rules', rule_action: 'list' })).length, 1)
   await call('a', { action: 'rules', rule_action: 'remove', id: rule.id })
-  assert.equal((await call('a', { action: 'review' })).misroutes.length, 1)
+  assert.equal((await call('a', { action: 'rules', rule_action: 'list' })).length, 0)
+  assert.equal((await call('a', { action: 'review' })).pending_lessons.length, 1)
 })
 
 test('customer triage handoffs queue in the main chat and advance after answers and dismissals', async (t) => {
