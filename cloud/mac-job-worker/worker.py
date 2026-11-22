@@ -1486,7 +1486,12 @@ def _mcp_call_tool(
 
 
 def run_dsbot_via_local_mcp(
-    job: dict[str, Any], mcp_url: str, mcp_token: str
+    job: dict[str, Any],
+    mcp_url: str,
+    mcp_token: str,
+    *,
+    empty_done_grace_sec: float = 45.0,
+    poll_sleep_sec: float = 1.0,
 ) -> dict[str, Optional[str]]:
     task = str(job["task"])
     timeout_sec = max(1, int(job.get("timeout_sec") or 900))
@@ -1551,6 +1556,7 @@ def run_dsbot_via_local_mcp(
     cur_after = after
     collected: list[dict[str, Any]] = []
     waiting_for_target: list[dict[str, Any]] = []
+    empty_grace_deadline = min(deadline, time.monotonic() + max(0.0, empty_done_grace_sec))
 
     def _matching_waiting() -> list[dict[str, Any]]:
         w_res = _mcp_call_tool(mcp_url, mcp_token, "list_waiting", {}, timeout=15.0)
@@ -1588,6 +1594,20 @@ def run_dsbot_via_local_mcp(
                     for m in (chat_res.get("messages") or [])
                     if m.get("kind") != "user" and int(m.get("time") or 0) >= after
                 )
+            if collected:
+                break
+            try:
+                matched = _matching_waiting()
+            except Exception:
+                matched = []
+            if matched:
+                waiting_for_target = matched
+                break
+            if time.monotonic() < empty_grace_deadline:
+                time.sleep(
+                    min(poll_sleep_sec, max(0.0, empty_grace_deadline - time.monotonic()))
+                )
+                continue
             break
         try:
             matched = _matching_waiting()

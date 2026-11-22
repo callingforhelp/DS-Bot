@@ -28,6 +28,7 @@ from worker import (
     default_paradev_runner,
     ensure_paradev_project,
     is_authorized_local_path,
+    run_dsbot_via_local_mcp,
 )
 
 
@@ -1321,6 +1322,74 @@ class ParaDevRunnerTest(unittest.TestCase):
                 sub_run.assert_not_called()
             self.assertEqual(res_err["status"], "failed")
             self.assertIn("MCP HTTP 500", res_err["error"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_dsbot_runner_retries_empty_done_during_cold_rollover(self) -> None:
+        wait_calls = 0
+
+        class RolloverHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                nonlocal wait_calls
+                length = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                tool_name = (req.get("params") or {}).get("name")
+                if tool_name == "send_to_bot":
+                    result = {"sent": True, "after": 1000}
+                elif tool_name == "wait_for_reply":
+                    wait_calls += 1
+                    if wait_calls == 1:
+                        result = {"done": True, "working": False, "after": 1000, "messages": []}
+                    else:
+                        result = {
+                            "done": True,
+                            "working": False,
+                            "after": 1600,
+                            "messages": [
+                                {"kind": "bot", "from": "Chief", "text": "COLD_ROLLOVER_OK", "time": 1600}
+                            ],
+                        }
+                elif tool_name == "read_chat":
+                    result = {"working": False, "messages": []}
+                elif tool_name == "list_waiting":
+                    result = {"waiting": [], "answerIn": "DS Bot on this computer"}
+                else:
+                    result = {}
+
+                body = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req.get("id"),
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(result)}],
+                            "structuredContent": result,
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), RolloverHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            res = run_dsbot_via_local_mcp(
+                {"task": "hi", "bot": "Chief", "timeout_sec": 10},
+                f"http://127.0.0.1:{srv.server_address[1]}/mcp",
+                "test-mcp-tok",
+                empty_done_grace_sec=5.0,
+                poll_sleep_sec=0.05,
+            )
+            self.assertEqual(res["status"], "succeeded")
+            self.assertIn("COLD_ROLLOVER_OK", res["result_summary"])
+            self.assertGreaterEqual(wait_calls, 2)
         finally:
             srv.shutdown()
             srv.server_close()
