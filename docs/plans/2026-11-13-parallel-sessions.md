@@ -40,6 +40,7 @@ not quietly fall back to the two-view shape.
   two model calls; the list says so.
 - `chatOf(botId)` still returns the current part. Phone, IM, group chats and the Bot's
   identity are unchanged; they keep seeing the current part.
+- Exception: public-platform IM customers each get their own background thread, never the Bot's foreground chat.
 
 ## Run mode
 
