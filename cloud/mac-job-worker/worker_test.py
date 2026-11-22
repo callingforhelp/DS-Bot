@@ -18,6 +18,7 @@ from broker import BrokerStore, ThreadingHTTPServer, make_handler
 from worker import (
     _PROBE_BANNER_PREFIX,
     BrokerClient,
+    ContextSyncManager,
     HttpHealthProbe,
     MacJobWorker,
     SsmTunnelManager,
@@ -25,11 +26,13 @@ from worker import (
     _ensure_local_git_repo,
     _frame_dsbot_task,
     _release_dir_lock,
+    build_mac_context_markdown,
     default_dsbot_runner,
     default_git_sync_runner,
     is_authorized_local_path,
     run_dsbot_via_local_mcp,
     start_tunnel_watchdog,
+    write_local_cloud_mirror,
 )
 
 
@@ -1019,6 +1022,167 @@ class LocalMacWorkerTest(unittest.TestCase):
             _frame_dsbot_task({"aws_session_id": "e2e-0310"}, framed_e2e),
             framed_e2e,
         )
+
+    def test_long_poll_claim_wakes_worker_poll_once(self) -> None:
+        from broker import BrokerStore, ThreadingHTTPServer, make_handler
+
+        store = BrokerStore(os.path.join(self.tmpdir.name, "jobs-lp.db"))
+        srv = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(store, producer_token="prod-tok", worker_token="work-tok"),
+        )
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            client = BrokerClient(f"http://127.0.0.1:{srv.server_address[1]}", "work-tok")
+            worker = MacJobWorker(
+                broker=client,
+                worker_id="mac-lp",
+                state_dir=os.path.join(self.tmpdir.name, "state-lp"),
+                dsbot_runner=lambda job: {"status": "succeeded", "result_summary": "lp-ok"},
+                claim_wait_sec=5.0,
+            )
+            claimed: dict[str, object] = {}
+
+            def run_poll() -> None:
+                t0 = time.monotonic()
+                claimed["res"] = worker.poll_once()
+                claimed["elapsed"] = time.monotonic() - t0
+
+            th = threading.Thread(target=run_poll, daemon=True)
+            th.start()
+            time.sleep(0.15)
+            store.enqueue_job(
+                {"target": "dsbot", "task": "ping", "aws_session_id": "lp-1", "bot": "Chief"}
+            )
+            th.join(timeout=4.0)
+            self.assertFalse(th.is_alive())
+            self.assertLess(claimed["elapsed"], 2.0)
+            self.assertEqual(claimed["res"]["status"], "succeeded")
+            self.assertEqual(claimed["res"]["result_summary"], "lp-ok")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            store.close()
+
+    def test_context_mirror_bidirectional_sync_and_dedup(self) -> None:
+        from broker import BrokerStore, ThreadingHTTPServer as THS, make_handler as mk_handler
+
+        store = BrokerStore(os.path.join(self.tmpdir.name, "jobs-ctx.db"))
+        ec2_team_dir = os.path.join(self.tmpdir.name, "ec2_team_mem")
+        os.makedirs(ec2_team_dir, exist_ok=True)
+        ec2_srv = THS(
+            ("127.0.0.1", 0),
+            mk_handler(
+                store,
+                producer_token="prod-tok",
+                worker_token="work-tok",
+                team_memory_dir=ec2_team_dir,
+            ),
+        )
+        threading.Thread(target=ec2_srv.serve_forever, daemon=True).start()
+        try:
+            dsbot_home = os.path.join(self.tmpdir.name, "mac_dsbot")
+            team_dir = os.path.join(dsbot_home, "bot", "memory", "team")
+            bot_mem_dir = os.path.join(dsbot_home, "bot", "memory", "bots", "b1")
+            sum_dir = os.path.join(dsbot_home, "bot", "memory", "summaries")
+            os.makedirs(team_dir, exist_ok=True)
+            os.makedirs(bot_mem_dir, exist_ok=True)
+            os.makedirs(sum_dir, exist_ok=True)
+            with open(os.path.join(dsbot_home, "bot", "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"bots": {"b1": {"name": "Devin Manager"}}}, f)
+            with open(os.path.join(team_dir, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write("# Memory\n\n## Index\n- [[shared]]\n")
+            with open(os.path.join(team_dir, "shared.md"), "w", encoding="utf-8") as f:
+                f.write("- User prefers concise reports\n- Bad: xoxb-secret123456789012345\n")
+            with open(os.path.join(team_dir, "cloud-mirror.md"), "w", encoding="utf-8") as f:
+                f.write("SHOULD_NOT_ECHO_BACK\n")
+            with open(os.path.join(bot_mem_dir, "notes.md"), "w", encoding="utf-8") as f:
+                f.write("- Devin manages DS-Bot PRs\n")
+            with open(os.path.join(sum_dir, "2026-11-23.md"), "w", encoding="utf-8") as f:
+                f.write("- Upgraded DS-Bot to 0.3.10\n")
+
+            class McpHandler(BaseHTTPRequestHandler):
+                def log_message(self, fmt: str, *args) -> None:
+                    return
+
+                def do_POST(self) -> None:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    req = json.loads(self.rfile.read(length).decode("utf-8"))
+                    args = (req.get("params") or {}).get("arguments") or {}
+                    bot = args.get("bot")
+                    res = {
+                        "messages": [
+                            {"kind": "user", "text": f"Working on repo for {bot}"},
+                            {"kind": "bot", "from": bot, "text": f"Ready in {bot} with sk-1234567890abcdef1234"},
+                        ]
+                    }
+                    body = json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req.get("id"),
+                            "result": {
+                                "content": [{"type": "text", "text": json.dumps(res)}],
+                                "structuredContent": res,
+                            },
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            mcp_srv = THS(("127.0.0.1", 0), McpHandler)
+            threading.Thread(target=mcp_srv.serve_forever, daemon=True).start()
+            try:
+                client = BrokerClient(
+                    f"http://127.0.0.1:{ec2_srv.server_address[1]}", "work-tok"
+                )
+                sync_mgr = ContextSyncManager(
+                    broker=client,
+                    dsbot_home=dsbot_home,
+                    state_dir=os.path.join(self.tmpdir.name, "sync-state"),
+                    mcp_url=f"http://127.0.0.1:{mcp_srv.server_address[1]}/mcp",
+                    mcp_token="tok",
+                    primary_bots=("Devin Manager",),
+                )
+                self.assertTrue(sync_mgr.sync_to_ec2())
+                self.assertFalse(sync_mgr.sync_to_ec2())  # unchanged hash -> deduped
+
+                with open(os.path.join(ec2_team_dir, "mac-mirror.md"), "r", encoding="utf-8") as f:
+                    ec2_mirrored = f.read()
+                self.assertIn("User prefers concise reports", ec2_mirrored)
+                self.assertIn("Devin Manager", ec2_mirrored)
+                self.assertIn("Working on repo for Devin Manager", ec2_mirrored)
+                self.assertNotIn("SHOULD_NOT_ECHO_BACK", ec2_mirrored)
+                self.assertNotIn("xoxb-secret123456789012345", ec2_mirrored)
+                self.assertNotIn("sk-1234567890abcdef1234", ec2_mirrored)
+
+                # Simulate EC2 /cloud recording a note -> Mac pulls into cloud-mirror.md
+                store.add_cloud_note(
+                    channel="D0CKFEVJF0X",
+                    thread_ts="1700.9",
+                    bot_name="Chief",
+                    prompt_excerpt="/cloud check CI",
+                    reply_excerpt="All checks green on dev",
+                )
+                pulled = sync_mgr.pull_cloud_notes()
+                self.assertEqual(pulled, 1)
+                self.assertEqual(sync_mgr.pull_cloud_notes(), 0)
+                with open(os.path.join(team_dir, "cloud-mirror.md"), "r", encoding="utf-8") as f:
+                    mac_cloud = f.read()
+                self.assertIn("All checks green on dev", mac_cloud)
+                with open(os.path.join(team_dir, "MEMORY.md"), "r", encoding="utf-8") as f:
+                    idx = f.read()
+                self.assertIn("- [[shared]]", idx)
+                self.assertIn("- [[cloud-mirror]]", idx)
+            finally:
+                mcp_srv.shutdown()
+                mcp_srv.server_close()
+        finally:
+            ec2_srv.shutdown()
+            ec2_srv.server_close()
+            store.close()
 
 
 if __name__ == "__main__":

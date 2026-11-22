@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import http.client
 import json
 import os
@@ -23,6 +24,7 @@ SECRET_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bx(?:app|oxb|oxp|oxa)-[A-Za-z0-9-]{16,}\b"),
     re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]{16,}=*"),
     re.compile(r"(?i)\b(AKIA[0-9A-Z]{16})\b"),
 ]
@@ -108,6 +110,22 @@ class BrokerClient:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.worker_token}",
             },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                return exc.code, json.loads(raw)
+            except Exception:
+                return exc.code, {"ok": False, "error": raw}
+
+    def get(self, path: str, timeout: float = 15.0) -> tuple[int, dict[str, Any]]:
+        req = urllib.request.Request(
+            f"{self.base_url}{path}",
+            method="GET",
+            headers={"Authorization": f"Bearer {self.worker_token}"},
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -759,6 +777,270 @@ def _mcp_call_tool(
     return parsed if isinstance(parsed, dict) else {"value": parsed}
 
 
+_INDEX_HEADING_RE = re.compile(r"^##\s+Index\s*$")
+_ANY_HEADING_RE = re.compile(r"^#{1,6}\s+")
+
+
+def _atomic_write_text_file(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def ensure_team_memory_link(memory_md_path: str, topic: str) -> None:
+    link = f"- [[{topic}]]"
+    existing = ""
+    if os.path.exists(memory_md_path):
+        with open(memory_md_path, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    if not existing.strip():
+        _atomic_write_text_file(memory_md_path, f"# Memory\n\n## Index\n{link}\n")
+        return
+    lines = existing.splitlines()
+    if any(ln.strip() == link or f"[[{topic}]]" in ln for ln in lines):
+        return
+    idx = next(
+        (i for i, ln in enumerate(lines) if _INDEX_HEADING_RE.match(ln.strip())),
+        -1,
+    )
+    if idx == -1:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(["## Index", link])
+    else:
+        end = next(
+            (i for i in range(idx + 1, len(lines)) if _ANY_HEADING_RE.match(lines[i])),
+            len(lines),
+        )
+        at = end
+        while at > idx + 1 and not lines[at - 1].strip():
+            at -= 1
+        lines.insert(at, link)
+    _atomic_write_text_file(memory_md_path, "\n".join(lines) + "\n")
+
+
+def write_local_cloud_mirror(dsbot_home: str, markdown: str, max_chars: int = 24000) -> str:
+    team_dir = os.path.join(dsbot_home, "bot", "memory", "team")
+    mirror_path = os.path.join(team_dir, "cloud-mirror.md")
+    clean = redact_secrets(str(markdown or ""))[:max_chars]
+    if clean and not clean.endswith("\n"):
+        clean += "\n"
+    _atomic_write_text_file(mirror_path, clean)
+    ensure_team_memory_link(os.path.join(team_dir, "MEMORY.md"), "cloud-mirror")
+    return mirror_path
+
+
+def _read_safe_md(path: str, limit: int = 3500) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read(limit + 200)
+    except OSError:
+        return ""
+    text = redact_secrets(raw.strip())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "\n[truncated]"
+    return text
+
+
+def build_mac_context_markdown(
+    dsbot_home: str,
+    mcp_url: Optional[str] = None,
+    mcp_token: Optional[str] = None,
+    primary_bots: tuple[str, ...] = ("Devin Manager", "Chief"),
+    max_turns: int = 10,
+    max_chars: int = 20000,
+) -> str:
+    mem_root = os.path.join(dsbot_home, "bot", "memory")
+    sections: list[str] = [
+        "# Mac Context Mirror (Local DS Bot.app)",
+        "Read-only snapshot of local Mac memory and recent primary bot turns.",
+        "",
+    ]
+
+    team_dir = os.path.join(mem_root, "team")
+    if os.path.isdir(team_dir):
+        for fname in sorted(os.listdir(team_dir)):
+            if not fname.endswith(".md") or fname in ("MEMORY.md", "cloud-mirror.md"):
+                continue
+            body = _read_safe_md(os.path.join(team_dir, fname), limit=4000)
+            if body:
+                sections.append(f"## Team Memory ({fname})")
+                sections.append(body)
+                sections.append("")
+
+    bot_names: dict[str, str] = {}
+    state_path = os.path.join(dsbot_home, "bot", "state.json")
+    if os.path.isfile(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            for bid, bobj in (st.get("bots") or {}).items():
+                if isinstance(bobj, dict) and bobj.get("name"):
+                    bot_names[str(bid)] = str(bobj["name"])
+        except Exception:
+            pass
+
+    bots_dir = os.path.join(mem_root, "bots")
+    if os.path.isdir(bots_dir):
+        for bid in sorted(os.listdir(bots_dir)):
+            bpath = os.path.join(bots_dir, bid)
+            if not os.path.isdir(bpath):
+                continue
+            label = bot_names.get(bid, bid)
+            for fname in sorted(os.listdir(bpath)):
+                if not fname.endswith(".md"):
+                    continue
+                body = _read_safe_md(os.path.join(bpath, fname), limit=1800)
+                if fname == "MEMORY.md" and len(body.splitlines()) <= 4 and "## Index" in body:
+                    continue
+                if body:
+                    sections.append(f"## Bot Memory ({label} / {fname})")
+                    sections.append(body)
+                    sections.append("")
+
+    summaries_dir = os.path.join(mem_root, "summaries")
+    if os.path.isdir(summaries_dir):
+        md_files = [
+            os.path.join(summaries_dir, fn)
+            for fn in os.listdir(summaries_dir)
+            if fn.endswith(".md")
+        ]
+        md_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for sp in md_files[:3]:
+            body = _read_safe_md(sp, limit=1800)
+            if body:
+                sections.append(f"## Summary ({os.path.basename(sp)})")
+                sections.append(body)
+                sections.append("")
+
+    tok = (mcp_token or "").strip()
+    if mcp_url and tok and max_turns > 0:
+        for bot_name in primary_bots:
+            try:
+                res = _mcp_call_tool(
+                    mcp_url,
+                    tok,
+                    "read_chat",
+                    {"bot": bot_name},
+                    timeout=8.0,
+                )
+                msgs = [
+                    m
+                    for m in (res.get("messages") or [])
+                    if isinstance(m, dict) and str(m.get("text") or "").strip()
+                ]
+                recent = msgs[-max_turns:]
+                if recent:
+                    sections.append(f"## Recent Live Turns ({bot_name})")
+                    for m in recent:
+                        kind = str(m.get("kind") or "msg")
+                        frm = str(m.get("from") or ("User" if kind == "user" else bot_name))
+                        txt = redact_secrets(str(m.get("text") or "")).replace("\n", " ").strip()[:400]
+                        sections.append(f"- [{kind}] {frm}: {txt}")
+                    sections.append("")
+            except Exception:
+                continue
+
+    combined = redact_secrets("\n".join(sections)).strip() + "\n"
+    if len(combined) > max_chars:
+        combined = combined[: max_chars - 32].rstrip() + "\n\n[mac-mirror truncated]\n"
+    return combined
+
+
+class ContextSyncManager:
+    """Keeps Mac <-> EC2 disjoint mirror files in sync over the broker HTTP tunnel."""
+
+    def __init__(
+        self,
+        broker: BrokerClient,
+        dsbot_home: str,
+        state_dir: str,
+        mcp_url: Optional[str] = None,
+        mcp_token_file: Optional[str] = None,
+        mcp_token: Optional[str] = None,
+        primary_bots: tuple[str, ...] = ("Devin Manager", "Chief"),
+    ) -> None:
+        self.broker = broker
+        self.dsbot_home = dsbot_home
+        self.state_dir = state_dir
+        self.mcp_url = mcp_url
+        self.mcp_token_file = mcp_token_file
+        self.mcp_token = mcp_token
+        self.primary_bots = primary_bots
+        self._lock = threading.Lock()
+        self._last_uploaded_sha = ""
+        self._cursor_path = os.path.join(self.state_dir, "cloud-notes-cursor.json")
+
+    def _load_cursor(self) -> int:
+        if not os.path.exists(self._cursor_path):
+            return 0
+        try:
+            with open(self._cursor_path, "r", encoding="utf-8") as f:
+                return int(json.load(f).get("last_note_id") or 0)
+        except Exception:
+            return 0
+
+    def _save_cursor(self, last_note_id: int) -> None:
+        os.makedirs(self.state_dir, exist_ok=True)
+        tmp = f"{self._cursor_path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"last_note_id": int(last_note_id)}, f)
+        os.replace(tmp, self._cursor_path)
+
+    def sync_to_ec2(self, force: bool = False) -> bool:
+        tok = _read_mcp_token(self.mcp_token, self.mcp_token_file)
+        markdown = build_mac_context_markdown(
+            self.dsbot_home,
+            mcp_url=self.mcp_url,
+            mcp_token=tok,
+            primary_bots=self.primary_bots,
+        )
+        digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        with self._lock:
+            if not force and digest == self._last_uploaded_sha:
+                return False
+            code, data = self.broker.post(
+                "/v1/worker/context-snapshot",
+                {"markdown": markdown, "sha256": digest},
+                timeout=15.0,
+            )
+            if code == 200 and data.get("ok"):
+                self._last_uploaded_sha = digest
+                return True
+            return False
+
+    def pull_cloud_notes(self) -> int:
+        with self._lock:
+            last_id = self._load_cursor()
+            code, data = self.broker.get(
+                f"/v1/worker/cloud-notes?since_id={last_id}&limit=50", timeout=15.0
+            )
+            if code != 200 or not data.get("ok"):
+                return 0
+            notes = data.get("notes") or []
+            latest_id = int(data.get("latest_id") or 0)
+            recent_md = str(data.get("recent_markdown") or "")
+            if not notes and latest_id <= last_id:
+                return 0
+            if recent_md.strip():
+                write_local_cloud_mirror(self.dsbot_home, recent_md)
+            new_cursor = max(last_id, latest_id, max((int(n.get("note_id") or 0) for n in notes), default=0))
+            if new_cursor > last_id:
+                self._save_cursor(new_cursor)
+                try:
+                    self.broker.post(
+                        "/v1/worker/cloud-notes/ack",
+                        {"up_to_id": new_cursor},
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            return len(notes)
+
+
 _PROBE_SESSION_PREFIXES = ("e2e-", "probe-", "healthcheck-")
 _PROBE_BANNER_PREFIX = "[Automated healthcheck probe from mac-job-worker"
 
@@ -1076,6 +1358,7 @@ class MacJobWorker:
         ] = None,
         hostname: Optional[str] = None,
         heartbeat_interval: float = 30.0,
+        claim_wait_sec: float = 0.0,
     ) -> None:
         self.broker = broker
         self.worker_id = worker_id
@@ -1085,6 +1368,7 @@ class MacJobWorker:
         self.git_sync_runner = git_sync_runner
         self.hostname = hostname or socket.gethostname()
         self.heartbeat_interval = heartbeat_interval
+        self.claim_wait_sec = max(0.0, float(claim_wait_sec))
 
     def _cache_path(self, job_id: str) -> str:
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", job_id)
@@ -1281,13 +1565,17 @@ class MacJobWorker:
                     fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
     def poll_once(self) -> Optional[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "worker_id": self.worker_id,
+            "hostname": self.hostname,
+            "capabilities": ["dsbot", "git_sync"],
+        }
+        if self.claim_wait_sec > 0.0:
+            payload["wait_sec"] = self.claim_wait_sec
         code, data = self.broker.post(
             "/v1/worker/claim",
-            {
-                "worker_id": self.worker_id,
-                "hostname": self.hostname,
-                "capabilities": ["dsbot", "git_sync"],
-            },
+            payload,
+            timeout=max(20.0, self.claim_wait_sec + 15.0),
         )
         if code != 200 or not data.get("ok"):
             return None
@@ -1324,6 +1612,7 @@ def main() -> None:
     )
     state_dir = os.environ.get("WORKER_STATE_DIR", "/Users/chief/.mac-job-worker/state")
     poll_interval = float(os.environ.get("POLL_INTERVAL_SEC", "5"))
+    claim_wait_sec = float(os.environ.get("CLAIM_WAIT_SEC", "25"))
     heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL_SEC", "30"))
 
     broker = BrokerClient(broker_url, worker_token)
@@ -1362,7 +1651,27 @@ def main() -> None:
         dsbot_runner=lambda job: default_dsbot_runner(job, dsh_bin, headless_patch),
         git_sync_runner=lambda job: default_git_sync_runner(job),
         heartbeat_interval=heartbeat_interval,
+        claim_wait_sec=claim_wait_sec,
     )
+
+    context_sync_enabled = (
+        os.environ.get("CONTEXT_SYNC_ENABLED", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    context_sync: Optional[ContextSyncManager] = None
+    if context_sync_enabled:
+        dsbot_home = os.path.expanduser(os.environ.get("DSBOT_HOME", "~/.ds-bot"))
+        mcp_url = os.environ.get("LOCAL_DSBOT_MCP_URL", "http://127.0.0.1:8797/mcp").strip()
+        mcp_token_file = os.environ.get(
+            "LOCAL_DSBOT_MCP_TOKEN_FILE", "/Users/chief/.mac-job-worker/dsbot-mcp-token"
+        )
+        context_sync = ContextSyncManager(
+            broker=broker,
+            dsbot_home=dsbot_home,
+            state_dir=state_dir,
+            mcp_url=mcp_url,
+            mcp_token_file=mcp_token_file,
+        )
 
     stop_event = threading.Event()
     if handoff_tunnel is not None:
@@ -1370,6 +1679,19 @@ def main() -> None:
         start_tunnel_watchdog(
             handoff_tunnel, stop_event, interval_sec=handoff_probe_sec
         )
+
+    if context_sync is not None:
+        sync_interval = max(30.0, float(os.environ.get("CONTEXT_SYNC_INTERVAL_SEC", "300")))
+
+        def context_sync_loop() -> None:
+            while not stop_event.wait(sync_interval):
+                try:
+                    context_sync.pull_cloud_notes()
+                    context_sync.sync_to_ec2()
+                except Exception as exc:
+                    sys.stderr.write(f"[worker] context-sync loop error: {exc}\n")
+
+        threading.Thread(target=context_sync_loop, daemon=True).start()
 
     def handle_sig(signum: int, _frame: Any) -> None:
         sys.stderr.write(f"[worker] received signal {signum}, shutting down\n")
@@ -1398,6 +1720,16 @@ def main() -> None:
                 sys.stderr.write(f"[worker] reconcile error: {exc}\n")
                 stop_event.wait(poll_interval)
                 continue
+            if context_sync is not None:
+                try:
+                    pulled = context_sync.pull_cloud_notes()
+                    pushed = context_sync.sync_to_ec2()
+                    if pulled or pushed:
+                        sys.stderr.write(
+                            f"[worker] context-sync on connect: pulled={pulled} pushed={pushed}\n"
+                        )
+                except Exception as exc:
+                    sys.stderr.write(f"[worker] context-sync connect error: {exc}\n")
 
         try:
             flushed = worker.flush_pending_decisions(spool_file)
@@ -1406,9 +1738,19 @@ def main() -> None:
         except Exception as exc:
             sys.stderr.write(f"[worker] decision flush error: {exc}\n")
 
+        poll_t0 = time.monotonic()
         try:
             did = worker.poll_once()
             if did is not None:
+                if context_sync is not None:
+                    try:
+                        context_sync.sync_to_ec2()
+                    except Exception as exc:
+                        sys.stderr.write(f"[worker] post-job context-sync error: {exc}\n")
+                continue
+            if claim_wait_sec > 0.0 and (time.monotonic() - poll_t0) >= min(
+                claim_wait_sec * 0.5, 5.0
+            ):
                 continue
         except Exception as exc:
             sys.stderr.write(f"[worker] poll error: {exc}\n")

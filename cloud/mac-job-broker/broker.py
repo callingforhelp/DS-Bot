@@ -31,6 +31,7 @@ SECRET_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bx(?:app|oxb|oxp|oxa)-[A-Za-z0-9-]{16,}\b"),
     re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]{16,}=*"),
     re.compile(r"(?i)\b(AKIA[0-9A-Z]{16})\b"),
 ]
@@ -48,6 +49,91 @@ def redact_secrets(text: str) -> str:
     return out
 
 
+_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+_INDEX_HEADING_RE = re.compile(r"^##\s+Index\s*$")
+_ANY_HEADING_RE = re.compile(r"^#{1,6}\s+")
+
+
+def _atomic_write_text(
+    path: str,
+    content: str,
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, 0o644)
+    if uid is not None and gid is not None:
+        try:
+            os.chown(tmp, uid, gid)
+        except PermissionError:
+            pass
+    os.replace(tmp, path)
+
+
+def _insert_memory_link(content: str, topic: str) -> str:
+    link = f"- [[{topic}]]"
+    if not content.strip():
+        return f"# Memory\n\n## Index\n{link}\n"
+    lines = content.splitlines()
+    if any(ln.strip() == link or f"[[{topic}]]" in ln for ln in lines):
+        return content if content.endswith("\n") else content + "\n"
+    idx = next(
+        (i for i, ln in enumerate(lines) if _INDEX_HEADING_RE.match(ln.strip())),
+        -1,
+    )
+    if idx == -1:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(["## Index", link])
+    else:
+        end = next(
+            (i for i in range(idx + 1, len(lines)) if _ANY_HEADING_RE.match(lines[i])),
+            len(lines),
+        )
+        at = end
+        while at > idx + 1 and not lines[at - 1].strip():
+            at -= 1
+        lines.insert(at, link)
+    return "\n".join(lines) + "\n"
+
+
+def write_team_mirror(
+    team_memory_dir: str,
+    topic: str,
+    markdown: str,
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+    max_chars: int = 24000,
+) -> dict[str, Any]:
+    if not _TOPIC_RE.match(topic):
+        raise ValueError(f"invalid mirror topic: {topic!r}")
+    os.makedirs(team_memory_dir, exist_ok=True)
+    if uid is not None and gid is not None:
+        try:
+            os.chown(team_memory_dir, uid, gid)
+        except PermissionError:
+            pass
+    clean = redact_secrets(str(markdown or ""))[:max_chars]
+    if clean and not clean.endswith("\n"):
+        clean += "\n"
+    topic_path = os.path.join(team_memory_dir, f"{topic}.md")
+    _atomic_write_text(topic_path, clean, uid=uid, gid=gid)
+
+    memory_path = os.path.join(team_memory_dir, "MEMORY.md")
+    existing = ""
+    if os.path.exists(memory_path):
+        with open(memory_path, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    updated = _insert_memory_link(existing, topic)
+    if updated != existing or not os.path.exists(memory_path):
+        _atomic_write_text(memory_path, updated, uid=uid, gid=gid)
+    return {"path": topic_path, "bytes": len(clean.encode("utf-8"))}
+
+
 class BrokerStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -55,6 +141,8 @@ class BrokerStore:
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
         self._lock = threading.Lock()
+        self._job_event_cond = threading.Condition()
+        self._enqueue_seq = 0
         self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         with self._lock:
@@ -129,6 +217,17 @@ class BrokerStore:
                     updated_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_paradev_sessions_updated ON paradev_sessions(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS cloud_notes (
+                    note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT,
+                    thread_ts TEXT,
+                    bot_name TEXT,
+                    prompt_excerpt TEXT NOT NULL,
+                    reply_excerpt TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    acked_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_cloud_notes_created ON cloud_notes(note_id);
                 """
             )
             for col, col_type in [
@@ -273,7 +372,13 @@ class BrokerStore:
             row = self.conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
+        self.notify_job_available()
         return self._row_to_dict(row), True
+
+    def notify_job_available(self) -> None:
+        with self._job_event_cond:
+            self._enqueue_seq += 1
+            self._job_event_cond.notify_all()
 
     def get_job(self, job_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
@@ -361,6 +466,42 @@ class BrokerStore:
                 "SELECT * FROM jobs WHERE job_id = ?", (row["job_id"],)
             ).fetchone()
         return self._row_to_dict(updated)
+
+    def wait_for_job(
+        self,
+        worker_id: str,
+        hostname: str = "",
+        capabilities: Optional[list[str]] = None,
+        wait_sec: float = 0.0,
+        lease_ttl_sec: int = DEFAULT_LEASE_TTL_SEC,
+    ) -> Optional[dict[str, Any]]:
+        clamped = max(0.0, min(float(wait_sec or 0.0), 30.0))
+        if clamped <= 0.0:
+            return self.claim_next_job(
+                worker_id=worker_id,
+                hostname=hostname,
+                capabilities=capabilities,
+                lease_ttl_sec=lease_ttl_sec,
+            )
+        deadline = time.monotonic() + clamped
+        while True:
+            with self._job_event_cond:
+                seq = self._enqueue_seq
+            job = self.claim_next_job(
+                worker_id=worker_id,
+                hostname=hostname,
+                capabilities=capabilities,
+                lease_ttl_sec=lease_ttl_sec,
+            )
+            if job is not None:
+                return job
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            with self._job_event_cond:
+                if self._enqueue_seq != seq:
+                    continue
+                self._job_event_cond.wait(timeout=min(remaining, 15.0))
 
     def heartbeat(
         self,
@@ -680,6 +821,85 @@ class BrokerStore:
             ).fetchone()
         return self._decision_to_dict(updated)
 
+    def add_cloud_note(
+        self,
+        *,
+        channel: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+        bot_name: Optional[str] = None,
+        prompt_excerpt: str,
+        reply_excerpt: str,
+    ) -> dict[str, Any]:
+        clean_prompt = redact_secrets(str(prompt_excerpt or "").strip())[:400]
+        clean_reply = redact_secrets(str(reply_excerpt or "").strip())[:1200]
+        if not clean_prompt and not clean_reply:
+            raise ValueError("prompt_excerpt or reply_excerpt is required")
+        now = time.time()
+        clean_ch = str(channel or "").strip()[:80] or None
+        clean_ts = str(thread_ts or "").strip()[:80] or None
+        clean_bot = str(bot_name or "").strip()[:80] or None
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                INSERT INTO cloud_notes (
+                    channel, thread_ts, bot_name, prompt_excerpt, reply_excerpt, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (clean_ch, clean_ts, clean_bot, clean_prompt, clean_reply, now),
+            )
+            self.conn.commit()
+            row = self.conn.execute(
+                "SELECT * FROM cloud_notes WHERE note_id = ?", (cur.lastrowid,)
+            ).fetchone()
+        return dict(row)
+
+    def list_cloud_notes(self, since_id: int = 0, limit: int = 30) -> list[dict[str, Any]]:
+        since = max(0, int(since_id or 0))
+        lim = max(1, min(int(limit or 30), 100))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM cloud_notes WHERE note_id > ? ORDER BY note_id ASC LIMIT ?",
+                (since, lim),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def render_cloud_notes_markdown(self, limit: int = 25) -> tuple[int, str]:
+        lim = max(1, min(int(limit or 25), 100))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM cloud_notes ORDER BY note_id DESC LIMIT ?",
+                (lim,),
+            ).fetchall()
+        if not rows:
+            return 0, "# Cloud Context Mirror (EC2 /cloud)\n\nNo `/cloud` turns recorded yet.\n"
+        max_id = max(int(r["note_id"]) for r in rows)
+        ordered = list(reversed(rows))
+        lines = ["# Cloud Context Mirror (EC2 /cloud)", ""]
+        for r in ordered:
+            stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(r["created_at"])))
+            who = r["bot_name"] or "Chief"
+            where = r["channel"] or "slack"
+            p = redact_secrets(str(r["prompt_excerpt"] or "")).replace("\n", " ").strip()
+            a = redact_secrets(str(r["reply_excerpt"] or "")).replace("\n", " ").strip()
+            lines.append(f"## #{r['note_id']} · {stamp} · {who} ({where})")
+            lines.append(f"- Asked: {p}")
+            lines.append(f"- Answered: {a}")
+            lines.append("")
+        return max_id, "\n".join(lines)
+
+    def ack_cloud_notes(self, up_to_id: int) -> int:
+        cap = int(up_to_id or 0)
+        if cap <= 0:
+            return 0
+        now = time.time()
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE cloud_notes SET acked_at = ? WHERE note_id <= ? AND acked_at IS NULL",
+                (now, cap),
+            )
+            self.conn.commit()
+            return int(cur.rowcount or 0)
+
     def ungranted_bot_ids(self, bot_ids: list[str]) -> list[str]:
         if not bot_ids:
             return []
@@ -862,6 +1082,9 @@ def make_handler(
     producer_token: str,
     worker_token: str,
     deliver_fn: Optional[Callable[[dict[str, Any]], None]] = None,
+    team_memory_dir: Optional[str] = None,
+    mirror_uid: Optional[int] = None,
+    mirror_gid: Optional[int] = None,
 ):
     class BrokerHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -947,6 +1170,28 @@ def make_handler(
                 self._send_json(200, {"ok": True, "mac_online": online, "job": job})
                 return
 
+            if path == "/v1/worker/cloud-notes":
+                if not self._check_auth(worker_token):
+                    return
+                try:
+                    since_id = int((qs.get("since_id") or ["0"])[0])
+                    limit = int((qs.get("limit") or ["30"])[0])
+                except ValueError:
+                    self._send_json(400, {"ok": False, "error": "invalid since_id or limit"})
+                    return
+                notes = store.list_cloud_notes(since_id=since_id, limit=limit)
+                latest_id, recent_markdown = store.render_cloud_notes_markdown(limit=25)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "notes": notes,
+                        "latest_id": latest_id,
+                        "recent_markdown": recent_markdown,
+                    },
+                )
+                return
+
             if path == "/v1/decisions":
                 if not self._check_auth(producer_token, worker_token):
                     return
@@ -1013,12 +1258,76 @@ def make_handler(
                 if not worker_id:
                     self._send_json(400, {"ok": False, "error": "worker_id is required"})
                     return
-                job = store.claim_next_job(
-                    worker_id=worker_id,
-                    hostname=str(body.get("hostname") or ""),
-                    capabilities=body.get("capabilities") or [],
+                try:
+                    wait_sec = float(body.get("wait_sec") or 0.0)
+                except (TypeError, ValueError):
+                    self._send_json(400, {"ok": False, "error": "invalid wait_sec"})
+                    return
+                kwargs = {
+                    "worker_id": worker_id,
+                    "hostname": str(body.get("hostname") or ""),
+                    "capabilities": body.get("capabilities") or [],
+                }
+                job = (
+                    store.wait_for_job(**kwargs, wait_sec=wait_sec)
+                    if wait_sec > 0
+                    else store.claim_next_job(**kwargs)
                 )
                 self._send_json(200, {"ok": True, "job": job})
+                return
+
+            if path == "/v1/worker/context-snapshot":
+                if not self._check_auth(worker_token):
+                    return
+                if not team_memory_dir:
+                    self._send_json(
+                        503,
+                        {"ok": False, "error": "team_memory_dir not configured"},
+                    )
+                    return
+                markdown = body.get("markdown")
+                if not isinstance(markdown, str):
+                    self._send_json(
+                        400, {"ok": False, "error": "markdown string is required"}
+                    )
+                    return
+                info = write_team_mirror(
+                    team_memory_dir,
+                    "mac-mirror",
+                    markdown,
+                    uid=mirror_uid,
+                    gid=mirror_gid,
+                )
+                self._send_json(200, {"ok": True, "written": True, **info})
+                return
+
+            if path == "/v1/worker/cloud-notes/ack":
+                if not self._check_auth(worker_token):
+                    return
+                try:
+                    up_to_id = int(body.get("up_to_id") or 0)
+                except (TypeError, ValueError):
+                    self._send_json(400, {"ok": False, "error": "invalid up_to_id"})
+                    return
+                acked = store.ack_cloud_notes(up_to_id)
+                self._send_json(200, {"ok": True, "acked": acked})
+                return
+
+            if path == "/v1/cloud-notes":
+                if not self._check_auth(producer_token):
+                    return
+                try:
+                    note = store.add_cloud_note(
+                        channel=body.get("channel"),
+                        thread_ts=body.get("thread_ts"),
+                        bot_name=body.get("bot_name"),
+                        prompt_excerpt=str(body.get("prompt_excerpt") or ""),
+                        reply_excerpt=str(body.get("reply_excerpt") or ""),
+                    )
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(201, {"ok": True, "note": note})
                 return
 
             if path == "/v1/worker/reconcile":
@@ -1142,6 +1451,11 @@ def run_server() -> None:
     dsbot_url = os.environ.get("DSBOT_URL", "http://127.0.0.1:13080")
     dsbot_container = os.environ.get("DSBOT_CONTAINER", "ds-bot")
     dsbot_state_path = os.environ.get("DSBOT_STATE_PATH", "/opt/ds-bot/dsbot/data/bot/state.json")
+    team_memory_dir = os.environ.get("DSBOT_TEAM_MEMORY_DIR") or os.path.join(
+        os.path.dirname(dsbot_state_path), "memory", "team"
+    )
+    mirror_uid = int(os.environ.get("BROKER_SOCK_UID", "1000"))
+    mirror_gid = int(os.environ.get("BROKER_SOCK_GID", "1000"))
 
     if not producer_token or not worker_token:
         raise SystemExit("BROKER_PRODUCER_TOKEN and BROKER_WORKER_TOKEN must be set")
@@ -1154,7 +1468,13 @@ def run_server() -> None:
         store.mark_delivery(job["job_id"], ok_sent)
 
     handler_cls = make_handler(
-        store, producer_token, worker_token, deliver_fn=deliver_one
+        store,
+        producer_token,
+        worker_token,
+        deliver_fn=deliver_one,
+        team_memory_dir=team_memory_dir,
+        mirror_uid=mirror_uid,
+        mirror_gid=mirror_gid,
     )
 
     tcp_server = ThreadingHTTPServer((host, port), handler_cls)
