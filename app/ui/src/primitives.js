@@ -86,7 +86,11 @@ export const Modal = () => null
 export const Tooltip = () => null
 
 // A user message's files: the extension and the size, written out. The file and JSON views
-// and DSH's reference projection are left out; user-message.js draws its own then.
+// and DSH's reference projection are left out (exported explicitly as undefined so Vite
+// resolves user-message.js cleanly without warnings); user-message.js draws its own then.
+export const FileTypeIcon = undefined
+export const JsonBlock = undefined
+export const projectUserText = undefined
 export const fileExtension = name => /\.([^./\\]+)$/.exec(String(name ?? ''))?.[1] ?? ''
 const UNITS = ['B', 'KB', 'MB', 'GB']
 export function fileSizeText(bytes) {

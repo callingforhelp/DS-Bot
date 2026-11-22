@@ -81,6 +81,9 @@ export const TEAM_TOOLS = [
   'attach_capability', 'detach_capability', 'use_pack', 'drop_pack', 'group_goal', 'group_task', 'list_connectors', 'request_connector',
   'task_start', 'task_send', 'task_stop', 'task_list', 'task_read',
 ]
+// The cloud hand-off tools (cloud-handoff.js). They run real work on the cloud sandbox,
+// so they stay out of TEAM_TOOLS, which groups.js reads as the team's quick tools.
+export const CLOUD_TOOLS = ['cloud_exec', 'cloud_git_sync']
 // Consecutive automatic admin wakes with no goal progress before the goal waits
 // for the user instead of waking the admin again.
 export const GOAL_IDLE_NUDGES = 2
