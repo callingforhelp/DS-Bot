@@ -145,9 +145,6 @@ class BrokerStore:
                     self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
                     pass
-            self.conn.execute(
-                "UPDATE jobs SET completed_at = updated_at WHERE completed_at IS NULL AND status IN ('succeeded', 'failed')"
-            )
             self.conn.commit()
 
     def close(self) -> None:
@@ -391,7 +388,6 @@ class BrokerStore:
         if status not in ("succeeded", "failed"):
             raise ValueError("status must be succeeded or failed")
         self.touch_worker(worker_id)
-        now = time.time()
         raw_summary = str(payload.get("result_summary") or "")
         clean_summary = redact_secrets(raw_summary)[:8000]
         error = payload.get("error")
@@ -413,79 +409,63 @@ class BrokerStore:
             role = role or str(kv.get("role") or "").strip().lower() or None
             agent = agent or str(kv.get("agent") or "").strip() or None
 
-        with self._lock:
+        with self._lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             row = self.conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             if row is None:
                 return False, None
-            # Idempotent re-delivery from same worker if already finished
             if row["status"] in ("succeeded", "failed") and row["worker_id"] == worker_id:
-                try:
-                    comp_ts = float(
-                        row["completed_at"]
-                        if "completed_at" in row.keys() and row["completed_at"] is not None
-                        else row["updated_at"]
-                    )
-                    self._record_paradev_session(
-                        row, workspace_id, terminal_id, role, agent, worktree_path,
-                        job_id, comp_ts,
-                    )
-                    self.conn.commit()
-                except Exception:
-                    self.conn.rollback()
-                    raise
+                # The first completion owns the registry update. Legacy jobs may
+                # only have a timestamp from a later delivery attempt.
                 return True, self._row_to_dict(row)
             if row["status"] not in ("running", "lease_lost") or (
                 row["worker_id"] and row["worker_id"] != worker_id
             ):
                 return False, self._row_to_dict(row)
-            try:
-                self.conn.execute(
-                    """
-                    UPDATE jobs
-                    SET status = ?,
-                        result_summary = ?,
-                        pr_url = ?,
-                        error = ?,
-                        lease_expires_at = NULL,
-                        delivery_state = 'pending',
-                        workspace_id = COALESCE(?, workspace_id),
-                        terminal_id = COALESCE(?, terminal_id),
-                        role = COALESCE(?, role),
-                        agent = COALESCE(?, agent),
-                        worktree_path = COALESCE(?, worktree_path),
-                        completed_at = COALESCE(completed_at, ?),
-                        updated_at = ?
-                    WHERE job_id = ?
-                    """,
-                    (
-                        status,
-                        clean_summary,
-                        clean_pr,
-                        clean_error,
-                        workspace_id,
-                        terminal_id,
-                        role,
-                        agent,
-                        worktree_path,
-                        now,
-                        now,
-                        job_id,
-                    ),
+            now = time.time()
+            self.conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?,
+                    result_summary = ?,
+                    pr_url = ?,
+                    error = ?,
+                    lease_expires_at = NULL,
+                    delivery_state = 'pending',
+                    workspace_id = COALESCE(?, workspace_id),
+                    terminal_id = COALESCE(?, terminal_id),
+                    role = COALESCE(?, role),
+                    agent = COALESCE(?, agent),
+                    worktree_path = COALESCE(?, worktree_path),
+                    completed_at = COALESCE(completed_at, ?),
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    status,
+                    clean_summary,
+                    clean_pr,
+                    clean_error,
+                    workspace_id,
+                    terminal_id,
+                    role,
+                    agent,
+                    worktree_path,
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+            updated = self.conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if updated is not None:
+                self._record_paradev_session(
+                    updated, workspace_id, terminal_id, role, agent, worktree_path,
+                    job_id, now,
                 )
-                updated = self.conn.execute(
-                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
-                ).fetchone()
-                if updated is not None:
-                    self._record_paradev_session(
-                        updated, workspace_id, terminal_id, role, agent, worktree_path,
-                        job_id, now,
-                    )
-                self.conn.commit()
-            except Exception:
-                self.conn.rollback()
-                raise
         return True, self._row_to_dict(updated)
 
     def _record_paradev_session(
