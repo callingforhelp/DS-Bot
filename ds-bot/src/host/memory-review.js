@@ -218,6 +218,7 @@ export function installReview(rt, memory) {
   // What a Session's turn gives the review: its Bot's own chat, or its group with a
   // copy of the group's log as of now. `key` is where the review keeps its place.
   const reviewOf = (sessionId) => {
+    if (rt.isCustomerPart?.(sessionId)) return undefined
     const chat = rt.chatOwners.get(sessionId)
     if (chat !== undefined) return { key: `chat:${sessionId}`, sessionId, botId: chat }
     const owner = rt.groupOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)
@@ -230,6 +231,7 @@ export function installReview(rt, memory) {
   // A Bot's own chat, kept in its own memory. A context switch during the wait leaves
   // the Session an earlier part, still the Bot's.
   async function reviewChat(seen) {
+    if (rt.isCustomerPart?.(seen.sessionId)) return
     const bot = rt.botOf(reviewOf(seen.sessionId)?.botId ?? seen.botId)
     if (bot === undefined) return
     const since = cursorsNow()[seen.key]

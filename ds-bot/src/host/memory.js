@@ -1044,6 +1044,7 @@ export function install(rt) {
   // What is said in a group stays there, so a group Session writes the group's memory
   // unless the Bot names another.
   function writeContext(args, exec) {
+    if (rt.isCustomerPart?.(exec.agent?.id)) return { error: 'Memory changes are not allowed in public customer conversations.' }
     const caller = callerOf(exec)
     if (caller === undefined) return { error: 'Only Bots on the team keep a memory.' }
     const { scope = caller.roomId === undefined ? ownScope(caller.bot.id) : groupScope(caller.roomId), error } = namedScope(args.scope, caller.bot.id, caller.roomId)

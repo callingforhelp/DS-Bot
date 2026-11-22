@@ -2593,6 +2593,54 @@ test('a turn whose Session moves to a fresh part before its review is still revi
   assert.deepEqual(Object.keys(JSON.parse(read('reviewed.json'))), ['chat:b2'])
 })
 
+test('public customer threads cannot enter memory review or persist entries shared with another customer', async (t) => {
+  const event = text => [{ event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } } }]
+  const { ctx, rt, requests, tool, section, call, stop } = start({
+    history: {
+      'customer-a-current': event('A_PRIVATE_CURRENT_FACT'),
+      'customer-a-past': event('A_PRIVATE_PAST_FACT'),
+    },
+    replies: [JSON.stringify({ changes: [{ op: 'add', text: 'A_PRIVATE_MEMORY_FOR_B' }] })],
+    config: { memoryReviewDelayMs: 0 },
+  })
+  t.after(() => stop())
+  await call('state', {})
+  const bot = rt.botOf('b2')
+  const customer = { connId: 'wecom', chatKey: 'customer-A' }
+  bot.openParts = [
+    { sessionId: 'customer-a-current', segments: [], customer },
+    { sessionId: 'customer-b', segments: [], customer: { ...customer, chatKey: 'customer-B' } },
+  ]
+  rt.chatOwners.set('customer-a-current', 'b2')
+  rt.chatOwners.set('customer-b', 'b2')
+  assert.equal(rt.isCustomerPart('customer-a-current'), true)
+  assert.equal(rt.isCustomerPart('customer-b'), true)
+
+  const emitStatus = (id, status) => ctx.emit('agent/status', { agent: { id, session: idleSession }, status })
+  emitStatus('customer-a-current', 'running')
+  emitStatus('customer-a-current', 'idle')
+
+  const oldPart = { sessionId: 'customer-a-past', segments: [], customer }
+  bot.openParts.push(oldPart)
+  rt.chatOwners.set('customer-a-past', 'b2')
+  emitStatus('customer-a-past', 'running')
+  oldPart.sessionId = 'customer-a-next'
+  oldPart.segments = [{ sessionId: 'customer-a-past', endedAt: Date.now() }]
+  rt.chatOwners.delete('customer-a-past')
+  rt.pastOwners.set('customer-a-past', { botId: 'b2' })
+  rt.chatOwners.set('customer-a-next', 'b2')
+  assert.equal(rt.isCustomerPart('customer-a-past'), true)
+  emitStatus('customer-a-past', 'idle')
+  await reviewed(call)
+
+  assert.equal(requests.length, 0)
+  await assert.rejects(tool('remember', { text: 'A_PRIVATE_DIRECT_MEMORY' }, 'customer-a-current'), /public customer conversations/)
+  assert.doesNotMatch(section('customer-b'), /A_PRIVATE/)
+  assert.match(await tool('remember', { text: 'Internal memory still works' }, 'b2'), /^Saved to your memory/)
+  assert.match(section('b2'), /Internal memory still works/)
+  assert.doesNotMatch(section('b2'), /A_PRIVATE/)
+})
+
 test('config.memoryReview false leaves memory to the Bots\' own remember calls', async (t) => {
   const { ctx, call, section, requests, stop } = start({ config: { memoryReview: false, memoryReviewDelayMs: 0 } })
   t.after(() => stop())
