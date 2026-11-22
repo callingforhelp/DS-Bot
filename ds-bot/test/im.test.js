@@ -342,6 +342,44 @@ test('customer thread creation errors are retryable without reserving a phantom 
   assert.equal(s.rt.botOf('a').openParts.length, 1)
 })
 
+test('triage tools restrict current and historical customer parts but not normal conversations', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  const first = await s.rt.customerPart('a', conn.id, 'dm-customer')
+  const tool = s.rt.teamTools.find(tool => tool.name === 'triage_cases')
+  const call = async (sessionId, args) => JSON.parse(await tool.execute(args, { agent: s.agentOf(sessionId) }))
+  const log = { action: 'log', customer: 'customer', summary: 'part drawing', routed_to: 'sales', reason: 'quote' }
+  const entry = await call(first, log)
+  const forbidden = [
+    { action: 'outcome', id: entry.id, result: 'misrouted', lesson: 'rule' },
+    { action: 'review' },
+    { action: 'rules', rule_action: 'add', text: 'rule' },
+    { action: 'rules', rule_action: 'remove', id: 'rule' },
+  ]
+  pushThreadPart(s.rt.botOf('a'), first, 'customer-next', { sessionId: first })
+  s.rt.chatOwners.delete(first)
+  s.rt.pastOwners.set(first, { botId: 'a' })
+  s.rt.chatOwners.set('customer-next', 'a')
+  await s.rt.save()
+  for (const sessionId of [first, 'customer-next']) {
+    assert.equal(s.rt.isCustomerPart(sessionId), true)
+    for (const args of forbidden) await assert.rejects(call(sessionId, args), /Outcomes, rules and reviews are recorded outside customer conversations/)
+    assert.equal((await call(sessionId, { action: 'recall', query: 'drawing' })).cases[0].id, entry.id)
+    assert.deepEqual(await call(sessionId, { action: 'rules', rule_action: 'list' }), [])
+    assert.ok((await call(sessionId, log)).id)
+  }
+  assert.equal(s.rt.isCustomerPart('a'), false)
+  assert.equal(s.rt.isCustomerPart('unknown'), false)
+  const normal = await call('a', log)
+  assert.ok((await call('a', { action: 'recall', query: 'drawing' })).cases.length)
+  await call('a', { action: 'outcome', id: normal.id, result: 'misrouted', lesson: 'Inspect drawings' })
+  const rule = await call('a', { action: 'rules', rule_action: 'add', text: 'Check dimensions' })
+  assert.equal((await call('a', { action: 'rules', rule_action: 'list' })).length, 2)
+  await call('a', { action: 'rules', rule_action: 'remove', id: rule.id })
+  assert.equal((await call('a', { action: 'review' })).misroutes.length, 1)
+})
+
 test('typing carries the chat key, not the chat record', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] })
   const s = await start()

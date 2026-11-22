@@ -72,7 +72,14 @@ export function install(rt) {
       rule_action: { type: 'string', enum: ['add', 'remove', 'list'] }, text: { type: 'string' },
     },
     output,
-    async execute(args) { await rt.load(); return triage(args) },
+    async execute(args, exec = {}) {
+      await rt.load()
+      if (rt.isCustomerPart(exec.agent?.id) && !(args.action === 'recall' || args.action === 'log'
+        || (args.action === 'rules' && args.rule_action === 'list'))) {
+        throw new Error('Outcomes, rules and reviews are recorded outside customer conversations')
+      }
+      return triage(args)
+    },
   }))
 
   const callerBot = (exec) => rt.botOf(rt.selfOf(exec.agent?.id))

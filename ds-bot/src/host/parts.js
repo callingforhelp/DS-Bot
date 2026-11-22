@@ -2104,6 +2104,12 @@ export function install(rt) {
   }
 
   const customerParts = new Map()
+  function isCustomerPart(sessionId) {
+    const botId = rt.chatOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)?.botId
+    const bot = rt.botOf(botId)
+    const thread = threadOfPart(bot, sessionId)
+    return thread?.thread === 'open' && bot.openParts[thread.index].customer !== undefined
+  }
   async function customerPart(botId, connId, chatKey) {
     await rt.load()
     const bot = rt.botOf(botId)
@@ -2197,5 +2203,5 @@ export function install(rt) {
     return true
   }
 
-  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, customerPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, customerPart, isCustomerPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }
