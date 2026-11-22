@@ -470,6 +470,41 @@ test('repeated outcomes keep all unpublished lessons private until a linked rule
   } finally { await rm(s.home, { recursive: true, force: true }) }
 })
 
+test('misroute lessons are stored once when outcomes change and remain pending after overwrite', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1000 })
+  const s = await votingBank(t)
+  s.customer('customer-a', { connId: 'conn-A', chatKey: 'chat-A' })
+  try {
+    await s.call({ action: 'log', customer: 'A', summary: 'HISTORYTOKEN drawing', routed_to: 'Sales', reason: 'misroute' }, 'customer-a')
+    const casesPath = join(s.home, 'triage', 'cases.jsonl')
+    const id = JSON.parse((await readFile(casesPath, 'utf8')).trim()).id
+    const lesson = 'PRIVATE_MISROUTE_TO_RESOLVED'
+    const copies = entry => [entry.outcome, entry.misroute, ...(entry.lesson_history ?? [])].filter(note => note?.lesson === lesson).length
+
+    t.mock.timers.setTime(1100)
+    await s.call({ action: 'outcome', id, result: 'misrouted', correct_route: 'drawing_review', lesson }, 'staff')
+    t.mock.timers.setTime(1200)
+    await s.call({ action: 'outcome', id, result: 'resolved', correct_route: 'after_sales', lesson: 'PRIVATE_RESOLVED_NOTE' }, 'staff')
+    let stored = JSON.parse((await readFile(casesPath, 'utf8')).trim())
+    assert.equal(copies(stored), 1)
+    assert.equal(stored.lesson_history?.some(note => note.lesson === lesson), false)
+    assert.equal(stored.misroute.lesson, lesson)
+
+    t.mock.timers.setTime(1300)
+    await s.call({ action: 'outcome', id, result: 'misrouted', correct_route: 'quote', lesson: 'PRIVATE_LATER_MISROUTE' }, 'staff')
+    stored = JSON.parse((await readFile(casesPath, 'utf8')).trim())
+    assert.equal(copies(stored), 1)
+    assert.equal(stored.lesson_history.filter(note => note.lesson === lesson).length, 1)
+    assert.equal((await s.call({ action: 'review' }, 'staff')).pending_lessons.filter(note => note.id === id && note.lesson === lesson).length, 1)
+
+    const reloaded = triageBank(s.home, () => {}, s.rt)
+    assert.equal(JSON.parse(await reloaded({ action: 'review' })).pending_lessons.filter(note => note.id === id && note.lesson === lesson).length, 1)
+    const recalled = await s.call({ action: 'recall', query: 'HISTORYTOKEN' }, 'customer-a')
+    assert.equal('lesson_history' in recalled.cases[0], false)
+    assert.doesNotMatch(JSON.stringify(recalled), /PRIVATE_MISROUTE_TO_RESOLVED|PRIVATE_RESOLVED_NOTE|PRIVATE_LATER_MISROUTE/)
+  } finally { await rm(s.home, { recursive: true, force: true }) }
+})
+
 test('a full rule bank does not block recording a corrected outcome', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
   const bank = triageBank(dir)

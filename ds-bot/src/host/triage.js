@@ -25,6 +25,12 @@ const validType = entry => {
 }
 const clean = value => String(value ?? '').trim().slice(0, 4000)
 const misrouteDetails = outcome => ({ at: outcome.at, correct_route: clean(outcome.correct_route), lesson: clean(outcome.lesson) })
+const lessonInfo = (entry, value) => {
+  const lesson = clean(value?.lesson)
+  if (!lesson) return
+  const at = Number.isFinite(value.at) ? value.at : Number.isFinite(entry.misrouted_at) ? entry.misrouted_at : Number.isFinite(entry.created) ? entry.created : 0
+  return { lesson, at, key: `${at}\0${lesson}` }
+}
 const caseLessons = entry => {
   const history = Array.isArray(entry.lesson_history)
     ? entry.lesson_history.filter(note => ['outcome', 'misroute'].includes(note?.source)).map(note => ({ source: note.source, value: note }))
@@ -35,14 +41,24 @@ const caseLessons = entry => {
     { source: 'misroute', value: entry.misroute },
     ...history,
   ].flatMap(({ source, value }) => {
-    const lesson = clean(value?.lesson)
-    if (!lesson) return []
-    const at = Number.isFinite(value.at) ? value.at : Number.isFinite(entry.misrouted_at) ? entry.misrouted_at : Number.isFinite(entry.created) ? entry.created : 0
-    const key = `${at}\0${lesson}`
-    if (seen.has(key)) return []
-    seen.add(key)
-    return [{ source, lesson, correct_route: clean(value.correct_route), at }]
+    const info = lessonInfo(entry, value)
+    if (!info || seen.has(info.key)) return []
+    seen.add(info.key)
+    return [{ source, lesson: info.lesson, correct_route: clean(value.correct_route), at: info.at }]
   })
+}
+const normalizeLessonHistory = entry => {
+  if (!Array.isArray(entry.lesson_history)) return
+  const seen = new Set([entry.outcome, entry.misroute].map(value => lessonInfo(entry, value)?.key).filter(Boolean))
+  const history = entry.lesson_history.filter(note => {
+    const info = lessonInfo(entry, note)
+    if (!info) return true
+    if (seen.has(info.key)) return false
+    seen.add(info.key)
+    return true
+  })
+  if (history.length) entry.lesson_history = history
+  else delete entry.lesson_history
 }
 const preservePendingLessons = (entry, rules) => {
   const history = Array.isArray(entry.lesson_history) ? entry.lesson_history : []
@@ -156,6 +172,7 @@ export function triageBank(home, writable = () => {}, rt) {
   const writeCases = async (cases, retained, rules) => {
     for (const entry of cases) {
       if (entry.misroute !== undefined) entry.misroute = misrouteDetails(entry.misroute)
+      normalizeLessonHistory(entry)
     }
     const lines = cases.map(item => JSON.stringify(item) + '\n')
     let bytes = lines.reduce((size, line) => size + Buffer.byteLength(line), 0)
