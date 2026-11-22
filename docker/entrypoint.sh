@@ -74,6 +74,23 @@ if [ -n "${DSH_TRUSTED_HOST:-}" ]; then
   done
   IFS=$old_ifs
 fi
+GOSU=$(command -v gosu)
 export HOME=/home/node
+
+# Restore persisted home dotdirs from /data so user-installed CLIs and auth
+# survive container recreations without changing fresh default installs.
+for dotdir in .local .config .cache .devin .codex; do
+  if [ ! -L "/data/$dotdir" ] && [ -d "/data/$dotdir" ] && [ ! -e "$HOME/$dotdir" ] && [ ! -L "$HOME/$dotdir" ]; then
+    ln -s "/data/$dotdir" "$HOME/$dotdir"
+    chown -h node:node "$HOME/$dotdir"
+  fi
+done
+if [ ! -L /data/.local ] && [ ! -L /data/.local/bin ] && [ -d /data/.local/bin ]; then
+  case ":${PATH:-}:" in
+    *:/data/.local/bin:*) ;;
+    *) export PATH="${PATH:+$PATH:}/data/.local/bin" ;;
+  esac
+fi
+
 cd /workspace
-exec gosu node "$@"
+exec "$GOSU" node "$@"
