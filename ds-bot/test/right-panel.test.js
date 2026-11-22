@@ -312,6 +312,22 @@ test('every Bot gets the Sessions section and New session, not only local-agent 
   assert.ok(engineEntry, 'the local-agent Bot still has it')
 })
 
+test('customer sessions are labelled and cannot invoke a foreground open action', () => {
+  let opened = 0
+  const tree = drawer('a', { openPart: () => { opened++ } }, {
+    ...roster, byId: { a: { ...bot, openParts: [{ sessionId: 'customer', customer: true }, { sessionId: 'background' }] } },
+  })
+  const customer = buttonsOf(tree).find(button => button.props.title === 'Customer conversation')
+  assert.ok(customer)
+  assert.match(textOf(customer), /Customer conversation/)
+  assert.equal(customer.props.disabled, true)
+  assert.equal(customer.props.onClick, undefined)
+  const normal = buttonsOf(tree).find(button => button.props.title === 'Open this session')
+  assert.equal(normal.props.disabled, false)
+  normal.props.onClick()
+  assert.equal(opened, 1)
+})
+
 // A second instance of the drawer bundle whose React runs effects at once and keeps
 // one state slot, so the status line can resolve its host read and render.
 const runStatsBundle = await build({

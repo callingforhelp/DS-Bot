@@ -77,6 +77,7 @@ export function install(rt) {
         sessionId: part.sessionId,
         startedAt: part.startedAt ?? 0,
         parts: (part.segments ?? []).map(segment => segment.sessionId),
+        ...(part.customer !== undefined ? { customer: true } : {}),
       }))
       return {
         ...bot, sessionId: rt.chatOf(bot.id), parts: (segments ?? []).map(segment => segment.sessionId),

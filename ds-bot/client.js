@@ -43526,7 +43526,7 @@ function GroupOverview({ room: room2, roster, actions, usage, useWork, openSetti
 }
 function BotSessions({ bot, part, run: run2, useSessions, actions, running }) {
   const runningOf = (id) => running?.[id] === true;
-  const open = (bot.openParts ?? []).map((entry) => ({ id: entry.sessionId, open: true, running: runningOf(entry.sessionId) }));
+  const open = (bot.openParts ?? []).map((entry) => ({ id: entry.sessionId, open: true, customer: entry.customer === true, running: runningOf(entry.sessionId) }));
   const backgroundRunning = open.some((entry) => entry.running);
   const entries2 = [
     { id: part, current: true, running: runningOf(part) },
@@ -43536,7 +43536,7 @@ function BotSessions({ bot, part, run: run2, useSessions, actions, running }) {
   const rows2 = useSessions((list) => entries2.map((entry) => list.byId?.[entry.id]), rowsEqual);
   const total = entries2.length;
   const openPart = (entry) => {
-    if (entry.current) return void 0;
+    if (entry.current || entry.customer) return void 0;
     if (entry.open && actions.openPart !== void 0) return () => run2(actions.openPart(bot.id, entry.id, entry.running));
     return () => run2(call("bot-open-part", { botId: bot.id, sessionId: entry.id }));
   };
@@ -43559,18 +43559,18 @@ function BotSessions({ bot, part, run: run2, useSessions, actions, running }) {
       const row = rows2[index];
       const when3 = row?.updatedAt ?? row?.createdAt;
       const label = row?.title && row.title.trim() !== "" ? row.title : t("Session {number}", { number: total - index });
-      const title = entry.current ? t("Current session") : entry.open && entry.running ? t("Open this running session") : entry.open ? t("Open this session") : t("Open this earlier session");
+      const title = entry.customer ? t("Customer conversation") : entry.current ? t("Current session") : entry.open && entry.running ? t("Open this running session") : entry.open ? t("Open this session") : t("Open this earlier session");
       return (0, import_react69.createElement)(
         "button",
         {
           key: entry.id,
           type: "button",
-          disabled: entry.current,
+          disabled: entry.current || entry.customer,
           className: `bt-agent-session${entry.current ? " is-current" : ""}${entry.running ? " is-running" : ""}`,
           title,
           onClick: openPart(entry)
         },
-        (0, import_react69.createElement)("span", { className: "bt-agent-session-name" }, label),
+        (0, import_react69.createElement)("span", { className: "bt-agent-session-name" }, entry.customer ? `${t("Customer conversation")} — ${label}` : label),
         (0, import_react69.createElement)(
           "span",
           { className: "bt-agent-session-meta" },

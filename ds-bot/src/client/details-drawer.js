@@ -238,7 +238,7 @@ function GroupOverview({ room, roster, actions, usage, useWork, openSettings }) 
 // running at once means two model calls.
 function BotSessions({ bot, part, run, useSessions, actions, running }) {
   const runningOf = id => running?.[id] === true
-  const open = (bot.openParts ?? []).map(entry => ({ id: entry.sessionId, open: true, running: runningOf(entry.sessionId) }))
+  const open = (bot.openParts ?? []).map(entry => ({ id: entry.sessionId, open: true, customer: entry.customer === true, running: runningOf(entry.sessionId) }))
   // Two sessions running at once means two model calls: shown only while a background
   // part really runs, above the list rather than as a quiet footnote.
   const backgroundRunning = open.some(entry => entry.running)
@@ -250,7 +250,7 @@ function BotSessions({ bot, part, run, useSessions, actions, running }) {
   const rows = useSessions(list => entries.map(entry => list.byId?.[entry.id]), rowsEqual)
   const total = entries.length
   const openPart = (entry) => {
-    if (entry.current) return undefined
+    if (entry.current || entry.customer) return undefined
     if (entry.open && actions.openPart !== undefined) return () => run(actions.openPart(bot.id, entry.id, entry.running))
     return () => run(call('bot-open-part', { botId: bot.id, sessionId: entry.id }))
   }
@@ -267,13 +267,13 @@ function BotSessions({ bot, part, run, useSessions, actions, running }) {
       const row = rows[index]
       const when = row?.updatedAt ?? row?.createdAt
       const label = row?.title && row.title.trim() !== '' ? row.title : t('Session {number}', { number: total - index })
-      const title = entry.current ? t('Current session') : entry.open && entry.running ? t('Open this running session') : entry.open ? t('Open this session') : t('Open this earlier session')
+      const title = entry.customer ? t('Customer conversation') : entry.current ? t('Current session') : entry.open && entry.running ? t('Open this running session') : entry.open ? t('Open this session') : t('Open this earlier session')
       return h('button', {
-        key: entry.id, type: 'button', disabled: entry.current,
+        key: entry.id, type: 'button', disabled: entry.current || entry.customer,
         className: `bt-agent-session${entry.current ? ' is-current' : ''}${entry.running ? ' is-running' : ''}`,
         title, onClick: openPart(entry),
       },
-        h('span', { className: 'bt-agent-session-name' }, label),
+        h('span', { className: 'bt-agent-session-name' }, entry.customer ? `${t('Customer conversation')} — ${label}` : label),
         h('span', { className: 'bt-agent-session-meta' },
           entry.running ? h('span', { className: 'bt-agent-session-run', role: 'status' }, t('Running'))
             : entry.current ? t('Current')
