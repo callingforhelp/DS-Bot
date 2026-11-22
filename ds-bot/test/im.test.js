@@ -185,9 +185,20 @@ test('WeCom startup seeds once through secret-set and sign-in never writes the e
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
   await s.rt.load()
-  await s.flush()
-  const conns = Object.values(s.rt.state.im.connections)
+  const deadline = Date.now() + 3_000
+  let conns = []
+  let persisted = false
+  while (Date.now() < deadline) {
+    conns = Object.values(s.rt.state.im.connections)
+    if (conns.length === 1) {
+      const saved = JSON.parse(readFileSync(join(s.home, 'state.json'), 'utf8'))
+      persisted = saved.im?.connections?.[conns[0].id] !== undefined
+      if (persisted) break
+    }
+    await delay(10)
+  }
   assert.equal(conns.length, 1)
+  assert.ok(persisted, 'WeCom environment seed was not persisted')
   const conn = conns[0]
   assert.equal(conn.platform, 'wecom_kf')
   assert.equal(conn.botId, null)
