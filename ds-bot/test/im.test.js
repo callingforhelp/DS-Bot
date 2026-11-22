@@ -188,6 +188,21 @@ test('WeCom startup never replaces an existing connection with an env seed', asy
   assert.equal(s.rt.state.im.connections.existing.botId, 'b')
 })
 
+test('an enabled public connection does not poll until it is bound to a Bot', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const view = await s.rt.imEndpoint('im-add', { platform: 'wecom_kf', botId: 'a', fields: { corpId: 'fake-corp', secret: 'fake-secret' } })
+  const conn = s.rt.state.im.connections[view.id]
+  const connects = s.fake.connects
+  await s.rt.imEndpoint('im-update', { id: conn.id, enabled: false })
+  conn.botId = null
+  await s.rt.imEndpoint('im-update', { id: conn.id, enabled: true })
+  assert.equal(conn.enabled, true)
+  assert.equal(s.fake.connects, connects)
+  await s.rt.imEndpoint('im-update', { id: conn.id, botId: 'a', enabled: true })
+  assert.ok(s.fake.connects > connects)
+})
+
 test('public customer platforms admit strangers but refuse control commands and card answers', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)

@@ -1058,8 +1058,9 @@ export function install(rt) {
     const run = syncing.then(async () => {
       const conns = connections()
       for (const conn of Object.values(conns)) {
+        const unboundPublic = imPlatform(conn.platform)?.public === true && rt.botOf(conn.botId) === undefined
         const wants = stopped !== true && adapters[conn.platform] !== undefined && conn.enabled !== false
-          && rt.readOnly() === undefined && hasSecrets(conn)
+          && !unboundPublic && rt.readOnly() === undefined && hasSecrets(conn)
         if (wants && !runners.has(conn.id)) await start(conn)
         else if (!wants && runners.has(conn.id)) await stop(conn.id)
       }
