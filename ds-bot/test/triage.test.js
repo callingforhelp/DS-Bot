@@ -319,11 +319,16 @@ test('case eviction never discards pending human handoffs and fails closed when 
 
 test('vote can record a handoff at capacity by evicting cases with published lessons', async (t) => {
   const s = await votingBank(t)
-  const cases = Array.from({ length: 2000 }, (_, index) => ({
+  const publishedCases = Array.from({ length: 200 }, (_, index) => ({
     id: `published-${index}`, created: index + 1, summary: 'previous case',
     outcome: { result: 'resolved', at: index + 1, lesson: `lesson ${index}` },
   }))
-  const rules = cases.map(entry => ({
+  const pendingHandoffs = Array.from({ length: 1800 }, (_, index) => ({
+    id: `pending-${index}`, created: 201 + index, summary: 'pending handoff',
+    handoff: { status: 'pending' },
+  }))
+  const cases = [...publishedCases, ...pendingHandoffs]
+  const rules = publishedCases.map(entry => ({
     id: `rule-${entry.id}`, text: `Sanitized ${entry.id}`, from_case: entry.id,
     created: entry.outcome.at, hits: 0,
   }))
@@ -344,6 +349,9 @@ test('vote can record a handoff at capacity by evicting cases with published les
   const saved = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
   assert.equal(saved.length, 2000)
   assert.equal(saved.some(entry => entry.id === 'published-0'), false)
+  assert.equal(saved.some(entry => entry.id === 'published-1'), true)
+  assert.equal(saved.filter(entry => entry.handoff?.status === 'pending').length, 1801)
+  assert.equal(saved.some(entry => entry.id === 'pending-0'), true)
   assert.equal(saved.at(-1).id, result.case_id)
   assert.equal(saved.at(-1).handoff.status, 'pending')
 })
