@@ -131,3 +131,24 @@ test('kf skips permanently rejected media and advances the page, but retries tra
     } finally { conn.stop() }
   }
 })
+
+test('kf marks failures after a delivered chunk permanent to prevent duplicate replies', async () => {
+  for (const failAt of [1, 2]) {
+    const env = fake()
+    const originalFetch = env.fetch
+    let sends = 0
+    env.fetch = async (url, options) => {
+      if (url.includes('/kf/send_msg') && ++sends === failAt) throw new Error('temporary network outage')
+      return originalFetch(url, options)
+    }
+    const conn = adapter.connect(fields, env, { onStatus() {}, onMessage() {} })
+    try {
+      await assert.rejects(conn.send({ key: 'customer' }, { text: 'x'.repeat(5000) }), error => {
+        assert.equal(error.permanent === true, failAt === 2)
+        if (failAt === 2) assert.match(error.message, /partially delivered; not retrying earlier chunks/)
+        return true
+      })
+      assert.equal(sends, failAt)
+    } finally { conn.stop() }
+  }
+})

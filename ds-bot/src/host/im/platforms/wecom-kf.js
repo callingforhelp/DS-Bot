@@ -127,8 +127,13 @@ export default {
       async send(chat, { text }) {
         const account = await select()
         let messageId
+        let delivered = false
         for (const content of chunks(text)) {
-          const answer = await api.call('kf/send_msg', { touser: chat.key, open_kfid: account.open_kfid, msgtype: 'text', text: { content } })
+          const answer = await api.call('kf/send_msg', { touser: chat.key, open_kfid: account.open_kfid, msgtype: 'text', text: { content } }).catch(error => {
+            if (!delivered) throw error
+            throw Object.assign(new Error(`WeCom Customer Service reply partially delivered; not retrying earlier chunks: ${error.message}`), { permanent: true })
+          })
+          delivered = true
           messageId = answer.msgid
         }
         return { messageId }
