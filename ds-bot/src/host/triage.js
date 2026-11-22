@@ -347,7 +347,7 @@ export function triageBank(home, writable = () => {}, rt) {
           const model = target?.model ?? target?.appliedModel
           const localTarget = target !== undefined && (rt.localAgentBadge?.(model) !== undefined || rt.isLocalAgentRef?.(model) === true)
           const senderBotId = rt.taskOwners?.get(context.sessionId)?.botId ?? rt.chatOwners?.get(context.sessionId)
-          if (!type || type.runtime === 'devin' || target === undefined || target.id === senderBotId || localTarget) {
+          if (!type || type.runtime === 'devin' || target === undefined || target.id === senderBotId || (customerSession && localTarget)) {
             result.selected_type = result.route
             delete result.route
             result.decision = 'handoff'
@@ -379,7 +379,8 @@ export function triageBank(home, writable = () => {}, rt) {
               const candidate = rt.findBot?.(entry.target)
               const model = candidate?.model ?? candidate?.appliedModel
               const senderBotId = rt.taskOwners?.get(context.sessionId)?.botId ?? rt.chatOwners?.get(context.sessionId)
-              return candidate !== undefined && candidate.id !== senderBotId && rt.localAgentBadge?.(model) === undefined && rt.isLocalAgentRef?.(model) !== true
+              const localTarget = rt.localAgentBadge?.(model) !== undefined || rt.isLocalAgentRef?.(model) === true
+              return candidate !== undefined && candidate.id !== senderBotId && (!customerSession || !localTarget)
             })(),
             method: entry.runtime === 'ds-bot' && entry.target ? 'message_bot' : 'staff',
           }))

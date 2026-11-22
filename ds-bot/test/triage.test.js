@@ -188,6 +188,35 @@ test('customer routing uses isolated specialist sessions and rejects control arg
   assert.deepEqual(droppedWorks, [openedWorks[2].id])
 })
 
+test('staff votes may route to a local specialist while customer votes hand off', async (t) => {
+  const s = await votingBank(t)
+  const target = { id: 'local-specialist', name: 'Local specialist', model: 'local/model' }
+  s.rt.findBot = name => name === target.name ? target : undefined
+  s.rt.localAgentBadge = model => model === target.model ? { name: target.name } : undefined
+  await s.call({ action: 'types', type_action: 'add', type: 'triage_test_local', handles: 'local requests', examples: ['local specialist work', 'specialist routing'], runtime: 'ds-bot', target: target.name })
+  await s.call({ action: 'types', type_action: 'add', type: 'triage_test_other', handles: 'other requests', examples: ['other specialist work', 'additional support'], runtime: 'ds-bot', target: target.name })
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
+  const routes = ['triage_test_local', 'triage_test_other']
+  const votes = [
+    { route: 'triage_test_local', confidence: 0.95, reason: 'Local specialist is the best fit' },
+    { route: 'triage_test_local', confidence: 0.9, reason: 'Local specialist is a match' },
+  ]
+
+  s.replies([...votes])
+  const staff = await s.call({ action: 'vote', summary: 'Staff request', routes }, 'staff')
+  assert.equal(staff.decision, 'route')
+  assert.equal(staff.delivery.target, target.name)
+  assert.equal(staff.delivery.method, 'message_bot')
+
+  const sessionId = 'customer-local'
+  s.customer(sessionId, { connId: 'conn-local', chatKey: 'chat-local' })
+  s.replies([...votes])
+  const customer = await s.call({ action: 'vote', summary: 'Customer request', routes }, sessionId)
+  assert.equal(customer.decision, 'handoff')
+  assert.equal(customer.route, 'triage_test_local')
+  assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'triage_test_local', message: 'Please help' }), false)
+})
+
 test('triage judge config validates refs and thresholds and persists atomically', async (t) => {
   const s = await votingBank(t)
   assert.deepEqual(await s.call({ action: 'judges' }), { judges: [], threshold: 0.7 })
