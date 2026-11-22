@@ -308,6 +308,12 @@ test('staff group votes hand off outside targets but keep main-chat destinations
     await s.bank.syncHandoffs()
     assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), [route, "I'll handle it myself"])
     assert.equal(s.rt.state.questions[sessionId], undefined)
+    if (route === 'triage_test_local_outside') {
+      const detail = s.rt.state.questions.main.detail
+      assert.match(detail, /The judges agreed on triage_test_local_outside, but automatic dispatch is unavailable from this conversation\. Staff must route this case from the Bot main chat\./)
+      assert.match(detail, /Route confidence: 93%; required threshold: 70%\./)
+      assert.doesNotMatch(detail, /No consensus|votes did not meet the routing agreement requirements/)
+    }
     s.rt.state.questions.main = undefined
   }
 
@@ -318,6 +324,19 @@ test('staff group votes hand off outside targets but keep main-chat destinations
   assert.equal(cases.at(-1).handoff.candidates.find(candidate => candidate.route === 'triage_test_self').available, false)
   await s.bank.syncHandoffs()
   assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), ["I'll handle it myself"])
+
+  s.rt.state.questions.main = undefined
+  s.replies([
+    { route: 'triage_test_local_outside', confidence: 0.95, reason: 'Best route' },
+    { route: 'triage_test_member', confidence: 0.9, reason: 'Alternative route' },
+  ])
+  const disagreement = await s.call({ action: 'vote', summary: 'Group request with disagreement', routes }, sessionId)
+  assert.equal(disagreement.decision, 'handoff')
+  await s.bank.syncHandoffs()
+  const disagreementDetail = s.rt.state.questions.main.detail
+  assert.match(disagreementDetail, /No consensus\. The judges selected different routes\./)
+  assert.match(disagreementDetail, /Valid votes: 2\/2; quorum: 2\./)
+  assert.doesNotMatch(disagreementDetail, /Route confidence:/)
 
   s.replies(votesFor('triage_test_member'))
   const member = await s.call({ action: 'vote', summary: 'Group member request', routes }, sessionId)

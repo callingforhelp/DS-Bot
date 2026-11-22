@@ -125,7 +125,8 @@ function handoffDetail(entry) {
   const agreedRoute = quorumMet && routes.size === 1 ? [...routes][0] : undefined
   const agreedCandidate = (handoff.candidates ?? []).find(candidate => candidate.route === agreedRoute)
   const missingTarget = agreedRoute !== undefined && agreedCandidate?.runtime === 'ds-bot'
-    && (typeof agreedCandidate.target !== 'string' || agreedCandidate.target.trim() === '' || agreedCandidate.available === false)
+    && (typeof agreedCandidate.target !== 'string' || agreedCandidate.target.trim() === '')
+  const deliveryIneligible = agreedRoute !== undefined && entry.delivery?.method === 'staff'
   const why = valid.length < quorum
     ? `Insufficient valid votes: ${valid.length} of ${votes.length}; ${quorum} required.`
     : routes.size > 1
@@ -136,6 +137,8 @@ function handoffDetail(entry) {
             ? `The judges agreed on ${agreedRoute}, but no destination is configured for this route.`
             : agreedCandidate?.runtime === 'devin'
               ? `The judges agreed on ${agreedRoute}; the external agent requires staff dispatch.`
+              : deliveryIneligible
+                ? `The judges agreed on ${agreedRoute}, but automatic dispatch is unavailable from this conversation. Staff must route this case from the Bot main chat.`
           : 'The votes did not meet the routing agreement requirements.'
   const voteLines = votes.map(vote => {
     const route = vote.valid ? vote.route : 'No valid route'
@@ -152,7 +155,7 @@ function handoffDetail(entry) {
         : candidate.available === false ? `${target}; unavailable, manual handling only` : target
     return `- ${route} · ${kind} · ${availability}`
   })
-  const confidenceLine = quorumMet && routes.size === 1
+  const confidenceLine = agreedRoute !== undefined
     ? `Route confidence: ${percent(confidence)}; required threshold: ${percent(threshold)}.`
     : `Valid votes: ${valid.length}/${votes.length}; quorum: ${quorum}.`
   return [
