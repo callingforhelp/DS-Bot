@@ -170,6 +170,7 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   Object.assign(s.rt, { state: { questions: {} }, chatOf: () => 'main', isCustomerPart: id => id === 'customer', save: async () => {} })
   await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
   await s.call({ action: 'types', type_action: 'edit', type: 'quote', target: 'Quote Bot' })
+  await s.call({ action: 'types', type_action: 'edit', type: 'drawing_review', target: 'Drawing Bot' })
   await s.call({ action: 'types', type_action: 'edit', type: 'order_status', target: 'Orders Bot' })
   s.rt.state.questions.main = { id: 'staff-question', question: 'Do not replace me' }
   const summary = Array(20).fill('Customer asked for a detailed quote.').join(' ')
@@ -177,7 +178,7 @@ test('pending handoffs survive bank reload and remain visible after a review', a
     { route: 'quote', confidence: 0.8, reason: 'quote request' },
     { route: 'order_status', confidence: 0.8, reason: 'order inquiry' },
   ])
-  const result = await s.call({ action: 'vote', summary, routes: ['quote', 'order_status'] })
+  const result = await s.call({ action: 'vote', summary, routes: ['quote', 'order_status', 'drawing_review'] })
   await s.bank.syncHandoffs()
   assert.equal(s.rt.state.questions.main.id, 'staff-question')
   delete s.rt.state.questions.main
@@ -187,7 +188,8 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   assert.deepEqual(detail.source, { bot_id: 'bot', customer_session_id: 'customer' })
   assert.equal(detail.case.summary, summary)
   assert.equal(detail.case.summary_untrusted, true)
-  assert.deepEqual(detail.candidate_destinations.map(entry => [entry.route, entry.target]), [['quote', 'Quote Bot'], ['order_status', 'Orders Bot']])
+  assert.deepEqual(detail.candidate_destinations.map(entry => [entry.route, entry.target]), [['quote', 'Quote Bot'], ['order_status', 'Orders Bot'], ['drawing_review', 'Drawing Bot']])
+  assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), ['quote', 'order_status', 'drawing_review', "I'll handle it myself"])
   assert.equal(s.rt.state.questions.customer, undefined)
   const next = triageBank(s.home, () => {}, s.rt)
   await next.syncHandoffs()

@@ -281,8 +281,11 @@ export function triageBank(home, writable = () => {}, rt) {
         if (!sessionId || rt.isCustomerPart(sessionId) || rt.state.questions[sessionId] !== undefined) continue
         const counts = new Map()
         for (const vote of entry.votes.filter(vote => vote.valid)) counts.set(vote.route, (counts.get(vote.route) ?? 0) + 1)
-        const routes = [...counts].sort((a, b) => b[1] - a[1]).map(([route]) => route)
-        const destinations = routes.map(route => entry.handoff.candidates?.find(candidate => candidate.route === route)).filter(Boolean)
+        const candidates = entry.handoff.candidates ?? (entry.handoff.routes ?? []).map(route => ({ route }))
+        const routes = [...candidates]
+          .sort((a, b) => (counts.get(b.route) ?? 0) - (counts.get(a.route) ?? 0))
+          .map(candidate => candidate.route)
+        const destinations = routes.map(route => candidates.find(candidate => candidate.route === route)).filter(Boolean)
         const detail = {
           source: { bot_id: entry.handoff.botId, customer_session_id: entry.handoff.sessionId },
           case: { id: entry.id, summary: entry.summary, summary_untrusted: true },
