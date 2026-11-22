@@ -426,6 +426,42 @@ test('pending case lessons survive review and clear only after a later linked ru
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test('repeated outcomes keep all unpublished lessons private until a linked rule is published', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1000 })
+  const s = await votingBank(t)
+  s.customer('customer-a', { connId: 'conn-A', chatKey: 'chat-A' })
+  try {
+    await s.call({ action: 'log', customer: 'A', summary: 'HISTORYTOKEN drawing', routed_to: 'Sales', reason: 'misroute' }, 'customer-a')
+    const casesPath = join(s.home, 'triage', 'cases.jsonl')
+    const id = JSON.parse((await readFile(casesPath, 'utf8')).trim()).id
+    const lessons = [
+      { result: 'misrouted', correct_route: 'drawing_review', lesson: 'PRIVATE_FIRST_MISROUTE' },
+      { result: 'misrouted', correct_route: 'after_sales', lesson: 'PRIVATE_SECOND_MISROUTE' },
+      { result: 'resolved', correct_route: 'order_status', lesson: 'PRIVATE_RESOLVED_NOTE' },
+      { result: 'correct', correct_route: 'quote', lesson: 'PRIVATE_CORRECT_NOTE' },
+    ]
+    for (const [index, outcome] of lessons.entries()) {
+      t.mock.timers.setTime(1100 + index * 100)
+      await s.call({ action: 'outcome', id, ...outcome }, 'staff')
+    }
+    const expected = lessons.map(item => item.lesson).sort()
+    const pending = await s.call({ action: 'review' }, 'staff')
+    assert.deepEqual(pending.pending_lessons.map(note => note.lesson).sort(), expected)
+    const reloaded = triageBank(s.home, () => {}, s.rt)
+    assert.deepEqual(JSON.parse(await reloaded({ action: 'review' })).pending_lessons.map(note => note.lesson).sort(), expected)
+
+    const recalled = await s.call({ action: 'recall', query: 'HISTORYTOKEN' }, 'customer-a')
+    assert.equal('lesson_history' in recalled.cases[0], false)
+    assert.doesNotMatch(JSON.stringify(recalled), /PRIVATE_(FIRST_MISROUTE|SECOND_MISROUTE|RESOLVED_NOTE|CORRECT_NOTE)/)
+    const stored = JSON.parse((await readFile(casesPath, 'utf8')).trim())
+    assert.equal(stored.lesson_history.length, 3)
+
+    t.mock.timers.setTime(1600)
+    await s.call({ action: 'rules', rule_action: 'add', id, text: 'Sanitized drawing guidance.' }, 'staff')
+    assert.deepEqual((await s.call({ action: 'review' }, 'staff')).pending_lessons, [])
+  } finally { await rm(s.home, { recursive: true, force: true }) }
+})
+
 test('a full rule bank does not block recording a corrected outcome', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
   const bank = triageBank(dir)

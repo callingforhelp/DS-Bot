@@ -25,15 +25,36 @@ const validType = entry => {
 }
 const clean = value => String(value ?? '').trim().slice(0, 4000)
 const misrouteDetails = outcome => ({ at: outcome.at, correct_route: clean(outcome.correct_route), lesson: clean(outcome.lesson) })
-const caseLessons = entry => [
-  { source: 'outcome', value: entry.outcome },
-  { source: 'misroute', value: entry.misroute },
-].flatMap(({ source, value }) => {
-  const lesson = clean(value?.lesson)
-  if (!lesson) return []
-  const at = Number.isFinite(value.at) ? value.at : Number.isFinite(entry.misrouted_at) ? entry.misrouted_at : Number.isFinite(entry.created) ? entry.created : 0
-  return [{ source, lesson, correct_route: clean(value.correct_route), at }]
-})
+const caseLessons = entry => {
+  const history = Array.isArray(entry.lesson_history)
+    ? entry.lesson_history.filter(note => ['outcome', 'misroute'].includes(note?.source)).map(note => ({ source: note.source, value: note }))
+    : []
+  const seen = new Set()
+  return [
+    { source: 'outcome', value: entry.outcome },
+    { source: 'misroute', value: entry.misroute },
+    ...history,
+  ].flatMap(({ source, value }) => {
+    const lesson = clean(value?.lesson)
+    if (!lesson) return []
+    const at = Number.isFinite(value.at) ? value.at : Number.isFinite(entry.misrouted_at) ? entry.misrouted_at : Number.isFinite(entry.created) ? entry.created : 0
+    const key = `${at}\0${lesson}`
+    if (seen.has(key)) return []
+    seen.add(key)
+    return [{ source, lesson, correct_route: clean(value.correct_route), at }]
+  })
+}
+const preservePendingLessons = (entry, rules) => {
+  const history = Array.isArray(entry.lesson_history) ? entry.lesson_history : []
+  const stored = new Set(caseLessons({ ...entry, outcome: undefined, misroute: undefined }).map(note => `${note.at}\0${note.lesson}`))
+  for (const note of caseLessons({ ...entry, lesson_history: [] })) {
+    const key = `${note.at}\0${note.lesson}`
+    if (stored.has(key) || publishedLesson(entry, note, rules)) continue
+    history.push(note)
+    stored.add(key)
+  }
+  if (history.length) entry.lesson_history = history
+}
 const publishedLesson = (entry, note, rules) => rules.some(rule => rule.from_case === entry.id && Number.isFinite(rule.created) && rule.created >= note.at)
 const hasPendingLessons = (entry, rules) => caseLessons(entry).some(note => !publishedLesson(entry, note, rules))
 const pendingLessons = (cases, rules) => cases.flatMap(entry => caseLessons(entry)
@@ -288,6 +309,7 @@ export function triageBank(home, writable = () => {}, rt) {
           if (!registered.has(correctRoute)) throw new Error(`correct_route must be a registered agent type ID. Available types: ${[...registered].join(', ')}`)
         }
         retained = entry
+        preservePendingLessons(entry, state.rules)
         if (entry.outcome?.result === 'misrouted') entry.misroute = misrouteDetails(entry.outcome)
         entry.outcome = { result: args.result, correct_route: correctRoute, lesson: clean(args.lesson), at: now }
         if (args.result === 'misrouted') { entry.misrouted_at = now; delete entry.misroute }
