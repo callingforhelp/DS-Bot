@@ -14,7 +14,7 @@ import { HANDOFF_ACK, HISTORY_TIMEOUT_MS, SOURCE_KIND, STEER_CUT } from './const
 import { within } from './folders.js'
 import { absoluteLinks } from './links.js'
 import { textOf } from './text.js'
-import { activeTasksOf, isActiveTask, isCustomerTask, threadCurrentOfPart, threadOfPart } from './threads.js'
+import { activeTasksOf, isActiveTask, isCustomerTask, isLiveTask, threadCurrentOfPart, threadOfPart } from './threads.js'
 import { output } from './tools.js'
 import { answerSender, cutOffText, turnFailure } from './turns.js'
 
@@ -505,8 +505,28 @@ export function install(rt) {
     return wasActive
   }
 
+  async function stopCustomerTask(task, reason = 'stopped') {
+    if (!isCustomerTask(task) || !isLiveTask(task)) return false
+    const sessionId = task.sessionId
+    task.status = 'waiting_customer'
+    task.updatedAt = Date.now()
+    await rt.save()
+    rt.cancelApprovals?.(sessionId)
+    const jobs = ctx.get?.('jobs')
+    for (const job of rt.runningJobs?.(sessionId) ?? []) {
+      try { jobs?.kill(job.id, sessionId, reason) } catch { /* already ended */ }
+    }
+    const agent = ctx.get('agents')?.get(sessionId)
+    agent?.inbox?.clear()
+    agent?.cancel({ kind: 'hook', reason: 'ds-bot: customer work stopped' })
+    return true
+  }
+
   async function stopAllTasksOfBot(bot, reason = 'stopped') {
     const rooms = new Set()
+    for (const task of bot.tasks ?? []) {
+      if (isCustomerTask(task) && isLiveTask(task)) await stopCustomerTask(task, reason)
+    }
     for (const task of activeTasksOf(bot).filter(item => !isCustomerTask(item))) {
       if (task.roomId !== undefined) rooms.add(task.roomId)
       await stopTask(bot, task, reason, { notifyForeground: false })
@@ -1449,6 +1469,7 @@ export function install(rt) {
       return stopped
     },
     stopAllTasksOfBot,
+    stopCustomerTask,
     hasRoomTasks,
     activeRoomTasks,
     stopMemberRoomTasks,
