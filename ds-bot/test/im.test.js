@@ -437,6 +437,43 @@ test('customer messages without IDs fail visibly without an unidentifiable retry
   assert.equal(s.prompts.length, 0)
 })
 
+test('stopping a connection clears its customer retry budgets before reconnecting', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  let attempts = 0
+  s.rt.customerPart = async () => { attempts++; throw new Error('setup unavailable') }
+  const staleHandler = s.fake.handlers.onMessage
+  const message = () => dm(s, 'customer', 'first', { messageId: 'first' })
+  for (let i = 0; i < 2; i++) await assert.rejects(message(), { retryInbound: true })
+  await message()
+  await s.rt.imEndpoint('im-update', { id: conn.id, enabled: false })
+  await s.rt.imEndpoint('im-update', { id: conn.id, enabled: true })
+  await staleHandler({ chat: { key: 'dm-customer', kind: 'direct' }, sender: { id: 'customer' }, text: 'old', messageId: 'old' })
+  assert.equal(attempts, 3, 'a stopped runner cannot add retry state after reconnecting')
+  for (let i = 0; i < 2; i++) await assert.rejects(message(), { retryInbound: true })
+  await message()
+  await s.flush()
+  assert.equal(s.fake.sent.length, 2)
+  assert.equal(attempts, 6)
+})
+
+test('a customer setup failure arriving after connection removal cannot recreate retry state', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  let started, rejectSetup
+  const entered = new Promise(resolve => { started = resolve })
+  s.rt.customerPart = () => new Promise((resolve, reject) => { rejectSetup = reject; started() })
+  const pending = dm(s, 'customer', 'first', { messageId: 'first' })
+  await entered
+  await s.rt.imEndpoint('im-remove', { id: conn.id })
+  rejectSetup(new Error('setup unavailable'))
+  await pending
+  assert.equal(s.fake.sent.length, 0)
+  assert.equal(s.prompts.length, 0)
+})
+
 test('customer setup apologies follow every supported IM language', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
