@@ -394,6 +394,8 @@ test('public customers have isolated background threads that survive rollover an
   assert.equal(s.prompts.at(-1).sessionId, 'rolled-customer')
   assert.equal(await s.rt.customerPart('a', conn.id, 'dm-first'), 'rolled-customer')
   assert.deepEqual(bot.openParts[0].customer, { connId: conn.id, chatKey: 'dm-first' })
+  assert.deepEqual(s.rt.customerIdentityOf(first), { connId: conn.id, chatKey: 'dm-first' })
+  assert.deepEqual(s.rt.customerIdentityOf('rolled-customer'), { connId: conn.id, chatKey: 'dm-first' })
   await assert.rejects(s.rt.switchPart('a', first), { code: 'bot/invalid' })
   assert.equal(s.rt.chatOf('a'), 'a')
   await assert.rejects(s.rt.customerPart('missing', conn.id, 'x'), { code: 'bot/not-found' })
@@ -669,11 +671,61 @@ test('customer setup apologies follow every supported IM language', async (t) =>
   }
 })
 
+test('customer recall and judge prompts stay within trusted customer provenance', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  const customerA = await s.rt.customerPart('a', conn.id, 'dm-customer-A')
+  const customerB = await s.rt.customerPart('a', conn.id, 'dm-customer-B')
+  const tool = s.rt.teamTools.find(tool => tool.name === 'triage_cases')
+  const call = async (sessionId, args) => JSON.parse(await tool.execute(args, { agent: s.agentOf(sessionId) }))
+  const log = (customer, summary) => ({ action: 'log', customer, summary, routed_to: 'quote', reason: 'matching request' })
+  const marker = 'MATCHTOKEN'
+  await call(customerA, log('A_CUSTOMER_LABEL', `A_PRIVATE_${marker}`))
+  await call(customerB, log('A_CUSTOMER_LABEL', `B_PRIVATE_${marker}`))
+  await call('a', log('LEGACY_CUSTOMER', `LEGACY_PRIVATE_${marker}`))
+
+  const bot = s.rt.botOf('a')
+  pushThreadPart(bot, customerA, 'customer-A-next', { sessionId: customerA })
+  s.rt.chatOwners.delete(customerA)
+  s.rt.pastOwners.set(customerA, { botId: 'a' })
+  s.rt.chatOwners.set('customer-A-next', 'a')
+  await s.rt.save()
+  assert.deepEqual(s.rt.customerIdentityOf(customerA), { connId: conn.id, chatKey: 'dm-customer-A' })
+  assert.deepEqual(s.rt.customerIdentityOf('customer-A-next'), { connId: conn.id, chatKey: 'dm-customer-A' })
+
+  const recalledA = await call(customerA, { action: 'recall', query: marker })
+  assert.deepEqual(recalledA.cases.map(item => item.summary), [`A_PRIVATE_${marker}`])
+  assert.equal(JSON.stringify(recalledA).includes('A_CUSTOMER_LABEL'), false)
+  assert.equal(JSON.stringify(recalledA).includes(conn.id), false)
+  const recalledB = await call(customerB, { action: 'recall', query: marker })
+  assert.deepEqual(recalledB.cases.map(item => item.summary), [`B_PRIVATE_${marker}`])
+  const staffRecall = await call('a', { action: 'recall', query: marker })
+  assert.equal(staffRecall.cases.length, 3)
+
+  s.rt.catalog = async () => [{ ref: 'p/one' }, { ref: 'p/two' }]
+  await call('a', { action: 'judges', models: ['p/one', 'p/two'] })
+  const prompts = []
+  s.rt.assembleLlm = async options => {
+    prompts.push(options)
+    return { finish: { kind: 'stop' }, blocks: () => [{ type: 'text', text: JSON.stringify({ route: 'quote', confidence: 0.8, reason: 'matching request' }) }] }
+  }
+  const vote = await call(customerB, { action: 'vote', summary: marker, routes: ['quote', 'after_sales'] })
+  const prompt = JSON.stringify(prompts)
+  assert.match(prompt, /B_PRIVATE_MATCHTOKEN/)
+  assert.doesNotMatch(prompt, /A_PRIVATE_MATCHTOKEN|LEGACY_PRIVATE_MATCHTOKEN|A_CUSTOMER_LABEL|LEGACY_CUSTOMER/)
+  assert.equal(vote.case_id, undefined)
+  assert.doesNotMatch(JSON.stringify(vote), /connId|chatKey|customer_source|dm-customer-B/)
+  const cases = readFileSync(join(s.home, 'triage', 'cases.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  assert.deepEqual(cases.find(item => item.handoff?.sessionId === customerB).customer_source, { connId: conn.id, chatKey: 'dm-customer-B' })
+})
+
 test('triage tools restrict current and historical customer parts but not normal conversations', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
   const conn = await add(s, { corpId: 'test', secret: 'test' })
   const first = await s.rt.customerPart('a', conn.id, 'dm-customer')
+  assert.deepEqual(s.rt.customerIdentityOf(first), { connId: conn.id, chatKey: 'dm-customer' })
   const tool = s.rt.teamTools.find(tool => tool.name === 'triage_cases')
   const call = async (sessionId, args) => JSON.parse(await tool.execute(args, { agent: s.agentOf(sessionId) }))
   await assert.rejects(
@@ -681,9 +733,9 @@ test('triage tools restrict current and historical customer parts but not normal
     /registered agent types/,
   )
   const log = { action: 'log', customer: 'customer', summary: 'part drawing', routed_to: 'sales', reason: 'quote' }
-  const entry = await call(first, log)
+  assert.deepEqual(await call(first, log), { logged: true })
   const forbidden = [
-    { action: 'outcome', id: entry.id, result: 'misrouted', lesson: 'rule' },
+    { action: 'outcome', id: 'customer-case', result: 'misrouted', lesson: 'rule' },
     { action: 'review' },
     { action: 'rules', rule_action: 'add', text: 'rule' },
     { action: 'rules', rule_action: 'remove', id: 'rule' },
@@ -701,11 +753,13 @@ test('triage tools restrict current and historical customer parts but not normal
   for (const sessionId of [first, 'customer-next']) {
     assert.equal(s.rt.isCustomerPart(sessionId), true)
     for (const args of forbidden) await assert.rejects(call(sessionId, args), /Outcomes, rules and reviews are recorded outside customer conversations/)
-    assert.equal((await call(sessionId, { action: 'recall', query: 'drawing' })).cases[0].id, entry.id)
+    const recalled = (await call(sessionId, { action: 'recall', query: 'drawing' })).cases[0]
+    assert.equal(recalled.summary, log.summary)
+    assert.equal('id' in recalled, false)
     assert.deepEqual(await call(sessionId, { action: 'rules', rule_action: 'list' }), [])
     assert.deepEqual(await call(sessionId, { action: 'judges' }), { judges: [], threshold: 0.7 })
     assert.equal((await call(sessionId, { action: 'types' })).length, 4)
-    assert.ok((await call(sessionId, log)).id)
+    assert.deepEqual(await call(sessionId, log), { logged: true })
   }
   assert.equal(s.rt.isCustomerPart('a'), false)
   assert.equal(s.rt.isCustomerPart('unknown'), false)
@@ -747,6 +801,8 @@ test('customer triage handoffs queue in the main chat and advance after answers 
   let pending = (await call('a', { action: 'review' })).pending_handoffs
   assert.equal(pending.length, 2)
   assert.equal(pending[0].handoff.sessionId, customer)
+  assert.equal(first.case_id, undefined)
+  assert.equal(second.case_id, undefined)
   const main = s.agentOf('a')
   main.followup = message => {
     main.lastFollowup = message
@@ -755,7 +811,7 @@ test('customer triage handoffs queue in the main chat and advance after answers 
   await s.rt.answerQuestion('a', existing, { selected: ['Continue'] })
   await s.rt.syncTriageHandoffs()
   const card = s.rt.state.questions.a
-  assert.equal(card.id, `triage-${first.case_id}`)
+  assert.equal(card.id, `triage-${pending[0].id}`)
   assert.match(card.question, /退款申请/)
   assert.deepEqual(card.options.map(option => option.label), ['quote', 'order_status', "I'll handle it myself"])
   assert.equal(card.detail.includes('\n'), false)
@@ -769,7 +825,7 @@ test('customer triage handoffs queue in the main chat and advance after answers 
   delete s.rt.state.questions.a
   await s.rt.save()
   await s.rt.syncTriageHandoffs()
-  assert.equal(s.rt.state.questions.a.id, `triage-${second.case_id}`)
+  assert.equal(s.rt.state.questions.a.id, `triage-${pending[1].id}`)
   await s.rt.answerQuestion('a', s.rt.state.questions.a.id, { selected: ["I'll handle it myself"] })
   await s.rt.syncTriageHandoffs()
   assert.equal(s.rt.state.questions.a, undefined)

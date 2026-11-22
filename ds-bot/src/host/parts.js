@@ -2120,6 +2120,15 @@ export function install(rt) {
     const thread = threadOfPart(bot, sessionId)
     return thread?.thread === 'open' && bot.openParts[thread.index].customer !== undefined
   }
+  function customerIdentityOf(sessionId) {
+    const botId = rt.chatOwners.get(sessionId) ?? rt.pastOwners.get(sessionId)?.botId
+    const bot = rt.botOf(botId)
+    const thread = threadOfPart(bot, sessionId)
+    if (thread?.thread !== 'open') return undefined
+    const customer = bot.openParts[thread.index].customer
+    if (typeof customer?.connId !== 'string' || customer.connId.length === 0 || typeof customer.chatKey !== 'string' || customer.chatKey.length === 0) return undefined
+    return { connId: customer.connId, chatKey: customer.chatKey }
+  }
   async function customerPart(botId, connId, chatKey) {
     await rt.load()
     const bot = rt.botOf(botId)
@@ -2218,5 +2227,5 @@ export function install(rt) {
     return true
   }
 
-  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, customerPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, customerPart, isCustomerPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, customerPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, customerPart, isCustomerPart, customerIdentityOf, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }

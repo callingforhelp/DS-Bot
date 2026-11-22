@@ -131,6 +131,8 @@ export function triageBank(home, writable = () => {}, rt) {
       const cases = await read('cases.jsonl', [], true)
       const state = await read('rules.json', { rules: [], reviewed: 0 })
       const now = Date.now()
+      const customerSession = rt?.isCustomerPart?.(context.sessionId) === true
+      const customerSource = customerSession ? rt.customerIdentityOf?.(context.sessionId) : undefined
       const addRule = (text, from_case) => {
         if (!clean(text)) throw new Error('Rule text is required')
         if (state.rules.length >= MAX_RULES) throw new Error('Triage rule limit reached; remove obsolete rules first')
@@ -142,10 +144,16 @@ export function triageBank(home, writable = () => {}, rt) {
       let retained
       const recall = () => {
         const query = terms(args.query ?? (args.action === 'vote' ? args.summary : undefined))
-        const ranked = cases.map(item => ({ ...item, score: overlap(query, terms([item.summary, item.attachments_summary, item.reason].join(' '))) }))
+        const eligible = customerSession
+          ? cases.filter(item => customerSource !== undefined && item.customer_source?.connId === customerSource.connId && item.customer_source?.chatKey === customerSource.chatKey)
+          : cases
+        const ranked = eligible.map(item => ({ ...item, score: overlap(query, terms([item.summary, item.attachments_summary, item.reason].join(' '))) }))
           .filter(item => item.score > 0).sort((a, b) => b.score - a.score).slice(0, Math.max(1, Math.min(20, Number(args.limit) || 5)))
         for (const rule of state.rules) if (overlap(query, terms(rule.text)) > 0) rule.hits++
-        return { cases: ranked, rules: state.rules }
+        const visible = customerSession
+          ? ranked.map(item => ({ summary: item.summary, ...(item.attachments_summary ? { attachments_summary: item.attachments_summary } : {}), routed_to: item.routed_to, reason: item.reason, score: item.score }))
+          : ranked
+        return { cases: visible, rules: customerSession ? state.rules.map(rule => ({ text: rule.text })) : state.rules }
       }
       if (args.action === 'judges') {
         const config = await read('config.json', { judges: [], threshold: 0.7 })
@@ -206,11 +214,11 @@ export function triageBank(home, writable = () => {}, rt) {
             route: entry.type, runtime: entry.runtime, target: entry.target, permission: entry.permission,
             method: entry.runtime === 'ds-bot' && entry.target ? 'message_bot' : 'staff',
           }))
-          retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', ...(result.delivery ? { delivery: result.delivery } : {}), handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes, candidates, ...(result.required_judges ? { required_judges: result.required_judges } : {}) } }
+          retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', ...(customerSource ? { customer_source: customerSource } : {}), ...(result.delivery ? { delivery: result.delivery } : {}), handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes, candidates, ...(result.required_judges ? { required_judges: result.required_judges } : {}) } }
           cases.push(retained)
           await writeCases(cases, retained)
           hasPending = true
-          result.case_id = retained.id
+          if (!customerSession) result.case_id = retained.id
           result.instructions = result.required_judges
             ? 'Do not route or call message_bot. At least two distinct judges must be configured before automatic routing; staff will route this case from the Bot main chat.'
             : 'Do not route or call message_bot. Send the customer the warm Chinese holding reply; staff will route this case from the Bot main chat.'
@@ -220,7 +228,7 @@ export function triageBank(home, writable = () => {}, rt) {
         result = recall()
       } else if (args.action === 'log') {
         for (const key of ['customer', 'summary', 'routed_to', 'reason']) if (!clean(args[key])) throw new Error(`${key} is required`)
-        const entry = { id: randomUUID(), created: now }
+        const entry = { id: randomUUID(), created: now, ...(customerSource ? { customer_source: customerSource } : {}) }
         for (const key of ['customer', 'summary', 'attachments_summary', 'routed_to', 'reason']) entry[key] = clean(args[key])
         if (args.votes !== undefined) entry.votes = compactVotes(args.votes)
         if (args.decision !== undefined) {
@@ -229,7 +237,7 @@ export function triageBank(home, writable = () => {}, rt) {
         }
         cases.push(entry)
         retained = entry
-        result = { id: entry.id }
+        result = customerSession ? { logged: true } : { id: entry.id }
       } else if (args.action === 'outcome') {
         const entry = cases.find(item => item.id === args.id)
         if (!entry) throw new Error('Triage case not found')

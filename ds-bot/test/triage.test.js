@@ -10,9 +10,12 @@ const votingBank = async (t) => {
   t.after(() => rm(home, { recursive: true, force: true }))
   const calls = []
   let responses = []
+  const customerSources = new Map()
   const rt = {
     catalog: async () => ['p/one', 'p/two', 'p/three'].map(ref => ({ ref })),
     botOf: id => id === 'bot' ? { id } : undefined,
+    isCustomerPart: sessionId => customerSources.has(sessionId),
+    customerIdentityOf: sessionId => customerSources.get(sessionId),
     desiredModel: async () => 'p/one', defaultModel: async () => 'p/two',
     assembleLlm: async options => {
       calls.push(options)
@@ -22,8 +25,52 @@ const votingBank = async (t) => {
     },
   }
   const bank = triageBank(home, () => {}, rt)
-  return { home, rt, bank, calls, replies: values => { responses = values }, call: async args => JSON.parse(await bank(args, { botId: 'bot', sessionId: 'customer' })) }
+  return {
+    home, rt, bank, calls, replies: values => { responses = values }, customer: (sessionId, source) => customerSources.set(sessionId, source),
+    call: async (args, sessionId = 'customer') => JSON.parse(await bank(args, { botId: 'bot', sessionId })),
+  }
 }
+
+test('customer recall and vote use only trusted same-thread case provenance', async (t) => {
+  const s = await votingBank(t)
+  const sourceA = { connId: 'conn-A', chatKey: 'chat-A' }
+  const sourceB = { connId: 'conn-B', chatKey: 'chat-B' }
+  for (const sessionId of ['customer-A', 'customer-A-old', 'customer-A-current']) s.customer(sessionId, sourceA)
+  s.customer('customer-B', sourceB)
+  const matching = 'MATCHTOKEN'
+  assert.deepEqual(await s.call({ action: 'log', customer: 'spoofed-A', summary: `A_PRIVATE_${matching}`, routed_to: 'quote', reason: 'A-only detail' }, 'customer-A'), { logged: true })
+  assert.deepEqual(await s.call({ action: 'log', customer: 'spoofed-B', summary: `B_PRIVATE_${matching}`, routed_to: 'quote', reason: 'B-only detail' }, 'customer-B'), { logged: true })
+  const legacy = await s.call({ action: 'log', customer: 'LEGACY_CUSTOMER', summary: `LEGACY_PRIVATE_${matching}`, routed_to: 'quote', reason: 'legacy detail' }, 'staff')
+  const stored = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.deepEqual(stored.find(item => item.summary.startsWith('A_PRIVATE')).customer_source, sourceA)
+  assert.deepEqual(stored.find(item => item.summary.startsWith('B_PRIVATE')).customer_source, sourceB)
+  assert.equal(stored.find(item => item.id === legacy.id).customer_source, undefined)
+
+  const ownA = await s.call({ action: 'recall', query: matching }, 'customer-A-old')
+  assert.deepEqual(ownA.cases.map(item => item.summary), [`A_PRIVATE_${matching}`])
+  assert.equal('id' in ownA.cases[0], false)
+  assert.equal('customer' in ownA.cases[0], false)
+  assert.equal('customer_source' in ownA.cases[0], false)
+  const ownB = await s.call({ action: 'recall', query: matching }, 'customer-B')
+  assert.deepEqual(ownB.cases.map(item => item.summary), [`B_PRIVATE_${matching}`])
+  s.customer('customer-unattributed', undefined)
+  assert.deepEqual((await s.call({ action: 'recall', query: matching }, 'customer-unattributed')).cases, [])
+  assert.deepEqual((await s.call({ action: 'recall', query: matching }, 'staff')).cases.map(item => item.summary).sort(), [`A_PRIVATE_${matching}`, `B_PRIVATE_${matching}`, `LEGACY_PRIVATE_${matching}`])
+
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] }, 'staff')
+  s.replies([
+    { route: 'quote', confidence: 0.8, reason: 'matched' },
+    { route: 'quote', confidence: 0.8, reason: 'matched' },
+  ])
+  const result = await s.call({ action: 'vote', summary: matching, routes: ['quote', 'after_sales'] }, 'customer-B')
+  const prompt = JSON.stringify(s.calls)
+  assert.match(prompt, /B_PRIVATE_MATCHTOKEN/)
+  assert.doesNotMatch(prompt, /A_PRIVATE_MATCHTOKEN|LEGACY_PRIVATE_MATCHTOKEN|conn-A|chat-A|spoofed-A/)
+  assert.equal(result.case_id, undefined)
+  assert.doesNotMatch(JSON.stringify(result), /conn-B|chat-B|customer_source/)
+  const afterVote = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.deepEqual(afterVote.find(item => item.handoff?.sessionId === 'customer-B').customer_source, sourceB)
+})
 
 test('triage judge config validates refs and thresholds and persists atomically', async (t) => {
   const s = await votingBank(t)
@@ -190,7 +237,9 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   assert.equal(s.rt.state.questions.main.id, 'staff-question')
   delete s.rt.state.questions.main
   await s.bank.syncHandoffs()
-  assert.equal(s.rt.state.questions.main.id, `triage-${result.case_id}`)
+  assert.equal(result.case_id, undefined)
+  const pending = (await s.call({ action: 'review' }, 'staff')).pending_handoffs[0]
+  assert.equal(s.rt.state.questions.main.id, `triage-${pending.id}`)
   const detail = JSON.parse(s.rt.state.questions.main.detail)
   assert.deepEqual(detail.source, { bot_id: 'bot', customer_session_id: 'customer' })
   assert.equal(detail.case.summary, summary)
