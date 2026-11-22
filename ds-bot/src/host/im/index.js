@@ -283,8 +283,9 @@ export function install(rt) {
     if (held !== undefined) {
       held.messageId = messageId ?? held.messageId
       held.text = body ?? held.text
+      held.delivered = true
     } else {
-      entries.push({ chatKey, messageId, text: body })
+      entries.push({ chatKey, messageId, text: body, delivered: true })
     }
     data.cards[cardKey] = entries
     scheduleWrite(id)
@@ -695,9 +696,10 @@ export function install(rt) {
 
   // One card this chat was sent and has not answered yet. A button names its own
   // card, so it must never fall through to a newer card of the same kind.
+  const wasDelivered = entry => entry.delivered === true || entry.messageId !== undefined
   const openCard = (conn, chatKey, cardKey) => {
     const entries = runtimes.get(conn.id)?.data?.cards[cardKey]
-    const entry = entries?.find(item => item.chatKey === chatKey && item.answer === undefined)
+    const entry = entries?.find(item => item.chatKey === chatKey && item.answer === undefined && wasDelivered(item))
     return entry === undefined ? undefined : { cardKey, entry }
   }
   const questionById = (id) => {
@@ -762,7 +764,7 @@ export function install(rt) {
     if (data === undefined) return undefined
     for (const [cardKey, entries] of Object.entries(data.cards).reverse()) {
       if (!cardKey.startsWith('q:') && !cardKey.startsWith('a:')) continue
-      const entry = entries.find(item => item.chatKey === chatKey && item.answer === undefined)
+      const entry = entries.find(item => item.chatKey === chatKey && item.answer === undefined && wasDelivered(item))
       if (entry !== undefined) return { cardKey, entry }
     }
     return undefined

@@ -181,6 +181,29 @@ test('public customers can answer numbered question cards but not control comman
   assert.equal(s.agentOf('a').cancelled, undefined)
 })
 
+test('a failed customer question card cannot consume a number until delivery succeeds', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer', 'hello')
+  s.imTurn('a')
+  s.fake.fails.push(Object.assign(new Error('reply quota exhausted'), { permanent: true }))
+  s.rt.state.questions.a = { id: 'failed-question', question: 'Which?', options: [{ label: 'yes' }] }
+  await s.rt.save()
+  await s.flush()
+  assert.equal(s.fake.sent.length, 1)
+  await dm(s, 'customer', '1')
+  assert.equal(s.prompts.length, 2)
+  assert.ok(s.rt.state.questions.a)
+  assert.equal(s.agentOf('a').followed, undefined)
+  await s.rt.imEndpoint('im-retry', { id: conn.id })
+  await s.flush()
+  await dm(s, 'customer', '1')
+  assert.equal(s.rt.state.questions.a, undefined)
+  assert.equal(s.agentOf('a').followed, 1)
+  assert.equal(s.prompts.length, 2)
+})
+
 test('two concurrent syncs start exactly one adapter', async (t) => {
   const s = await start()
   t.after(s.stop)
