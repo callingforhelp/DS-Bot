@@ -16,12 +16,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "mac-job-broker")))
 from broker import BrokerStore, ThreadingHTTPServer, make_handler
 
 from worker import (
+    _PROBE_BANNER_PREFIX,
     BrokerClient,
     HttpHealthProbe,
     MacJobWorker,
     SsmTunnelManager,
     _acquire_dir_lock,
     _ensure_local_git_repo,
+    _frame_dsbot_task,
     _release_dir_lock,
     default_dsbot_runner,
     default_git_sync_runner,
@@ -999,6 +1001,24 @@ class LocalMacWorkerTest(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_frame_dsbot_task_marks_probes_without_touching_normal_jobs(self) -> None:
+        raw = "Reply with PONG."
+        self.assertEqual(
+            _frame_dsbot_task({"aws_session_id": "web-chat-42", "role": "worker"}, raw),
+            raw,
+        )
+        framed_e2e = _frame_dsbot_task({"aws_session_id": "e2e-0310"}, raw)
+        self.assertTrue(framed_e2e.startswith(_PROBE_BANNER_PREFIX))
+        self.assertIn("(session=e2e-0310)", framed_e2e)
+        self.assertTrue(framed_e2e.endswith(raw))
+        # Role=probe triggers framing even without prefix and never double-frames.
+        framed_role = _frame_dsbot_task({"aws_session_id": "custom", "role": "probe"}, raw)
+        self.assertTrue(framed_role.startswith(_PROBE_BANNER_PREFIX))
+        self.assertEqual(
+            _frame_dsbot_task({"aws_session_id": "e2e-0310"}, framed_e2e),
+            framed_e2e,
+        )
 
 
 if __name__ == "__main__":

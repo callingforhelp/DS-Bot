@@ -759,6 +759,24 @@ def _mcp_call_tool(
     return parsed if isinstance(parsed, dict) else {"value": parsed}
 
 
+_PROBE_SESSION_PREFIXES = ("e2e-", "probe-", "healthcheck-")
+_PROBE_BANNER_PREFIX = "[Automated healthcheck probe from mac-job-worker"
+
+
+def _frame_dsbot_task(job: dict[str, Any], task: str) -> str:
+    role = str(job.get("role") or "").strip().lower()
+    session_id = str(job.get("aws_session_id") or "").strip()
+    is_probe = role == "probe" or session_id.lower().startswith(_PROBE_SESSION_PREFIXES)
+    if not is_probe or task.lstrip().startswith(_PROBE_BANNER_PREFIX):
+        return task
+    label = session_id or "probe"
+    return (
+        f"{_PROBE_BANNER_PREFIX} (session={label}): "
+        "reply with only what is requested below; no extra commentary or follow-up question needed.]\n\n"
+        f"{task}"
+    )
+
+
 def run_dsbot_via_local_mcp(
     job: dict[str, Any],
     mcp_url: str,
@@ -767,7 +785,7 @@ def run_dsbot_via_local_mcp(
     empty_done_grace_sec: float = 45.0,
     poll_sleep_sec: float = 1.0,
 ) -> dict[str, Optional[str]]:
-    task = str(job["task"])
+    task = _frame_dsbot_task(job, str(job["task"]))
     timeout_sec = max(1, int(job.get("timeout_sec") or 900))
     deadline = time.monotonic() + timeout_sec
     group_target = str(job.get("group") or job.get("group_name") or "").strip()

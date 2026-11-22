@@ -153,6 +153,10 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'route POST /api/bot',
     'effect ds-bot: load state',
     'effect ds-bot: local agents',
+    'effect ds-bot: cloud runtime prompt',
+    'prompt bot-cloud-runtime 645',
+    'effect ds-bot: cloud prompt router',
+    'effect ds-bot: cloud runtime poll',
   ])
 })
 

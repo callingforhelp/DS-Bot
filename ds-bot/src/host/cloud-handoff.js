@@ -1171,6 +1171,10 @@ export function install(rt) {
         return JSON.stringify({ ok: true, direction, cloudPush, macPullJob })
       },
     }))
+    // The Desktop-only read_browser stays the last tool, so the list every profile
+    // shares comes first and only the profile's own tool differs at the end.
+    const browserAt = rt.teamTools.findIndex(tool => tool.name === 'read_browser')
+    if (browserAt !== -1) rt.teamTools.push(...rt.teamTools.splice(browserAt, 1))
   }
 
   if (typeof ctx.systemPrompt?.section === 'function') {
