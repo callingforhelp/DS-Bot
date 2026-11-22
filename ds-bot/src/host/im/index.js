@@ -712,18 +712,18 @@ export function install(rt) {
       if (target?.botId !== undefined) {
         const key = typeof msg.messageId === 'string' && msg.messageId !== ''
           ? JSON.stringify([conn.id, msg.chat.key, msg.sender.id, msg.messageId]) : undefined
-        if (customerFailures.exhausted(key)) return
+        if (customerFailures.exhausted(conn.id, key)) return
         try {
           await rt.customerPart(target.botId, conn.id, msg.chat.key)
           if (runner.stopped === true) throw stoppedInbound()
-          customerFailures.success(key)
+          customerFailures.success(conn.id, key)
         } catch (error) {
           if (runner.stopped === true) throw stoppedInbound()
           if (customerFailures.fail(conn.id, key, error?.permanent === true)) {
             throw Object.assign(new Error('Customer conversation could not be opened', { cause: error }), { retryInbound: true })
           }
           rt.warn('ds-bot: customer conversation failed: %s', reasonOf(error))
-          if (customerFailures.shouldReply(conn.id, key)) await sendText(conn, msg.chat, text('unavailable'))
+          await sendText(conn, msg.chat, text('unavailable'))
           return
         }
       }

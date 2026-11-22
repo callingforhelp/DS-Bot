@@ -438,20 +438,48 @@ test('customer messages without IDs fail visibly without an unidentifiable retry
   assert.equal(s.prompts.length, 0)
 })
 
-test('replaying an evicted customer failure logs without sending another quota-consuming apology', async (t) => {
+test('a new customer failure still retries and sends one apology after eviction', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
   await add(s, { corpId: 'test', secret: 'test' })
-  let warnings = 0
-  s.rt.warn = () => { warnings++ }
+  s.rt.warn = () => {}
   s.rt.customerPart = async () => { throw Object.assign(new Error('setup unavailable'), { permanent: true }) }
-  for (let i = 0; i <= 1024; i++) await dm(s, 'customer', 'first', { messageId: String(i) })
+  for (let i = 0; i <= 1024; i++) await dm(s, 'customer', 'old', { messageId: String(i) })
+  let attempts = 0
+  s.rt.customerPart = async () => { attempts++; throw new Error('setup unavailable') }
+  const message = () => dm(s, 'customer', 'new', { messageId: 'new' })
+  for (let i = 0; i < 2; i++) await assert.rejects(message(), { retryInbound: true })
+  await message()
+  await message()
   await s.flush()
-  assert.equal(s.fake.sent.length, 1025)
-  for (let replay = 0; replay < 3; replay++) await dm(s, 'customer', 'first', { messageId: '0' })
+  assert.equal(attempts, 3)
+  assert.equal(s.fake.sent.length, 1026, 'the new failed message gets exactly one apology')
+  assert.equal(s.prompts.length, 0)
+})
+
+test('a full replayed customer page retains every failure and sends no duplicate apologies', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  s.rt.warn = () => {}
+  let attempts = 0
+  s.rt.customerPart = async (botId, connId, chatKey) => {
+    attempts++
+    throw Object.assign(new Error('setup unavailable'), { permanent: chatKey !== 'dm-last' })
+  }
+  for (let i = 0; i <= 1024; i++) await dm(s, 'customer', 'old', { messageId: `old-${i}` })
+  const poll = async () => {
+    for (let i = 0; i < 1000; i++) await dm(s, i === 999 ? 'last' : 'customer', 'page', { messageId: `page-${i}` })
+  }
+  for (let i = 0; i < 2; i++) await assert.rejects(poll(), { retryInbound: true })
+  await poll()
   await s.flush()
-  assert.equal(s.fake.sent.length, 1025, 'an evicted message does not consume the reply quota again')
-  assert.equal(warnings, 1028, 'suppressed failures are still logged')
+  assert.equal(s.fake.sent.length, 2025)
+  assert.equal(attempts, 2027)
+  await poll()
+  await s.flush()
+  assert.equal(s.fake.sent.length, 2025)
+  assert.equal(attempts, 2027, 'the whole current page remains exhausted after old-page eviction')
   assert.equal(s.prompts.length, 0)
 })
 
