@@ -8,6 +8,7 @@
 // Reads ~/.ds-bot only; prints counts, sizes and destinations, never file names or contents.
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { ROOT } from './pg.mjs'
 import { backupName, createBackup, downloadBackup, pruneDir, restoreBackup, uploadBackup } from '../src/backup.mjs'
@@ -92,6 +93,6 @@ async function main() {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) {
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => { console.error(`backup-mac: ${error.message}`); process.exit(1) })
 }
