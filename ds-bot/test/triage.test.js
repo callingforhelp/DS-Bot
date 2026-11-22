@@ -252,6 +252,60 @@ test('staff votes may route to a local specialist while customer votes hand off'
   assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'triage_test_local', message: 'Please help' }), false)
 })
 
+test('staff group votes hand off outside targets and mark only message_bot destinations available', async (t) => {
+  const s = await votingBank(t)
+  const sessionId = 'staff-group-session'
+  const targets = new Map([
+    ['Main Bot', { id: 'bot', name: 'Main Bot', model: 'p/one' }],
+    ['Local outside', { id: 'local-outside', name: 'Local outside', model: 'local/model' }],
+    ['Hosted outside', { id: 'hosted-outside', name: 'Hosted outside', model: 'p/one' }],
+    ['Group member', { id: 'group-member', name: 'Group member', model: 'p/two' }],
+  ])
+  const room = { id: 'group-1', name: 'Support group', members: ['bot', 'group-member'] }
+  s.rt.findBot = name => targets.get(name)
+  s.rt.groupOwners = new Map([[sessionId, { roomId: room.id }]])
+  s.rt.roomOf = roomId => roomId === room.id ? room : undefined
+  s.rt.localAgentBadge = model => model === 'local/model' ? { name: 'Local agent' } : undefined
+
+  const definitions = [
+    ['triage_test_local_outside', 'Local outside', 'local specialist work'],
+    ['triage_test_hosted_outside', 'Hosted outside', 'hosted specialist work'],
+    ['triage_test_member', 'Group member', 'group specialist work'],
+    ['triage_test_self', 'Main Bot', 'main bot work'],
+  ]
+  for (const [type, target, handles] of definitions) {
+    await s.call({ action: 'types', type_action: 'add', type, handles, examples: [`${handles} request`, `another ${handles} request`], runtime: 'ds-bot', target })
+  }
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
+  const routes = definitions.map(([type]) => type)
+  const votesFor = route => [
+    { route, confidence: 0.95, reason: 'Best route' },
+    { route, confidence: 0.9, reason: 'Matching route' },
+  ]
+
+  for (const route of routes.slice(0, 2).concat(routes[3])) {
+    s.replies(votesFor(route))
+    const result = await s.call({ action: 'vote', summary: `Group request for ${route}`, routes }, sessionId)
+    assert.equal(result.decision, 'handoff')
+    assert.equal(result.route, undefined)
+    assert.equal(result.selected_type, route)
+    const cases = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    const candidates = Object.fromEntries(cases.at(-1).handoff.candidates.map(candidate => [candidate.route, candidate.available]))
+    assert.deepEqual(candidates, {
+      triage_test_local_outside: false,
+      triage_test_hosted_outside: false,
+      triage_test_member: true,
+      triage_test_self: false,
+    })
+  }
+
+  s.replies(votesFor('triage_test_member'))
+  const member = await s.call({ action: 'vote', summary: 'Group member request', routes }, sessionId)
+  assert.equal(member.decision, 'route')
+  assert.equal(member.delivery.target, 'Group member')
+  assert.equal(member.delivery.method, 'message_bot')
+})
+
 test('triage judge config validates refs and thresholds and persists atomically', async (t) => {
   const s = await votingBank(t)
   assert.deepEqual(await s.call({ action: 'judges' }), { judges: [], threshold: 0.7 })
