@@ -192,8 +192,11 @@ try {
   assert.equal((await state()).bots[chief.id].sessionId ?? chief.id, foreground)
   passed('staff read-only customer page returns A transcript without writes or foreground changes')
 } finally {
-  await mkdir(home, { recursive: true })
-  await writeFile(join(home, 'triage-e2e-results.json'), JSON.stringify({ checks, sent, mediaReads }, null, 2))
   await bench('stop').catch(error => console.error(error.message))
-  await new Promise(resolve => server.close(resolve))
+  try {
+    await mkdir(home, { recursive: true })
+    await writeFile(join(home, 'triage-e2e-results.json'), JSON.stringify({ checks, sent, mediaReads }, null, 2))
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+  }
 }
