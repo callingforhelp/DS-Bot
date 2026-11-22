@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -323,19 +324,35 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(res["status"], "succeeded")
         meta = json.loads(res["result_summary"])
         self.assertEqual(meta["branch"], "v1")
-        ab = subprocess.run(
-            ["git", "-C", src_dir, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", src_dir, *args], text=True).strip()
+
+        self.assertEqual(git("symbolic-ref", "HEAD"), "refs/heads/v1")
+        self.assertTrue(git("ls-remote", "--exit-code", bare_dir, "refs/heads/v1"))
+        branchless = default_git_sync_runner(
+            {"task": "push", "repo": src_dir}, "/nonexistent", parent_dir=self.tmpdir.name
         )
-        self.assertIn(ab.stdout.strip(), ("v1", "heads/v1"))
-        ls = subprocess.run(
-            ["git", "ls-remote", "--exit-code", bare_dir, "refs/heads/v1"],
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(ls.returncode, 0)
+        self.assertEqual(branchless["status"], "succeeded", branchless["error"])
+        self.assertEqual(json.loads(branchless["result_summary"])["branch"], "v1")
+
+        branch_tip = git("rev-parse", "HEAD")
+        tag_tip = git("commit-tree", "HEAD^{tree}", "-m", "Tag-only commit")
+        git("tag", "--force", "v1", tag_tip)
+        git("push", "origin", "refs/tags/v1")
+        for local_exists in (True, False):
+            with self.subTest(local_exists=local_exists):
+                git("switch", "main")
+                if not local_exists:
+                    git("branch", "-D", "v1")
+                pull = default_git_sync_runner(
+                    {"task": "pull", "repo": src_dir, "branch": "v1"},
+                    "/nonexistent",
+                    parent_dir=self.tmpdir.name,
+                )
+                self.assertEqual(pull["status"], "succeeded", pull["error"])
+                self.assertEqual(git("symbolic-ref", "HEAD"), "refs/heads/v1")
+                self.assertEqual(git("rev-parse", "HEAD"), branch_tip)
 
     def _make_tag_collision_repo(self) -> tuple:
         bare_dir = os.path.join(self.tmpdir.name, "tag-collide-remote.git")
@@ -1037,6 +1054,85 @@ class ParaDevRunnerTest(unittest.TestCase):
         )
         self.assertFalse(os.path.exists(claim))
         self.assertFalse(os.path.exists(spool))
+
+    def test_strict_roots_check_workspace_restored_from_session_store(self) -> None:
+        allowed = os.path.join(self.tmpdir.name, "allowed")
+        os.mkdir(allowed)
+        os.environ["MAC_WORKER_ALLOWED_ROOTS"] = allowed
+        os.environ["FAKE_PARADEV_WS_JSON"] = json.dumps(
+            [{"id": "ws-outside", "worktreePath": self.tmpdir.name}]
+        )
+        store = ParadevSessionStore(os.environ["PARADEV_SESSIONS_FILE"])
+        store.upsert(
+            "demo:main",
+            {"workspace_id": "ws-outside", "worker_terminal_id": "term-fake-1"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "Unauthorized local path"):
+            default_paradev_runner(
+                {"task": "x", "repo": "demo", "branch": "main"},
+                self.fake_bin,
+            )
+        self.assertFalse(any(c[:2] == ["terminals", "send"] for c in self._calls()))
+
+    def test_dsbot_does_not_fall_back_from_unverified_workspace(self) -> None:
+        os.environ["MAC_WORKER_ALLOWED_ROOTS"] = self.tmpdir.name
+        for workspace in (
+            [],
+            [{"id": "ws-1", "path": self.tmpdir.name}],
+            [{"id": "ws-1", "worktreePath": os.path.join(self.tmpdir.name, "missing")}],
+        ):
+            with self.subTest(workspace=workspace), patch("worker.default_dsbot_runner") as run:
+                os.environ["FAKE_PARADEV_WS_JSON"] = json.dumps(workspace)
+                with self.assertRaisesRegex(RuntimeError, "could not be verified"):
+                    default_paradev_runner(
+                        {
+                            "task": "x",
+                            "workspace_id": "ws-1",
+                            "agent": "dsbot",
+                            "cwd": self.tmpdir.name,
+                        },
+                        self.fake_bin,
+                    )
+                run.assert_not_called()
+
+    def test_git_sync_push_fails_on_detached_head(self) -> None:
+        bare_dir = os.path.join(self.tmpdir.name, "detached-remote.git")
+        subprocess.run(["git", "init", "--bare", "-b", "main", bare_dir], check=True, capture_output=True)
+        src_dir = os.path.join(self.tmpdir.name, "detached-repo")
+        subprocess.run(["git", "init", "-b", "main", src_dir], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=src_dir, check=True)
+        with open(os.path.join(src_dir, "README.md"), "w", encoding="utf-8") as f:
+            f.write("# detached\n")
+        subprocess.run(["git", "add", "-A"], cwd=src_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=src_dir, check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", bare_dir], cwd=src_dir, check=True)
+        subprocess.run(["git", "checkout", "--detach", "HEAD"], cwd=src_dir, check=True, capture_output=True)
+
+        res = default_git_sync_runner(
+            {"task": json.dumps({"action": "push", "repo": src_dir}), "repo": src_dir},
+            "/nonexistent",
+            parent_dir=self.tmpdir.name,
+        )
+        self.assertEqual(res["status"], "failed")
+        self.assertIn("detached HEAD", res["error"])
+
+    def test_git_sync_rejects_invalid_branch_name(self) -> None:
+        src_dir = os.path.join(self.tmpdir.name, "invalid-branch-repo")
+        os.mkdir(src_dir)
+        for bad_branch in ("--evil", "bad..name"):
+            with self.subTest(branch=bad_branch):
+                res = default_git_sync_runner(
+                    {
+                        "task": json.dumps({"action": "pull", "repo": src_dir, "branch": bad_branch}),
+                        "repo": src_dir,
+                        "branch": bad_branch,
+                    },
+                    "/nonexistent",
+                    parent_dir=self.tmpdir.name,
+                )
+                self.assertEqual(res["status"], "failed")
+                self.assertIn("Invalid Git branch name", res["error"])
 
 
 if __name__ == "__main__":

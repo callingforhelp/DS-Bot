@@ -769,26 +769,29 @@ def default_paradev_runner(
     if cwd and not is_authorized_local_path(cwd, paradev_bin):
         raise RuntimeError(f"Unauthorized local path: {cwd}")
 
-    ws_info = None
-    if ws_id and ws_id != "local":
-        ws_info = _get_workspace_info(paradev_bin, ws_id=ws_id)
-        wt_path = str((ws_info or {}).get("worktreePath") or "").strip()
-        if wt_path:
-            if not is_authorized_local_path(wt_path, paradev_bin):
-                raise RuntimeError(f"Unauthorized local path: {wt_path}")
-        elif "MAC_WORKER_ALLOWED_ROOTS" in os.environ:
+    strict_roots = "MAC_WORKER_ALLOWED_ROOTS" in os.environ
+
+    def _authorized_worktree(
+        workspace_id: str, workspace: Optional[dict[str, Any]]
+    ) -> Optional[str]:
+        info = workspace or {}
+        path = str(info.get("worktreePath") or info.get("worktree_path") or "").strip()
+        if not path and not strict_roots and agent == "dsbot":
+            path = str(info.get("path") or "").strip()
+        if path and not is_authorized_local_path(path, paradev_bin):
+            raise RuntimeError(f"Unauthorized local path: {path}")
+        if strict_roots and not (path and os.path.isdir(os.path.expanduser(path))):
             raise RuntimeError(
-                f"Workspace worktree path could not be verified under strict roots: {ws_id}"
+                f"Workspace worktree path could not be verified under strict roots: {workspace_id}"
             )
+        return os.path.expanduser(path) if path else None
 
     if agent == "dsbot":
         worktree_path: Optional[str] = None
         if ws_id:
-            if ws_info:
-                worktree_path = (
-                    ws_info.get("worktreePath")
-                    or ws_info.get("worktree_path")
-                    or ws_info.get("path")
+            if ws_id != "local":
+                worktree_path = _authorized_worktree(
+                    ws_id, _get_workspace_info(paradev_bin, ws_id=ws_id)
                 )
         elif repo_hint or cwd:
             proj, _ = ensure_paradev_project(
@@ -803,11 +806,7 @@ def default_paradev_runner(
                 )
                 if ws:
                     ws_id = ws.get("id") or ws_id
-                    worktree_path = (
-                        ws.get("worktreePath")
-                        or ws.get("worktree_path")
-                        or ws.get("path")
-                    )
+                    worktree_path = _authorized_worktree(ws_id or "", ws)
                 else:
                     worktree_path = proj.get("path") or cwd
         if not worktree_path:
@@ -901,6 +900,9 @@ def default_paradev_runner(
             store.upsert(session_key, entry)
         except Exception:
             pass
+
+    if ws_id and (strict_roots or ws_id != "local"):
+        _authorized_worktree(ws_id, _get_workspace_info(paradev_bin, ws_id=ws_id))
 
     if ws_id and term_id:
         send_res = subprocess.run(
@@ -1062,18 +1064,9 @@ def _run_git(
     )
 
 
-def _current_branch_name(repo_path: str) -> Optional[str]:
-    sym = _run_git(["symbolic-ref", "--quiet", "HEAD"], cwd=repo_path)
-    if sym.returncode == 0:
-        ref = sym.stdout.strip()
-        if ref.startswith("refs/heads/"):
-            return ref[len("refs/heads/"):]
-        if ref:
-            return ref
-    br_res = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
-    if br_res.returncode == 0 and br_res.stdout.strip():
-        return br_res.stdout.strip()
-    return None
+def _current_git_branch(repo_path: str) -> str:
+    head = _run_git(["symbolic-ref", "--quiet", "HEAD"], cwd=repo_path)
+    return head.stdout.strip().removeprefix("refs/heads/") if head.returncode == 0 else ""
 
 
 def _resolve_mac_repo_path(
@@ -1145,6 +1138,23 @@ def default_git_sync_runner(
             "error": f"Unauthorized local path: {repo_path}",
         }
 
+    req_ref = f"refs/heads/{req_branch}" if req_branch else ""
+    if req_branch and (
+        req_branch.startswith("-") or _run_git(["check-ref-format", req_ref]).returncode != 0
+    ):
+        return {
+            "status": "failed",
+            "result_summary": "",
+            "pr_url": None,
+            "error": f"Invalid Git branch name: {req_branch}",
+        }
+
+    def _has_requested_branch() -> bool:
+        return (
+            _run_git(["show-ref", "--verify", "--quiet", req_ref], cwd=repo_path).returncode
+            == 0
+        )
+
     if action == "pull":
         if not os.path.exists(os.path.join(repo_path, ".git")):
             clone_src = remote_hint
@@ -1171,8 +1181,6 @@ def default_git_sync_runner(
                     }
 
         _run_git(["fetch", "origin", "--prune"], cwd=repo_path, timeout=90)
-        if req_branch:
-            _run_git(["fetch", "origin", req_branch], cwd=repo_path, timeout=90)
 
         st = _run_git(["status", "--porcelain"], cwd=repo_path)
         dirty = bool(st.stdout.strip())
@@ -1182,20 +1190,21 @@ def default_git_sync_runner(
             if dirty:
                 dirty_skipped = True
             else:
-                has_local_branch = (
-                    _run_git(
-                        ["show-ref", "--verify", "--quiet", f"refs/heads/{req_branch}"],
-                        cwd=repo_path,
-                    ).returncode
-                    == 0
-                )
-                if has_local_branch:
-                    co = _run_git(["checkout", req_branch], cwd=repo_path)
+                if _has_requested_branch():
+                    co = _run_git(["switch", "--no-guess", "--", req_branch], cwd=repo_path)
                 else:
-                    co = _run_git(
-                        ["checkout", "-B", req_branch, f"origin/{req_branch}"],
-                        cwd=repo_path,
-                    )
+                    co = _run_git(["fetch", "origin", req_ref], cwd=repo_path, timeout=90)
+                    if co.returncode == 0:
+                        co = _run_git(
+                            [
+                                "switch",
+                                "--track",
+                                "-c",
+                                req_branch,
+                                f"refs/remotes/origin/{req_branch}",
+                            ],
+                            cwd=repo_path,
+                        )
                 if co.returncode != 0:
                     return {
                         "status": "failed",
@@ -1203,7 +1212,7 @@ def default_git_sync_runner(
                         "pr_url": None,
                         "error": redact_secrets(co.stderr or co.stdout or f"git checkout {req_branch} failed"),
                     }
-                ff = _run_git(["pull", "--ff-only", "origin", req_branch], cwd=repo_path, timeout=90)
+                ff = _run_git(["pull", "--ff-only", "origin", req_ref], cwd=repo_path, timeout=90)
                 if ff.returncode != 0:
                     return {
                         "status": "failed",
@@ -1233,7 +1242,7 @@ def default_git_sync_runner(
             "repo": short_name,
             "path": repo_path,
             "remote_url": rem_res.stdout.strip() if rem_res.returncode == 0 else (remote_hint or None),
-            "branch": _current_branch_name(repo_path) or (req_branch or None),
+            "branch": _current_git_branch(repo_path) or None,
             "commit": sha_res.stdout.strip() if sha_res.returncode == 0 else None,
             "pulled": pulled,
             "dirty_skipped": dirty_skipped,
@@ -1272,7 +1281,7 @@ def default_git_sync_runner(
                 "error": redact_secrets(cm.stderr or cm.stdout or "initial commit failed"),
             }
 
-    cur_branch = _current_branch_name(repo_path) or "main"
+    cur_branch = _current_git_branch(repo_path)
     st = _run_git(["status", "--porcelain"], cwd=repo_path)
     dirty_committed = False
     active_branch = cur_branch
@@ -1299,17 +1308,10 @@ def default_git_sync_runner(
         dirty_committed = True
         active_branch = target_branch
     elif req_branch and req_branch != cur_branch:
-        has_branch = (
-            _run_git(
-                ["show-ref", "--verify", "--quiet", f"refs/heads/{req_branch}"],
-                cwd=repo_path,
-            ).returncode
-            == 0
-        )
-        if has_branch:
-            co = _run_git(["checkout", req_branch], cwd=repo_path)
+        if _has_requested_branch():
+            co = _run_git(["switch", "--no-guess", "--", req_branch], cwd=repo_path)
         else:
-            co = _run_git(["checkout", "-B", req_branch], cwd=repo_path)
+            co = _run_git(["switch", "-c", req_branch], cwd=repo_path)
         if co.returncode != 0:
             return {
                 "status": "failed",
@@ -1320,6 +1322,14 @@ def default_git_sync_runner(
                 ),
             }
         active_branch = req_branch
+
+    if not active_branch:
+        return {
+            "status": "failed",
+            "result_summary": "",
+            "pr_url": None,
+            "error": "A branch is required to push from a detached HEAD",
+        }
 
     rem_res = _run_git(["remote", "get-url", "origin"], cwd=repo_path)
     remote_created = False
@@ -1332,7 +1342,7 @@ def default_git_sync_runner(
                 "error": "No origin remote configured and create_if_missing is false",
             }
         gh_res = subprocess.run(
-            [gh_bin, "repo", "create", short_name, "--private", "--source=.", "--remote=origin", "--push"],
+            [gh_bin, "repo", "create", short_name, "--private", "--source=.", "--remote=origin"],
             cwd=repo_path,
             capture_output=True,
             text=True,
@@ -1350,19 +1360,19 @@ def default_git_sync_runner(
         rem_res = _run_git(["remote", "get-url", "origin"], cwd=repo_path)
 
     remote_url = rem_res.stdout.strip() if rem_res.returncode == 0 else None
-    if not remote_created:
-        push_res = _run_git(
-            ["push", "-u", "origin", f"refs/heads/{active_branch}"],
-            cwd=repo_path,
-            timeout=120,
-        )
-        if push_res.returncode != 0:
-            return {
-                "status": "failed",
-                "result_summary": "",
-                "pr_url": None,
-                "error": redact_secrets(push_res.stderr or push_res.stdout or "git push failed"),
-            }
+    active_ref = f"refs/heads/{active_branch}"
+    push_res = _run_git(
+        ["push", "-u", "origin", f"{active_ref}:{active_ref}"],
+        cwd=repo_path,
+        timeout=120,
+    )
+    if push_res.returncode != 0:
+        return {
+            "status": "failed",
+            "result_summary": "",
+            "pr_url": None,
+            "error": redact_secrets(push_res.stderr or push_res.stdout or "git push failed"),
+        }
 
     sha_res = _run_git(["rev-parse", "--short", "HEAD"], cwd=repo_path)
     summary = {

@@ -2,6 +2,7 @@
 import http.client
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -759,6 +760,66 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(job["status"], "running")
         self.assertIsNone(job["completed_at"])
         self.assertIsNone(job["result_summary"])
+
+    def test_delivered_legacy_completion_retry_preserves_newer_workspace(self) -> None:
+        old_id = self._run_paradev_job(
+            {"repo": "demo-app", "branch": "main"},
+            {"workspace_id": "ws-old", "terminal_id": "term-old"},
+        )
+        self._run_paradev_job(
+            {"repo": "demo-app", "branch": "main"},
+            {"workspace_id": "ws-new", "terminal_id": "term-new"},
+        )
+        self.store.mark_delivery(old_id, True)
+        with self.store._lock, self.store.conn:
+            self.store.conn.execute("UPDATE jobs SET completed_at = NULL WHERE job_id = ?", (old_id,))
+
+        restarted = BrokerStore(self.db_path)
+        try:
+            ok, _ = restarted.complete_job({
+                "job_id": old_id, "worker_id": "mac-1", "status": "succeeded",
+                "workspace_id": "ws-old", "terminal_id": "term-old",
+            })
+            self.assertTrue(ok)
+            self.assertEqual(
+                [(s["workspace_id"], s["worker_terminal_id"]) for s in restarted.list_paradev_sessions()],
+                [("ws-new", "term-new")],
+            )
+        finally:
+            restarted.close()
+
+    def test_completion_rolls_back_when_registry_write_fails(self) -> None:
+        job, _ = self.store.enqueue_job({
+            "target": "paradev", "task": "t", "aws_session_id": "s1", "repo": "demo-app",
+        })
+        job_id = job["job_id"]
+        self.assertEqual(self.store.claim_next_job("mac-1")["job_id"], job_id)
+        with self.store._lock, self.store.conn:
+            self.store.conn.execute("""
+                CREATE TRIGGER reject_session BEFORE INSERT ON paradev_sessions
+                BEGIN SELECT RAISE(ABORT, 'registry write failed'); END
+            """)
+        payload = {
+            "job_id": job_id, "worker_id": "mac-1", "status": "succeeded",
+            "workspace_id": "ws-1", "terminal_id": "term-1",
+        }
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "registry write failed"):
+            self.store.complete_job(payload)
+        self.store.touch_worker("mac-2")
+
+        restarted = BrokerStore(self.db_path)
+        try:
+            self.assertEqual(restarted.get_job(job_id)["status"], "running")
+            self.assertEqual(restarted.list_paradev_sessions(), [])
+            self.assertEqual([j["job_id"] for j in restarted.reconcile_worker("mac-1")], [job_id])
+            with restarted._lock, restarted.conn:
+                restarted.conn.execute("DROP TRIGGER reject_session")
+            ok, done = restarted.complete_job(payload)
+            self.assertTrue(ok)
+            self.assertIsNotNone(done["completed_at"])
+            self.assertEqual(restarted.list_paradev_sessions()[0]["last_job_id"], job_id)
+        finally:
+            restarted.close()
 
 
 if __name__ == "__main__":
