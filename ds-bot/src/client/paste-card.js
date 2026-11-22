@@ -167,6 +167,7 @@ export function PasteGuard({ sessionId, inputActions, useInput, useUi, actions }
   // The shell draws its own file card for the pasted attachment; the card above the box
   // is the same paste, so the shell's copy is hidden rather than drawn twice.
   useEffect(() => {
+    if (!blocks.some(block => block.attachmentId !== null)) return undefined
     const card = anchor.current?.closest('[data-composer-card]')
     if (card === null || card === undefined) return undefined
     const mark = () => {

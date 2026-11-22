@@ -17386,12 +17386,12 @@ body[data-bt-goal] [class*="_scroll"]:has(> [class*="_column"]){padding-top:calc
 @keyframes bt-fade-out{from{opacity:1}to{opacity:0}}
 [data-composer-card]{display:flex!important;flex-direction:row!important;flex-wrap:wrap!important;align-items:center!important;gap:0!important;min-height:44px!important;border-radius:22px!important;padding:7.5px!important;box-sizing:border-box;background:var(--bt-glass-bg)!important;-webkit-backdrop-filter:blur(20px) saturate(180%)!important;backdrop-filter:blur(20px) saturate(180%)!important;border:.5px solid var(--bt-glass-rim)!important;box-shadow:var(--bt-glass-shadow),0 0 0 1px rgba(228,228,228,.04)!important;transition:border-color .15s ease,background-color .15s ease,${spring(SPRING_SHAPE, "border-radius")}!important}
 [data-composer-card]:hover,[data-composer-card]:focus-within{border-color:color-mix(in srgb,var(--bt-ink) 30%,transparent)!important}
-[data-composer-card]:has(> [data-slot="conversation.input.attachments"] *),[data-composer-card]:has([data-composer-input] br + *),[data-composer-card]:has([data-composer-input] > :nth-child(2)){border-radius:18px!important}
+[data-composer-card]:has(> [data-slot="conversation.input.attachments"] *){border-radius:18px!important}
 [class*="_root"]:has(> [data-composer-card]){padding:0 11px 13px 16px!important}
 [class*="_root"]:has(> [data-composer-card])>[data-composer-card]{max-width:min(992px,100%)!important}
 [data-composer-card]>[class*="_row"]{display:contents!important}
 [data-composer-card] [class*="_tools"]{order:1!important;flex:none!important;align-self:flex-end!important;margin:0!important}
-[data-composer-card]>[data-input-scroll]{order:2!important;flex:1 1 0!important;min-width:0!important;padding:0 8px!important;margin:0!important}
+[data-composer-card]>[data-input-scroll]{order:2!important;flex:1 1 0!important;min-width:0!important;padding:0 8px!important;margin:0!important;contain:layout style}
 [data-composer-card] [class*="_trailing"]{order:3!important;flex:none!important;align-self:flex-end!important;margin:0!important}
 /* The slot anchor is display:contents, so the rail inside it is the flex item. */
 [data-composer-card]>[data-slot="conversation.input.attachments"]>[class*="_rail"]{order:0!important;flex:0 0 100%!important;margin:0!important;padding:2px 8px 6px!important}
@@ -17422,7 +17422,7 @@ body[data-bt-goal] [class*="_scroll"]:has(> [class*="_column"]){padding-top:calc
 [data-composer-card] button[class*="_primary"]:active:not(:disabled){scale:.9}
 @keyframes bt-icon-swap{from{opacity:0;transform:scale(.5) rotate(-30deg)}}
 [data-composer-card] button[class*="_primary"] svg{width:14px;height:14px}
-[data-composer-card] button[class*="_primary"]:disabled{display:none!important}
+[data-composer-card] button[class*="_primary"]:disabled:not([data-sending]){display:none!important}
 [data-composer-dock]{display:none!important}
 .bt-mic,.bt-voice{flex:none;width:28px;height:28px;border-radius:50%;border:0;padding:0;display:inline-grid;place-items:center;cursor:pointer;transition:background-color .15s ease,color .15s ease,${spring(SPRING_TAP, "scale")}}
 .bt-mic{background:color-mix(in srgb,var(--bt-ink) 5%,transparent);box-shadow:inset 0 0 0 .5px var(--bt-line);color:var(--bt-ink-2)}
@@ -17437,6 +17437,7 @@ body[data-bt-goal] [class*="_scroll"]:has(> [class*="_column"]){padding-top:calc
    toolbar sits below the message instead of over it; its secondary buttons are 36px,
    so the pill stays shorter than the primary touch controls. */
 @media (hover:none){
+  [data-composer-card]{-webkit-backdrop-filter:none!important;backdrop-filter:none!important;background:var(--bt-card)!important}
   .bt-msg{position:relative}
   .bt-msg-line{position:static}
   .bt-tools{top:100%;bottom:auto;left:auto;right:4px;margin-left:0;margin-top:2px;border-radius:999px;padding:2px;background:var(--bt-card);box-shadow:inset 0 0 0 .5px var(--bt-line-2),0 4px 14px rgba(0,0,0,.14)}
@@ -17449,9 +17450,9 @@ body[data-bt-goal] [class*="_scroll"]:has(> [class*="_column"]){padding-top:calc
   .bt-utools button{width:44px;height:44px}
   [data-chat-flow-kind=user] [class*="_actions"] button{width:44px;height:44px}
 }
-[data-composer-card]:has(button[class*="_primary"]:disabled) .bt-voice{display:inline-grid}
+[data-composer-card]:has(button[class*="_primary"]:disabled:not([data-sending])) .bt-voice{display:inline-grid}
 body[data-bt-room] .bt-voice{display:none!important}
-body[data-bt-room] [data-composer-card]:has(button[class*="_primary"]:disabled) .bt-mic:not([aria-pressed=true]){background:var(--bt-accent);color:var(--bt-accent-ink,#fff)}
+body[data-bt-room] [data-composer-card]:has(button[class*="_primary"]:disabled:not([data-sending])) .bt-mic:not([aria-pressed=true]){background:var(--bt-accent);color:var(--bt-accent-ink,#fff)}
 .bt-mic-note{position:absolute;right:12px;bottom:calc(100% + 8px);padding:5px 10px;border-radius:8px;background:var(--bt-user);color:var(--bt-user-ink);font-size:12px;line-height:16px;white-space:nowrap;pointer-events:none;animation:bt-rise .16s ease-out}
 [data-chain-overlay-fallback="conversation.composer"]:has(~ .bt-q){display:block!important;order:2}
 .bt-q{order:1}
@@ -38907,6 +38908,142 @@ var SETTINGS_SHELL_CSS = `
 .bt-release-line.bt-release-done{border-top-style:solid;color:var(--bt-green);opacity:1}
 `;
 
+// src/client/composer-guards.js
+var PROMPT_TIMEOUT_MS = 2e4;
+var DRAFT_DEBOUNCE_MS = 300;
+var PROMPT_PATH = /(?:^|\/)api\/session\/prompt(?:\?|$)/;
+var DRAFT_PREFIX = "dsh.conversation";
+function isComposerSeatMutation(records) {
+  if (!Array.isArray(records) || records.length === 0) return false;
+  return records.every((record) => {
+    const node = record?.target;
+    const el = typeof node?.closest === "function" ? node : node?.parentElement;
+    return el !== null && el !== void 0 && typeof el.closest === "function" && el.closest("[data-composer-seat]") !== null;
+  });
+}
+function readComposerHeight(scroller, fallback = 152, computeStyle = globalThis.getComputedStyle) {
+  const inline = scroller?.style?.getPropertyValue?.("--dsh-composer-height") ?? "";
+  const raw = inline || (typeof computeStyle === "function" && scroller ? computeStyle(scroller)?.getPropertyValue?.("--dsh-composer-height") ?? "" : "");
+  return parseFloat(raw) || fallback;
+}
+function staleComposerDraftText(box, currentDraft) {
+  if (!box || box.isContentEditable !== true) return null;
+  if (typeof box.hasAttribute === "function" && box.hasAttribute("data-composer-composing")) return null;
+  if (typeof box.querySelector === "function" && box.querySelector("[data-lexical-decorator]") !== null) return null;
+  const domText = String(box.innerText ?? box.textContent ?? "").replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n");
+  if (domText.trim() !== "" && String(currentDraft ?? "").trim() === "") {
+    return domText.replace(/\n+$/, "");
+  }
+  return null;
+}
+function installPromptTimeout({ scope = globalThis, timeoutMs = PROMPT_TIMEOUT_MS } = {}) {
+  if (typeof scope?.fetch !== "function" || scope.__dsBotPromptTimeoutPatched) return () => {
+  };
+  const origFetch = scope.fetch;
+  const rawFetch = origFetch.bind(scope);
+  const wrappedFetch = function wrappedPromptFetch(input, init) {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url ?? "";
+    const method = (init?.method ?? (typeof input === "object" && input !== null && "method" in input ? input.method : "GET") ?? "GET").toUpperCase();
+    if (method !== "POST" || !PROMPT_PATH.test(url)) return rawFetch(input, init);
+    const controller = new AbortController();
+    const outer = init?.signal ?? (typeof input === "object" && input !== null && "signal" in input ? input.signal : void 0);
+    const onOuterAbort = () => controller.abort(outer?.reason);
+    if (outer) {
+      if (outer.aborted) controller.abort(outer.reason);
+      else outer.addEventListener("abort", onOuterAbort, { once: true });
+    }
+    const timer = setTimeout(() => {
+      const error = typeof DOMException === "function" ? new DOMException("Send timed out after 20s — please retry", "TimeoutError") : Object.assign(new Error("Send timed out after 20s — please retry"), { name: "TimeoutError" });
+      controller.abort(error);
+    }, timeoutMs);
+    return rawFetch(input, { ...init, signal: controller.signal }).finally(() => {
+      clearTimeout(timer);
+      outer?.removeEventListener("abort", onOuterAbort);
+    });
+  };
+  scope.__dsBotPromptTimeoutPatched = true;
+  scope.fetch = wrappedFetch;
+  return () => {
+    if (scope.fetch === wrappedFetch) scope.fetch = origFetch;
+    scope.__dsBotPromptTimeoutPatched = false;
+  };
+}
+function installDraftDebounce({
+  scope = globalThis,
+  storage = typeof localStorage !== "undefined" ? localStorage : void 0,
+  storageProto = typeof Storage !== "undefined" ? Storage.prototype : void 0,
+  doc = typeof document !== "undefined" ? document : void 0,
+  win = typeof window !== "undefined" ? window : void 0,
+  delayMs = DRAFT_DEBOUNCE_MS
+} = {}) {
+  if (!storage || !storageProto || scope.__dsBotDraftDebouncePatched) return () => {
+  };
+  const rawSet = storageProto.setItem;
+  const rawGet = storageProto.getItem;
+  const rawRemove = storageProto.removeItem;
+  const pending = /* @__PURE__ */ new Map();
+  let flushTimer = 0;
+  const isDraftKey = (key) => typeof key === "string" && key.startsWith(DRAFT_PREFIX);
+  const flushAll = () => {
+    clearTimeout(flushTimer);
+    flushTimer = 0;
+    if (pending.size === 0) return;
+    for (const [key, value] of pending) {
+      try {
+        rawSet.call(storage, key, value);
+      } catch {
+      }
+    }
+    pending.clear();
+  };
+  const wrappedSet = function wrappedSetItem(key, value) {
+    if (this !== storage || !isDraftKey(key)) return rawSet.call(this, key, value);
+    const str = String(value);
+    if (str.includes('"draft":""')) {
+      pending.delete(key);
+      return rawSet.call(this, key, str);
+    }
+    pending.set(key, str);
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(flushAll, delayMs);
+  };
+  const wrappedGet = function wrappedGetItem(key) {
+    if (this === storage && pending.has(key)) return pending.get(key);
+    return rawGet.call(this, key);
+  };
+  const wrappedRemove = function wrappedRemoveItem(key) {
+    if (this === storage) pending.delete(key);
+    return rawRemove.call(this, key);
+  };
+  const onVis = () => {
+    if (doc?.visibilityState === "hidden") flushAll();
+  };
+  scope.__dsBotDraftDebouncePatched = true;
+  storageProto.setItem = wrappedSet;
+  storageProto.getItem = wrappedGet;
+  storageProto.removeItem = wrappedRemove;
+  win?.addEventListener?.("pagehide", flushAll);
+  doc?.addEventListener?.("visibilitychange", onVis);
+  return () => {
+    flushAll();
+    if (storageProto.setItem === wrappedSet) storageProto.setItem = rawSet;
+    if (storageProto.getItem === wrappedGet) storageProto.getItem = rawGet;
+    if (storageProto.removeItem === wrappedRemove) storageProto.removeItem = rawRemove;
+    win?.removeEventListener?.("pagehide", flushAll);
+    doc?.removeEventListener?.("visibilitychange", onVis);
+    scope.__dsBotDraftDebouncePatched = false;
+  };
+}
+function installComposerGuards(options = {}) {
+  const cleanups = [
+    installPromptTimeout(options),
+    installDraftDebounce(options)
+  ];
+  return () => {
+    for (const off of cleanups) off();
+  };
+}
+
 // src/client/header.js
 var import_react55 = require("react");
 var import_react_dom10 = require("react-dom");
@@ -39046,7 +39183,12 @@ function useTranscriptView() {
   (0, import_react55.useEffect)(() => {
     let frame = 0;
     let watched = null;
-    const observer = new MutationObserver(() => schedule());
+    let watchedSeat = null;
+    const observer = new MutationObserver((records) => {
+      if (isComposerSeatMutation(records)) return;
+      schedule();
+    });
+    const seatResize = typeof ResizeObserver === "function" ? new ResizeObserver(() => schedule()) : null;
     const measure = () => {
       frame = 0;
       const scroller = document.querySelector("[data-conversation-scroll]");
@@ -39054,6 +39196,12 @@ function useTranscriptView() {
         observer.disconnect();
         watched = scroller;
         if (scroller) observer.observe(scroller, { childList: true, subtree: true });
+      }
+      const seat = scroller?.querySelector("[data-composer-seat]") ?? null;
+      if (seat !== watchedSeat) {
+        seatResize?.disconnect();
+        watchedSeat = seat;
+        if (seat) seatResize?.observe(seat);
       }
       if (!scroller) {
         setView(null);
@@ -39067,7 +39215,7 @@ function useTranscriptView() {
         const at = sep.getBoundingClientRect();
         divider = at.bottom <= headerBottom ? "above" : at.top >= box.bottom ? "below" : "in-view";
       }
-      const composer = parseFloat(getComputedStyle(scroller).getPropertyValue("--dsh-composer-height")) || 152;
+      const composer = readComposerHeight(scroller);
       const next = {
         unpinned: scroller.querySelector('[class*="_toBottomSlot"]>button') !== null,
         divider,
@@ -39088,6 +39236,7 @@ function useTranscriptView() {
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
+      seatResize?.disconnect();
       document.removeEventListener("scroll", schedule, true);
       window.removeEventListener("resize", schedule);
       window.visualViewport?.removeEventListener("resize", schedule);
@@ -39246,8 +39395,13 @@ function useDictation(onText) {
   const stop = () => recognition.current?.stop();
   return { listening, note, start, stop };
 }
-function ComposerVoice({ sessionId, inputActions, actions, useUi, useRoster }) {
+function ComposerVoice({ sessionId, inputActions, useInput, actions, useUi, useRoster }) {
   const enterToSend = useRoster((state) => sendsOnEnter(state.prefs));
+  const draftRef = (0, import_react56.useRef)("");
+  useInput?.((state) => {
+    draftRef.current = state.draft ?? "";
+    return null;
+  });
   const composerRoot = (0, import_react56.useRef)(null);
   (0, import_react56.useEffect)(() => {
     const root = composerRoot.current?.closest("[data-composer-card]");
@@ -39256,6 +39410,44 @@ function ComposerVoice({ sessionId, inputActions, actions, useUi, useRoster }) {
     root.addEventListener("keydown", onKey, true);
     return () => root.removeEventListener("keydown", onKey, true);
   }, [enterToSend, inputActions]);
+  (0, import_react56.useEffect)(() => {
+    const root = composerRoot.current?.closest("[data-composer-card]");
+    if (!root || typeof inputActions?.setDraft !== "function") return void 0;
+    let composing = false;
+    let syncTimer = 0;
+    const syncStaleDraft = () => {
+      syncTimer = 0;
+      if (composing) return;
+      const box = root.querySelector("[data-composer-input]");
+      const text = staleComposerDraftText(box, draftRef.current);
+      if (text !== null) inputActions.setDraft(text);
+    };
+    const scheduleSync = (delay) => {
+      clearTimeout(syncTimer);
+      syncTimer = setTimeout(syncStaleDraft, delay);
+    };
+    const onCompStart = () => {
+      composing = true;
+      clearTimeout(syncTimer);
+    };
+    const onCompEnd = () => {
+      composing = false;
+      scheduleSync(45);
+    };
+    const onInput = (event) => {
+      if (event.isComposing || composing) return;
+      scheduleSync(160);
+    };
+    root.addEventListener("compositionstart", onCompStart, true);
+    root.addEventListener("compositionend", onCompEnd, true);
+    root.addEventListener("input", onInput, true);
+    return () => {
+      clearTimeout(syncTimer);
+      root.removeEventListener("compositionstart", onCompStart, true);
+      root.removeEventListener("compositionend", onCompEnd, true);
+      root.removeEventListener("input", onInput, true);
+    };
+  }, [sessionId, inputActions]);
   const dictation = useDictation((text, final) => {
     if (final && inputActions) inputActions.insertText(text, inputActions.captureInsertion());
   });
@@ -40991,6 +41183,7 @@ function PasteGuard({ sessionId, inputActions, useInput, useUi, actions }) {
     return () => clearTimeout(timer);
   }, [blocks]);
   (0, import_react62.useEffect)(() => {
+    if (!blocks.some((block) => block.attachmentId !== null)) return void 0;
     const card = anchor.current?.closest("[data-composer-card]");
     if (card === null || card === void 0) return void 0;
     const mark2 = () => {
@@ -47671,6 +47864,7 @@ function apply(ctx) {
   }
   const face = () => ({ actions, hooks: { roster, ui: ui2, activity, work, memoryNews, registry, turnClock, live, computer, cards, heldCards, browserPages, browserTabs, browserHolds, surface, update, frame, sidebarPref, settingsShellHeld } });
   const hostDrawsUserText = typeof ctx.uiConversation.userText?.register === "function";
+  ctx.effect(() => installComposerGuards(), "ds-bot: composer stability guards");
   ctx.effect(() => installCommandActions(ctx, { roster, actions }), "ds-bot: bot command actions");
   ctx.effect(() => {
     const offStyles = installCompiledStyles(SETTINGS_SHELL_CSS, "settings-shell");
