@@ -290,6 +290,35 @@ try {
   assert.doesNotMatch(clarificationText, /STAFF_CONTEXT_SENTINEL|Chief|Quote|E2E_SPECIALIST_ASK_USER/)
   assert.equal((await state()).questions[specialistClarificationTask.sessionId], undefined)
   passed('a specialist ask_user returns Chinese clarification through primary to A only, without a hidden card or staff name')
+  const answerStart = sent.length
+  const primaryCallsBeforeAnswer = (await calls()).filter(call => call.session === a.sessionId).length
+  message('customer-A', '型号甲')
+  await until(async () => sent.slice(answerStart).some(value => value.touser === 'customer-A' && value.text?.content?.includes('已确认型号甲')),
+    'specialist answer returned through primary')
+  await settle()
+  const answerMessages = sent.slice(answerStart)
+  assert.equal(answerMessages.filter(value => value.touser === 'customer-A' && value.text?.content?.includes('已确认型号甲')).length, 1)
+  assert.equal(answerMessages.filter(value => value.touser === 'customer-B').length, 0)
+  assert.doesNotMatch(answerMessages.map(value => value.text?.content ?? '').join('\n'), /STAFF_CONTEXT_SENTINEL|Chief|Quote|E2E_SPECIALIST_ANSWER/)
+  const answeredState = await state()
+  const sameSpecialistTask = answeredState.bots[quoteId].tasks.filter(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
+  assert.equal(sameSpecialistTask.length, 1)
+  assert.equal(sameSpecialistTask[0].sessionId, specialistClarificationTask.sessionId)
+  assert.equal(sameSpecialistTask[0].customer?.connId, specialistClarificationTask.customer?.connId)
+  assert.equal(sameSpecialistTask[0].customer?.chatKey, specialistClarificationTask.customer?.chatKey)
+  assert.equal(answeredState.questions[specialistClarificationTask.sessionId], undefined)
+  assert.equal(answeredState.questions[a.sessionId], undefined)
+  const answerCalls = (await calls()).filter(call => call.session === a.sessionId).slice(primaryCallsBeforeAnswer)
+  assert.ok(answerCalls.some(call => call.out?.some(block => block.type === 'tool_use' && block.name === 'triage_cases'
+    && block.input?.action === 'vote' && block.input.summary?.includes('型号甲'))), 'primary obtains a new vote for the customer answer')
+  assert.ok(answerCalls.some(call => call.triageToolResults?.some(result => result.includes('"decision":"route"') && result.includes('"route":"quote"'))),
+    'the new vote grants the quote route')
+  assert.ok(answerCalls.some(call => call.out?.some(block => block.type === 'tool_use' && block.name === 'message_bot'
+    && block.input?.to === 'quote' && block.input.message?.includes('型号甲'))), 'primary dispatches the answer through the customer route alias')
+  const specialistAnswerCall = (await calls()).find(call => call.session === specialistClarificationTask.sessionId
+    && call.customerRequest?.messages?.some(message => message.role === 'user' && message.text?.includes('E2E_SPECIALIST_ANSWER') && message.text.includes('型号甲')))
+  assert.ok(specialistAnswerCall, 'the same specialist session receives the selected model in its actual prompt')
+  passed('A answers the specialist clarification; a fresh primary vote sends 型号甲 to the same task and returns it to A only')
   message('customer-A', 'E2E_ASK_CARD_A')
   await until(async () => (await state()).questions[a.sessionId]?.options?.length === 3
     && sent.some(value => value.touser === 'customer-A' && value.text?.content?.includes('E2E_A_OPTION_ONE')), 'A customer question card')

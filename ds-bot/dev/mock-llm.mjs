@@ -145,7 +145,12 @@ function decide(body) {
       let value
       try { value = JSON.parse(raw) } catch { return [text(`分诊工具拒绝：${raw}`)] }
       if (value.decision === 'handoff') return [text(value.holding_reply)]
-      if (value.decision === 'route') return [text('已安排报价专员跟进。'), tool('message_bot', { to: value.delivery.target, message: used.input.summary?.includes('E2E_SPECIALIST_ASK_USER') ? 'E2E_SPECIALIST_ASK_USER：客户需要确认产品型号。' : 'E2E_ROUTED_CASE：客户需要报价，请审核。' })]
+      if (value.decision === 'route') return [text('已安排报价专员跟进。'), tool('message_bot', {
+        to: value.delivery.target,
+        message: used.input.summary?.includes('E2E_SPECIALIST_ANSWER')
+          ? 'E2E_SPECIALIST_ANSWER：客户选择型号甲，请按型号甲继续处理。'
+          : used.input.summary?.includes('E2E_SPECIALIST_ASK_USER') ? 'E2E_SPECIALIST_ASK_USER：客户需要确认产品型号。' : 'E2E_ROUTED_CASE：客户需要报价，请审核。',
+      })]
       let summary = '分诊已完成。'
       try {
         const value = JSON.parse(raw)
@@ -166,6 +171,12 @@ function decide(body) {
     const latest = [...prompt.matchAll(/(?:^|\n)User: ([^\n]*)/g)].at(-1)
     const replied = latest !== undefined && /\n(?:Chief|Quote): /.test(prompt.slice(latest.index + latest[0].length))
     const currentUser = latest === undefined ? textBlocks(last?.content).at(-1)?.trim() : replied ? '' : latest[1].trim()
+    if (system.includes('# Customer service') && !result && currentUser === '型号甲') {
+      return [tool('triage_cases', { action: 'vote', summary: 'E2E_SPECIALIST_ANSWER：客户选择型号甲', routes: ['quote', 'order_status'] })]
+    }
+    if (system.includes('# Customer service') && !result && textOf(last?.content).includes('E2E_SPECIALIST_ANSWER')) {
+      return [text('已确认型号甲，会按该型号继续跟进。')]
+    }
     const questionCard = /^E2E_ASK_CARD_([AB])$/.exec(currentUser ?? '')
     if (system.includes('# Customer service') && !result && questionCard) {
       const customer = questionCard[1]
@@ -189,7 +200,8 @@ function decide(body) {
       ? /STEP summary \(triage-part\.step\):[\s\S]*?Cylindrical surfaces are only a hole\/boss hint, not a hole count\./.exec(latestContent)?.[0]
       : undefined
     if (stepSummary) return [text(`您好，已收到 STEP 图纸摘要，我会按这些信息核对：\n${stepSummary}`)]
-    const routedCase = JSON.stringify(messages).includes('E2E_ROUTED_CASE') || JSON.stringify(messages).includes('E2E_SPECIALIST_ASK_USER')
+    const routedCase = JSON.stringify(messages).includes('E2E_ROUTED_CASE')
+      || JSON.stringify(messages).includes('E2E_SPECIALIST_ASK_USER') || JSON.stringify(messages).includes('E2E_SPECIALIST_ANSWER')
     if (system.includes('# Customer service') && routedCase && latestContent.startsWith('[Reply from Customer support]\n')) {
       return [text(latestContent.slice('[Reply from Customer support]\n'.length))]
     }
