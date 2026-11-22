@@ -311,6 +311,7 @@ export function triageBank(home, writable = () => {}, rt) {
         const routes = [...candidates]
           .sort((a, b) => (counts.get(b.route) ?? 0) - (counts.get(a.route) ?? 0))
           .map(candidate => candidate.route)
+        const votedRoutes = routes.filter(route => counts.has(route))
         const destinations = routes.map(route => candidates.find(candidate => candidate.route === route)).filter(Boolean)
         const detail = {
           source: { bot_id: entry.handoff.botId, customer_session_id: entry.handoff.sessionId },
@@ -323,7 +324,7 @@ export function triageBank(home, writable = () => {}, rt) {
           id: questionId,
           question: `Customer case ${entry.id.slice(0, 8)}: ${entry.summary.slice(0, 160)}`,
           detail: JSON.stringify(detail),
-          options: [...routes.map(label => ({ label })), { label: "I'll handle it myself" }],
+          options: [...votedRoutes.map(label => ({ label })), { label: "I'll handle it myself" }],
           multiSelect: false, allowCustom: true, askedAt: Date.now(),
         }
         shown.add(entry.id)
