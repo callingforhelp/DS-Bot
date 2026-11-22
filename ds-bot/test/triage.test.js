@@ -152,17 +152,24 @@ test('registry voting delivers only configured DS Bot targets and hands off Devi
 
 test('reasoning metadata is not a vote and truncated responses hand off', async (t) => {
   const s = await votingBank(t)
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
+  await s.call({ action: 'types', type_action: 'edit', type: 'quote', target: 'Quote Bot' })
   let kind = 'stop'
   s.rt.assembleLlm = async () => ({ finish: { kind }, blocks: () => [
     { type: 'thinking', text: 'Private reasoning is not JSON output' },
     { type: 'text', text: JSON.stringify({ route: 'quote', confidence: 0.7, reason: 'match' }) },
   ] })
   const args = { action: 'vote', summary: 'case', routes: ['quote', 'after_sales'] }
-  assert.equal((await s.call(args)).decision, 'handoff')
+  const parsed = await s.call(args)
+  assert.equal(parsed.decision, 'route')
+  assert.equal(parsed.route, 'quote')
+  assert.equal(parsed.votes.length, 2)
+  assert.ok(parsed.votes.every(vote => vote.valid))
   kind = 'max-tokens'
   const result = await s.call(args)
   assert.equal(result.decision, 'handoff')
-  assert.equal(result.votes[0].valid, false)
+  assert.equal(result.votes.length, 2)
+  assert.ok(result.votes.every(vote => !vote.valid))
 })
 
 test('pending handoffs survive bank reload and remain visible after a review', async (t) => {
