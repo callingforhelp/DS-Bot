@@ -296,7 +296,7 @@ test('two concurrent syncs start exactly one adapter', async (t) => {
 
 test('public customers have isolated background threads that survive rollover and cannot be focused', async (t) => {
   const uploads = []
-  const s = await start({ platform: 'wecom_kf', services: { fileUploads: { uploadStream: async ({ sessionId }) => { uploads.push(sessionId); return { id: 'receipt' } } } } })
+  const s = await start({ platform: 'wecom_kf', services: { fileUploads: { uploadStream: async ({ sessionId }) => { uploads.push(sessionId); return { receiptId: 'receipt' } } } } })
   t.after(s.stop)
   const conn = await add(s, { corpId: 'test', secret: 'test' })
   await Promise.all([dm(s, 'first', 'hello'), dm(s, 'first', 'again')])
@@ -312,6 +312,7 @@ test('public customers have isolated background threads that survive rollover an
   await dm(s, 'first', 'attachment', { files: [{ name: 'part.txt', data: Buffer.from('part') }] })
   assert.deepEqual(uploads, [first])
   assert.equal(s.prompts.at(-1).sessionId, first)
+  assert.deepEqual(s.prompts.at(-1).content.find(block => block.type === 'file'), { type: 'file', receiptId: 'receipt' })
   await assert.rejects(s.rt.switchPart('a', first), { code: 'bot/invalid' })
   assert.equal(focusOpenPart(bot, first), false)
   pushThreadPart(bot, first, 'rolled-customer', { sessionId: first, endedAt: Date.now() })
