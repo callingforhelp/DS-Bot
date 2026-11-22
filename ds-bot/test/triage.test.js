@@ -51,3 +51,26 @@ test('triage evicts oldest cases when a new case reaches the byte limit', async 
     assert.equal(cases.filter(item => item.id === 'oldest').length, count - 1)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+
+test('triage review retains misroutes that were subsequently resolved', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1000 })
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  const bank = triageBank(dir)
+  const call = async args => JSON.parse(await bank(args))
+  try {
+    const { id } = await call({ action: 'log', customer: 'c', summary: 'part', routed_to: 'sales', reason: 'quote' })
+    t.mock.timers.setTime(1500)
+    await call({ action: 'review' })
+    t.mock.timers.setTime(2000)
+    await call({ action: 'outcome', id, result: 'misrouted', correct_route: 'engineering' })
+    t.mock.timers.setTime(3000)
+    await call({ action: 'outcome', id, result: 'resolved' })
+    t.mock.timers.setTime(4000)
+    const review = JSON.parse(await triageBank(dir)({ action: 'review' }))
+    assert.deepEqual(review.cases, [])
+    assert.equal(review.misroutes.length, 1)
+    assert.equal(review.misroutes[0].outcome.result, 'resolved')
+    assert.equal(review.misroutes[0].misroute.correct_route, 'engineering')
+    assert.deepEqual((await call({ action: 'review' })).misroutes, [])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
