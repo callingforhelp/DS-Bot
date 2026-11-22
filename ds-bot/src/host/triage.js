@@ -272,6 +272,7 @@ export function triageBank(home, writable = () => {}, rt) {
         if (entry.outcome?.result === 'misrouted') entry.misroute = misrouteDetails(entry.outcome)
         entry.outcome = { result: args.result, correct_route: clean(args.correct_route), lesson: clean(args.lesson), at: now }
         if (args.result === 'misrouted') { entry.misrouted_at = now; delete entry.misroute }
+        if (args.result === 'misrouted' && clean(args.lesson)) addRule(args.lesson, entry.id)
         result = entry
       } else if (args.action === 'rules') {
         if (args.rule_action === 'add') result = addRule(args.text)
