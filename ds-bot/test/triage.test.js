@@ -99,6 +99,49 @@ test('triage starts all judges before awaiting any of their responses', async (t
   assert.equal(started, 3)
 })
 
+test('agent types ship Chinese defaults, validate edits, persist and preserve judge config', async (t) => {
+  const s = await votingBank(t)
+  const defaults = await s.call({ action: 'types' })
+  assert.deepEqual(defaults.map(entry => entry.type), ['quote', 'drawing_review', 'order_status', 'after_sales'])
+  assert.ok(defaults.every(entry => entry.examples.length >= 2 && !entry.target && /[\u4e00-\u9fff]/.test(entry.handles)))
+  await s.call({ action: 'judges', threshold: 0.8 })
+  await s.call({ action: 'types', type_action: 'edit', type: 'quote', target: 'Sales' })
+  const extra = { action: 'types', type_action: 'add', type: 'special', handles: '特殊工艺', examples: ['请检查热处理。', '请确认表面工艺。'], runtime: 'devin', target: 'https://app.devin.ai/bots/test' }
+  await s.call(extra)
+  await assert.rejects(s.call(extra), /already exists/)
+  for (const change of [{ examples: [] }, { handles: 'a\nb' }, { runtime: 'shell' }, { target: null }, { permission: '' }]) await assert.rejects(s.call({ action: 'types', type_action: 'edit', type: 'quote', ...change }))
+  const reload = triageBank(s.home)
+  assert.equal(JSON.parse(await reload({ action: 'types' })).find(entry => entry.type === 'quote').target, 'Sales')
+  assert.equal((await s.call({ action: 'judges' })).threshold, 0.8)
+  await s.call({ action: 'types', type_action: 'remove', type: 'special' })
+  await assert.rejects(s.call({ action: 'types', type_action: 'remove', type: 'missing' }), /not found/)
+  for (const entry of defaults) await s.call({ action: 'types', type_action: 'remove', type: entry.type })
+  assert.deepEqual(await s.call({ action: 'types' }), [])
+  await assert.rejects(s.call({ action: 'vote', summary: 'case' }), /at least two/)
+})
+
+test('registry voting delivers only configured DS Bot targets and hands off Devin or missing targets', async (t) => {
+  const s = await votingBank(t)
+  const vote = { route: 'quote', confidence: 1, reason: '报价需求' }
+  const call = async () => { s.replies([vote]); return s.call({ action: 'vote', summary: '请报价' }) }
+  let result = await call()
+  assert.equal(result.decision, 'handoff')
+  assert.equal(result.route, undefined)
+  assert.equal(result.delivery.method, 'staff')
+  const prompt = JSON.parse(s.calls.at(-1).messages[0].content[0].text)
+  assert.equal(prompt.types.length, 4)
+  assert.ok(prompt.types[0].handles && prompt.types[0].examples.length === 2)
+  await s.call({ action: 'types', type_action: 'edit', type: 'quote', target: 'Sales' })
+  result = await call()
+  assert.equal(result.decision, 'route')
+  assert.deepEqual(result.delivery, { runtime: 'ds-bot', target: 'Sales', permission: 'restricted', method: 'message_bot' })
+  await s.call({ action: 'types', type_action: 'edit', type: 'quote', runtime: 'devin', target: 'bot-test' })
+  result = await call()
+  assert.equal(result.decision, 'handoff')
+  assert.equal(result.delivery.target, 'bot-test')
+  assert.equal((await s.call({ action: 'review' })).pending_handoffs.at(-1).delivery.runtime, 'devin')
+})
+
 test('reasoning metadata is not a vote and truncated responses hand off', async (t) => {
   const s = await votingBank(t)
   let kind = 'stop'

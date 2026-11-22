@@ -617,6 +617,9 @@ test('triage tools restrict current and historical customer parts but not normal
     { action: 'rules', rule_action: 'remove', id: 'rule' },
     { action: 'judges', models: ['p/one'] },
     { action: 'judges', threshold: 0.8 },
+    { action: 'types', type_action: 'remove', type: 'quote' },
+    { action: 'types', type_action: 'edit', type: 'quote', target: 'Sales' },
+    { action: 'types', type_action: 'add', type: 'new' },
   ]
   pushThreadPart(s.rt.botOf('a'), first, 'customer-next', { sessionId: first })
   s.rt.chatOwners.delete(first)
@@ -629,6 +632,7 @@ test('triage tools restrict current and historical customer parts but not normal
     assert.equal((await call(sessionId, { action: 'recall', query: 'drawing' })).cases[0].id, entry.id)
     assert.deepEqual(await call(sessionId, { action: 'rules', rule_action: 'list' }), [])
     assert.deepEqual(await call(sessionId, { action: 'judges' }), { judges: [], threshold: 0.7 })
+    assert.equal((await call(sessionId, { action: 'types' })).length, 4)
     assert.ok((await call(sessionId, log)).id)
   }
   assert.equal(s.rt.isCustomerPart('a'), false)
