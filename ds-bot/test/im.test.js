@@ -522,22 +522,28 @@ test('a customer setup failure arriving after connection removal cannot recreate
 })
 
 test('WeCom does not save a cursor past customer setup that resolves after stop begins', async (t) => {
-  let entered, resolveSetup, settled
+  let entered, resolveSetup, settled, stopEntered, releaseStop, pollSettled
   const setupStarted = new Promise(resolve => { entered = resolve })
   const deliverySettled = new Promise(resolve => { settled = resolve })
+  const adapterStopEntered = new Promise(resolve => { stopEntered = resolve })
+  const stopGate = new Promise(resolve => { releaseStop = resolve })
+  const pollFinished = new Promise(resolve => { pollSettled = resolve })
+  t.after(() => releaseStop())
+  let adapterStopped = false
   const runtime = { cursor: 'before', cursorAccountId: 'kf-test' }
   const cursors = []
   const adapter = {
     check: async () => ({ account: { id: 'kf-test', name: 'Test' } }),
     connect(fields, env, handlers) {
-      return wecomKf.connect(fields, {
+      const handle = wecomKf.connect(fields, {
         ...env,
         runtime: { get: () => runtime, set: patch => { cursors.push(patch); Object.assign(runtime, patch) } },
-        async fetch(url) {
+        async fetch(url, options) {
           const path = new URL(url).pathname.split('/').pop()
           if (path === 'gettoken') return Response.json({ access_token: 'test', expires_in: 7200 })
           if (path === 'list') return Response.json({ account_list: [{ open_kfid: 'kf-test', name: 'Test' }] })
           assert.equal(path, 'sync_msg')
+          assert.equal(JSON.parse(options.body).limit, 1000)
           return Response.json({ next_cursor: 'after', msg_list: [{ msgid: 'first', origin: 3, external_userid: 'customer', msgtype: 'text', text: { content: 'hello' } }] })
         },
       }, {
@@ -546,7 +552,12 @@ test('WeCom does not save a cursor past customer setup that resolves after stop 
           try { await handlers.onMessage(msg); settled(undefined) }
           catch (error) { settled(error); throw error }
         },
+        onStatus(status) {
+          handlers.onStatus(status)
+          if (status.state === 'error' || status.state === 'ready') pollSettled(status)
+        },
       })
+      return { ...handle, async stop() { stopEntered(); await stopGate; adapterStopped = true; handle.stop() } }
     },
   }
   const s = await start({ platform: 'wecom_kf', adapter })
@@ -554,13 +565,23 @@ test('WeCom does not save a cursor past customer setup that resolves after stop 
   s.rt.customerPart = () => new Promise(resolve => { resolveSetup = resolve; entered() })
   const conn = await add(s, { corpId: 'test', secret: 'test' })
   await setupStarted
-  await s.rt.imEndpoint('im-update', { id: conn.id, enabled: false })
-  resolveSetup('customer-part')
-  assert.equal((await deliverySettled)?.retryInbound, true)
-  assert.deepEqual(cursors, [])
-  assert.equal(runtime.cursor, 'before')
-  assert.equal(s.prompts.length, 0)
-  assert.equal(Object.keys(s.rt.state.requests ?? {}).length, 0)
+  const stopping = s.rt.imEndpoint('im-update', { id: conn.id, enabled: false })
+  await adapterStopEntered
+  try {
+    assert.equal(adapterStopped, false)
+    resolveSetup('customer-part')
+    const result = await pollFinished
+    assert.equal(adapterStopped, false, 'the poller is still running when it handles the host result')
+    assert.deepEqual(cursors, [])
+    assert.equal(runtime.cursor, 'before')
+    assert.equal(result.state, 'error')
+    assert.equal((await deliverySettled)?.retryInbound, true)
+    assert.equal(s.prompts.length, 0)
+    assert.equal(Object.keys(s.rt.state.requests ?? {}).length, 0)
+  } finally {
+    releaseStop()
+    await stopping
+  }
 })
 
 test('customer setup apologies follow every supported IM language', async (t) => {
