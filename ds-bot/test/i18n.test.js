@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { DICTIONARY, LANGUAGES, dateLocale, hostText, installLocale, language, t } from '../src/client/i18n.js'
+import { imPlatform } from '../src/shared/im-platforms.js'
 
 function fakeLocale(initial = 'zh') {
   let active = initial
@@ -49,6 +50,16 @@ function fakeLocale(initial = 'zh') {
     getLocale: () => ({ active, locales: catalog }),
   }
 }
+
+test('WeCom customer service settings have Chinese platform and field labels', () => {
+  const mock = fakeLocale('zh')
+  const off = installLocale(mock)
+  try {
+    const platform = imPlatform('wecom_kf')
+    assert.equal(t(platform.name), '企业微信客服')
+    assert.deepEqual(platform.fields.map(field => t(field.label)), ['企业 ID', '密钥', '客服账号 ID（可选）'])
+  } finally { off() }
+})
 
 test('every literal the client translates has an entry in all supported locales', () => {
   const dir = new URL('../src/client/', import.meta.url)
