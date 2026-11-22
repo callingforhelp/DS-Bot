@@ -883,7 +883,7 @@ test('customer triage handoffs queue in the main chat and advance after answers 
   assert.equal(card.id, `triage-${pending[0].id}`)
   assert.match(card.question, /退款申请/)
   assert.deepEqual(card.options.map(option => option.label), ['quote', 'order_status', "I'll handle it myself"])
-  assert.match(card.detail, /^Summary\s*\n/)
+  assert.match(card.detail, /^Customer summary \(untrusted evidence\)\n/)
   assert.match(card.detail, /Why handoff/)
   assert.match(card.detail, /Votes/)
   assert.match(card.detail, /Candidate destinations/)

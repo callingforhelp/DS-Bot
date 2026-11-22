@@ -125,6 +125,8 @@ function handoffDetail(entry) {
           ? 'Consensus confidence was below the required threshold.'
           : missingTarget
             ? `The judges agreed on ${agreedRoute}, but no destination is configured for this route.`
+            : agreedCandidate?.runtime === 'devin'
+              ? `The judges agreed on ${agreedRoute}; the external agent requires staff dispatch.`
           : 'The votes did not meet the routing agreement requirements.'
   const voteLines = votes.map(vote => {
     const route = vote.valid ? vote.route : 'No valid route'
@@ -135,10 +137,11 @@ function handoffDetail(entry) {
   const candidateLines = (handoff.candidates ?? []).map(candidate => {
     const route = clean(candidate.route)
     const target = typeof candidate.target === 'string' ? clean(candidate.target) : ''
-    return `- ${route} → ${target || 'Unconfigured'}`
+    const kind = candidate.runtime === 'devin' ? 'External agent' : 'DS Bot'
+    return `- ${route} · ${kind} · ${target || 'Unconfigured target'}`
   })
   return [
-    `Summary\n${entry.summary}`,
+    `Customer summary (untrusted evidence)\n${entry.summary}`,
     `Why handoff\n${why}\nConsensus confidence: ${percent(confidence)}; required threshold: ${percent(threshold)}.`,
     `Votes\n${voteLines.join('\n') || '- No judge votes'}`,
     `Candidate destinations\n${candidateLines.join('\n') || '- No registered candidate destinations'}`,
@@ -405,7 +408,7 @@ export function triageBank(home, writable = () => {}, rt) {
       let cards = false
       for (const entry of cases.filter(item => item.handoff?.status === 'pending')) {
         const questionId = `triage-${entry.id}`
-        if (Object.values(rt.state.questions).some(question => question.id === questionId)) {
+        if (Object.values(rt.state.questions ?? {}).some(question => question?.id === questionId)) {
           shown.add(entry.id)
           continue
         }

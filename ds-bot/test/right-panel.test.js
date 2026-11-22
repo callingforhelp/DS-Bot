@@ -341,15 +341,19 @@ test('no Bot shows a Sessions list or New session control, including local-agent
   assert.equal(buttonsOf(engine).find(button => textOf(button).includes('New session')), undefined)
 })
 
-test('customer sessions open a read-only transcript without invoking a foreground open action', () => {
+test('customer tasks show a read-only transcript without foreground session controls', () => {
   let opened = 0
   const tree = drawer('a', { openPart: () => { opened++ } }, {
-    ...roster, byId: { a: { ...bot, openParts: [{ sessionId: 'customer', customer: true }, { sessionId: 'background' }] } },
+    ...roster, byId: { a: {
+      ...bot,
+      tasks: [{ id: 'customer-task', title: 'Customer conversation', origin: 'customer', customer: { connId: 'wecom', chatKey: 'customer-A' }, status: 'waiting_customer', sessionId: 'customer', segments: [] }],
+      customerSessions: [{ sessionId: 'customer', updatedAt: 1 }],
+    } },
   })
   const customer = buttonsOf(tree).find(button => button.props.title === 'Customer conversation')
   assert.ok(customer)
   assert.match(textOf(customer), /Customer conversation/)
-  assert.equal(customer.props.disabled, false)
+  assert.equal(customer.props.disabled ?? false, false)
   customer.props.onClick()
   assert.equal(drawerUpdate, 'customer')
   assert.equal(opened, 0)
@@ -358,7 +362,7 @@ test('customer sessions open a read-only transcript without invoking a foregroun
     if (!node || typeof node !== 'object') return undefined
     return node.type?.name === name ? node : component(node.children ?? [], name)
   }
-  const sessions = component(tree, 'BotSessions')
+  const sessions = component(tree, 'CustomerSessions')
   let reading
   drawerState = drawerUpdate
   try { reading = sessions.type(sessions.props) } finally { drawerState = undefined }
@@ -369,10 +373,9 @@ test('customer sessions open a read-only transcript without invoking a foregroun
   assert.match(textOf(reading), /Read only/)
   assert.equal(buttonsOf(reading).some(button => /Send|Open this/.test(textOf(button))), false)
   assert.equal(opened, 0)
-  const normal = buttonsOf(tree).find(button => button.props.title === 'Open this session')
-  assert.equal(normal.props.disabled, false)
-  normal.props.onClick()
-  assert.equal(opened, 1)
+  assert.equal(buttonsOf(tree).find(button => button.props.title === 'Open this session'), undefined)
+  assert.equal(buttonsOf(tree).some(button => textOf(button).includes('New session')), false)
+  assert.equal(opened, 0)
 })
 
 // A second instance of the drawer bundle whose React runs effects at once and keeps

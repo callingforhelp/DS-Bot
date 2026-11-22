@@ -2783,7 +2783,17 @@ test('a turn whose Session moves to a fresh part before its review is still revi
 
 test('public customer threads cannot enter memory review or persist entries shared with another customer', async (t) => {
   const event = text => [{ event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } } }]
+  const customer = { connId: 'wecom', chatKey: 'customer-A' }
+  const customerTasks = [
+    { id: 'customer-a-task', title: 'Customer conversation', origin: 'customer', customer, status: 'waiting_customer', sessionId: 'customer-a-current', segments: [] },
+    { id: 'customer-b-task', title: 'Customer conversation', origin: 'customer', customer: { ...customer, chatKey: 'customer-B' }, status: 'waiting_customer', sessionId: 'customer-b', segments: [] },
+  ]
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-customer-'))
+  const seed = structuredClone(TEAM)
+  seed.bots.b2.tasks = customerTasks
+  writeFileSync(join(home, 'state.json'), JSON.stringify(seed))
   const { ctx, rt, requests, tool, section, call, stop } = start({
+    home,
     history: {
       'customer-a-current': event('A_PRIVATE_CURRENT_FACT'),
       'customer-a-past': event('A_PRIVATE_PAST_FACT'),
@@ -2793,12 +2803,6 @@ test('public customer threads cannot enter memory review or persist entries shar
   })
   t.after(() => stop())
   await call('state', {})
-  const bot = rt.botOf('b2')
-  const customer = { connId: 'wecom', chatKey: 'customer-A' }
-  bot.openParts = [
-    { sessionId: 'customer-a-current', segments: [], customer },
-    { sessionId: 'customer-b', segments: [], customer: { ...customer, chatKey: 'customer-B' } },
-  ]
   rt.chatOwners.set('customer-a-current', 'b2')
   rt.chatOwners.set('customer-b', 'b2')
   assert.equal(rt.isCustomerPart('customer-a-current'), true)
@@ -2807,22 +2811,24 @@ test('public customer threads cannot enter memory review or persist entries shar
   const emitStatus = (id, status) => ctx.emit('agent/status', { agent: { id, session: idleSession }, status })
   emitStatus('customer-a-current', 'running')
   emitStatus('customer-a-current', 'idle')
+  await rt.save()
 
-  const oldPart = { sessionId: 'customer-a-past', segments: [], customer }
-  bot.openParts.push(oldPart)
+  const oldTask = rt.botOf('b2').tasks[0]
   rt.chatOwners.set('customer-a-past', 'b2')
   emitStatus('customer-a-past', 'running')
-  oldPart.sessionId = 'customer-a-next'
-  oldPart.segments = [{ sessionId: 'customer-a-past', endedAt: Date.now() }]
+  oldTask.sessionId = 'customer-a-next'
+  oldTask.segments = [{ sessionId: 'customer-a-past', endedAt: Date.now() }]
   rt.chatOwners.delete('customer-a-past')
   rt.pastOwners.set('customer-a-past', { botId: 'b2' })
   rt.chatOwners.set('customer-a-next', 'b2')
+  await rt.save()
   assert.equal(rt.isCustomerPart('customer-a-past'), true)
   emitStatus('customer-a-past', 'idle')
   await reviewed(call)
 
   assert.equal(requests.length, 0)
-  await assert.rejects(tool('bot_remember', { text: 'A_PRIVATE_DIRECT_MEMORY' }, 'customer-a-current'), /public customer conversations/)
+  await assert.rejects(tool('bot_remember', { text: 'A_PRIVATE_DIRECT_MEMORY' }, 'customer-a-next'), /public customer conversations/)
+  await assert.rejects(tool('bot_remember', { text: 'A_PRIVATE_HISTORICAL_MEMORY' }, 'customer-a-past'), /public customer conversations/)
   assert.doesNotMatch(section('customer-b'), /A_PRIVATE/)
   assert.match(await tool('bot_remember', { text: 'Internal memory still works' }, 'b2'), /^Saved to your memory/)
   assert.match(section('b2'), /Internal memory still works/)

@@ -167,9 +167,9 @@ try {
   const handoff = (await state()).questions[foreground]
   assert.ok(handoff?.id.startsWith('triage-'))
   assert.equal((await state()).questions[a.sessionId], undefined)
-  assert.match(handoff.detail, /^Summary\n/)
+  assert.match(handoff.detail, /^Customer summary \(untrusted evidence\)\n/)
   assert.ok(handoff.detail.includes('DISAGREE：客户需要确认责任归属'))
-  assert.ok(handoff.detail.includes('quote → Quote'))
+  assert.ok(handoff.detail.includes('quote · DS Bot · Quote'))
   assert.ok(handoff.detail.includes('Customer conversation'))
   assert.doesNotMatch(handoff.detail, /customer_session_id|candidate_destinations|\{"case"/)
   assert.ok(replies.some(value => value.touser === 'customer-A' && /您好.*专人/.test(value.text?.content)))

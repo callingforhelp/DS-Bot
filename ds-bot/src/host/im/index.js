@@ -859,11 +859,11 @@ export function install(rt) {
   // One card this chat was sent and has not answered yet. A button names its own
   // card, so it must never fall through to a newer card of the same kind.
   const wasDelivered = entry => entry.delivered !== false
-  const openCard = (conn, chatKey, cardKey) => {
+  const openCard = (conn, chatKey, cardKey, allowPending = false) => {
     const binding = bindingOf(conn, chatKey)
     if (binding === undefined) return undefined
     const entries = runtimes.get(conn.id)?.data?.cards[cardKey]
-    const entry = entries?.find(item => item.chatKey === chatKey && item.answer === undefined && wasDelivered(item)
+    const entry = entries?.find(item => item.chatKey === chatKey && item.answer === undefined && (allowPending || wasDelivered(item))
       && (item.binding ?? legacyCardBinding(cardKey)) === binding)
     return entry === undefined ? undefined : { cardKey, entry }
   }
@@ -1037,7 +1037,7 @@ export function install(rt) {
     return undefined
   }
 
-  const receiveMessage = (conn) => async (msg) => {
+  const receiveMessage = (conn) => async (msg, customerSessionId, alreadyAdmitted = false) => {
     if (msg.sender.bot === true) return
     if (!paired(conn, msg.sender.id)) {
       if (msg.chat.kind === 'group' && !msg.mentioned) return
@@ -1115,7 +1115,7 @@ export function install(rt) {
     }
     const customer = imPlatform(conn.platform)?.public === true
     if (customer && (msg.chat.kind !== 'direct' || target.botId === undefined)) throw new Error('Public customer chats require a direct conversation bound to a Bot')
-    const sessionId = customer ? await rt.customerPart(target.botId, conn.id, msg.chat.key) : target.botId ?? target.roomId
+    const sessionId = customer ? customerSessionId ?? await rt.customerPart(target.botId, conn.id, msg.chat.key) : target.botId ?? target.roomId
     // The receipt has to sit on the Session that takes the message. A group's own
     // Session moves on to a fresh part (`room.sessionId`) while `room.id` stays the
     // first one, so uploading under the id leaves the receipt on a Session the
@@ -1150,7 +1150,12 @@ export function install(rt) {
       await rt.sendUser({ sessionId, content, requestId })
       return 'accepted'
     }
-    await send()
+    if (typeof msg.messageId === 'string' && msg.messageId !== '' && !alreadyAdmitted) {
+      const event = rt.requestIdentity({ caller: `im:${conn.id}`, context: msg.chat.key, name: msg.messageId, payload: msg.sender.id })
+      const admitted = await rt.admitRequest(event, send)
+      if (admitted?.status === 'readonly') await sendText(conn, msg.chat, text('readonly'))
+      else if (admitted?.status === 'uncertain') await sendText(conn, msg.chat, text('uncertain'))
+    } else await send()
   }
   const customerFailures = new CustomerFailures()
   const onMessage = (conn, runner) => async (msg) => {
@@ -1172,6 +1177,7 @@ export function install(rt) {
       await sendText(conn, msg.chat, text('readonly'))
       return
     }
+    let customerSessionId
     if (imPlatform(conn.platform)?.public === true && msg.chat.kind === 'direct') {
       if (runner.stopped === true) throw stoppedInbound()
       const target = resolveTarget(conn, conn.chats[msg.chat.key])
@@ -1180,7 +1186,7 @@ export function install(rt) {
           ? JSON.stringify([conn.id, msg.chat.key, msg.sender.id, msg.messageId]) : undefined
         if (customerFailures.exhausted(conn.id, key)) return
         try {
-          await rt.customerPart(target.botId, conn.id, msg.chat.key)
+          customerSessionId = await rt.customerPart(target.botId, conn.id, msg.chat.key)
           if (runner.stopped === true) throw stoppedInbound()
           customerFailures.success(conn.id, key)
         } catch (error) {
@@ -1194,19 +1200,15 @@ export function install(rt) {
         }
       }
     }
-    if (typeof msg.messageId === 'string' && msg.messageId !== '') {
+    if (imPlatform(conn.platform)?.public === true && typeof msg.messageId === 'string' && msg.messageId !== '') {
       const event = rt.requestIdentity({ caller: `im:${conn.id}`, context: msg.chat.key, name: msg.messageId, payload: msg.sender.id })
-      // The lock can move between the check above and the admission; no receipt was
-      // written in that case, so the user can send the platform event again later.
       const admitted = await rt.admitRequest(event, async () => {
-        await receiveMessage(conn)(msg)
+        await receiveMessage(conn)(msg, customerSessionId, true)
         return 'accepted'
       })
       if (admitted?.status === 'readonly') await sendText(conn, msg.chat, text('readonly'))
-      // A receipt from an earlier run left the outcome unknown: the message may have
-      // run, so sending it again could repeat the work. Tell the user where to look.
       else if (admitted?.status === 'uncertain') await sendText(conn, msg.chat, text('uncertain'))
-    } else await receiveMessage(conn)(msg)
+    } else await receiveMessage(conn)(msg, customerSessionId)
   }
 
   const onAction = (conn) => async (action) => {
@@ -1296,7 +1298,7 @@ export function install(rt) {
       if (tokenView !== undefined) {
         const found = viewById(cardKey.slice(2))
         const origin = found === undefined ? undefined : cardOrigin(found.sessionId, found.view)
-        if (origin?.conn.id !== conn.id || origin.chatKey !== chatKey || openCard(conn, chatKey, cardKey) === undefined) {
+        if (origin?.conn.id !== conn.id || origin.chatKey !== chatKey || openCard(conn, chatKey, cardKey, true) === undefined) {
           await unmarkCard(conn.id, cardKey, chatKey)
           continue
         }
