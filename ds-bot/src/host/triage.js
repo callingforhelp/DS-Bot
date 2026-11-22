@@ -45,8 +45,8 @@ async function judgeVotes(rt, config, args, context, recalled) {
       const answer = await rt.assembleLlm({ ...route, sessionId: context.sessionId, purpose: 'triage-vote', system, messages, maxTokens: 1024, tools: [], signal: AbortSignal.timeout(60_000) })
       if (answer.finish.kind !== 'stop') throw new Error('Incomplete vote')
       const blocks = answer.blocks()
-      if (blocks.some(block => block.type !== 'text')) throw new Error('Non-text vote')
-      const parsed = JSON.parse(blocks.map(block => block.text).join(''))
+      if (blocks.some(block => block.type !== 'text' && block.type !== 'thinking')) throw new Error('Non-text vote')
+      const parsed = JSON.parse(blocks.filter(block => block.type === 'text').map(block => block.text).join(''))
       if (!parsed || Array.isArray(parsed) || Object.keys(parsed).sort().join(',') !== 'confidence,reason,route' || !args.routes.includes(parsed.route)
         || typeof parsed.confidence !== 'number' || !Number.isFinite(parsed.confidence) || parsed.confidence < 0 || parsed.confidence > 1 || typeof parsed.reason !== 'string' || !parsed.reason.trim()) throw new Error('Invalid vote')
       return { judge: judge ?? '', valid: true, route: parsed.route, confidence: parsed.confidence, reason: clean(parsed.reason) }
@@ -55,7 +55,7 @@ async function judgeVotes(rt, config, args, context, recalled) {
     }
   }))
   const valid = votes.filter(vote => vote.valid)
-  const confidence = valid.length ? valid.reduce((sum, vote) => sum + vote.confidence, 0) / valid.length : 0
+  const confidence = valid.reduce((mean, vote, index) => mean + (vote.confidence - mean) / (index + 1), 0)
   const agreed = valid.length >= Math.ceil(judges.length * 2 / 3) && new Set(valid.map(vote => vote.route)).size === 1 && confidence >= config.threshold
   return { decision: agreed ? 'route' : 'handoff', ...(agreed ? { route: valid[0].route } : {}), confidence, threshold: config.threshold, votes }
 }
@@ -63,6 +63,15 @@ async function judgeVotes(rt, config, args, context, recalled) {
 export function triageBank(home, writable = () => {}, rt) {
   const dir = join(home, 'triage')
   let queue = Promise.resolve()
+  let hasPending = true
+  let syncing
+  // After restart, redisplay unseen pending handoffs rather than assume they were handled.
+  const shown = new Set()
+  const schedule = run => {
+    const pending = queue.then(run)
+    queue = pending.catch(() => {})
+    return pending
+  }
   const read = async (name, fallback, jsonl = false) => {
     try {
       const path = join(dir, name)
@@ -88,14 +97,15 @@ export function triageBank(home, writable = () => {}, rt) {
     const lines = cases.map(item => JSON.stringify(item) + '\n')
     let bytes = lines.reduce((size, line) => size + Buffer.byteLength(line), 0)
     while ((bytes > MAX_BYTES || lines.length > MAX_CASES) && lines.length > 1) {
-      const index = cases.findIndex(entry => entry !== retained)
+      const index = cases.findIndex(entry => entry !== retained && entry.handoff?.status !== 'pending')
       if (index === -1) break
       bytes -= Buffer.byteLength(lines.splice(index, 1)[0])
       cases.splice(index, 1)
     }
+    if (lines.length > MAX_CASES) throw new Error('Triage case limit reached; handle pending handoffs first')
     await write('cases.jsonl', lines.join(''))
   }
-  return (args, context = {}) => {
+  const call = (args, context = {}) => {
     const run = async () => {
       writable()
       const cases = await read('cases.jsonl', [], true)
@@ -135,6 +145,15 @@ export function triageBank(home, writable = () => {}, rt) {
       } else if (args.action === 'vote') {
         const config = await read('config.json', { judges: [], threshold: 0.7 })
         result = await judgeVotes(rt, config, args, context, recall())
+        if (result.decision === 'handoff') {
+          retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes: args.routes } }
+          cases.push(retained)
+          await writeCases(cases, retained)
+          hasPending = true
+          result.case_id = retained.id
+          result.instructions = 'Do not route or call message_bot. Send the customer the warm Chinese holding reply; staff will route this case from the Bot main chat.'
+          result.holding_reply = '您好，已收到您的需求，正在为您安排专人跟进，请稍候。'
+        }
       } else if (args.action === 'recall') {
         result = recall()
       } else if (args.action === 'log') {
@@ -167,15 +186,57 @@ export function triageBank(home, writable = () => {}, rt) {
       } else if (args.action === 'review') {
         const misroutes = cases.filter(item => (item.misrouted_at ?? item.misroute?.at ?? (item.outcome?.result === 'misrouted' ? item.outcome.at : 0)) > state.reviewed)
           .map(item => ({ ...item, misroute: misrouteDetails(item.outcome?.result === 'misrouted' ? item.outcome : item.misroute ?? { at: item.misrouted_at }) }))
-        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes, rules: state.rules }
+        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes, rules: state.rules, pending_handoffs: cases.filter(item => item.handoff?.status === 'pending') }
         state.reviewed = now
       } else throw new Error('Unknown triage action')
       if (['log', 'outcome'].includes(args.action)) await writeCases(cases, retained)
       await write('rules.json', JSON.stringify(state))
       return JSON.stringify(result)
     }
-    const pending = queue.then(run)
-    queue = pending.catch(() => {})
-    return pending
+    return schedule(run)
   }
+  call.syncHandoffs = () => {
+    if (!hasPending) return Promise.resolve()
+    if (syncing) return syncing
+    syncing = schedule(async () => {
+      writable()
+      const cases = await read('cases.jsonl', [], true)
+      let changed = false
+      let cards = false
+      for (const entry of cases.filter(item => item.handoff?.status === 'pending')) {
+        const questionId = `triage-${entry.id}`
+        if (Object.values(rt.state.questions).some(question => question.id === questionId)) {
+          shown.add(entry.id)
+          continue
+        }
+        if (shown.has(entry.id)) {
+          entry.handoff.status = 'handled'
+          shown.delete(entry.id)
+          changed = true
+          continue
+        }
+        const sessionId = rt.chatOf(entry.handoff.botId)
+        if (!sessionId || rt.isCustomerPart(sessionId) || rt.state.questions[sessionId] !== undefined) continue
+        const counts = new Map()
+        for (const vote of entry.votes.filter(vote => vote.valid)) counts.set(vote.route, (counts.get(vote.route) ?? 0) + 1)
+        const routes = [...counts].sort((a, b) => b[1] - a[1]).map(([route]) => route)
+        rt.state.questions[sessionId] = {
+          id: questionId,
+          question: `Customer case ${entry.id.slice(0, 8)}: ${entry.summary.slice(0, 160)}`,
+          detail: entry.votes.map(vote => `${vote.judge}: ${vote.valid ? `${vote.route} (${Math.round(vote.confidence * 100)}%)` : 'invalid'} — ${vote.reason}`.replace(/\s+/g, ' ')).join(' | '),
+          options: [...routes.map(label => ({ label })), { label: "I'll handle it myself" }],
+          multiSelect: false, allowCustom: true, askedAt: Date.now(),
+        }
+        shown.add(entry.id)
+        cards = true
+        rt.cardShown?.(sessionId, 'question', rt.state.questions[sessionId].question)
+      }
+      if (changed) await writeCases(cases)
+      hasPending = cases.some(entry => entry.handoff?.status === 'pending')
+      if (cards) await rt.save({ required: true })
+    }).finally(() => { syncing = undefined })
+    return syncing
+  }
+  call.idle = () => queue
+  return call
 }

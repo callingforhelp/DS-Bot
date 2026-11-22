@@ -615,6 +615,8 @@ test('triage tools restrict current and historical customer parts but not normal
     { action: 'review' },
     { action: 'rules', rule_action: 'add', text: 'rule' },
     { action: 'rules', rule_action: 'remove', id: 'rule' },
+    { action: 'judges', models: ['p/one'] },
+    { action: 'judges', threshold: 0.8 },
   ]
   pushThreadPart(s.rt.botOf('a'), first, 'customer-next', { sessionId: first })
   s.rt.chatOwners.delete(first)
@@ -626,6 +628,7 @@ test('triage tools restrict current and historical customer parts but not normal
     for (const args of forbidden) await assert.rejects(call(sessionId, args), /Outcomes, rules and reviews are recorded outside customer conversations/)
     assert.equal((await call(sessionId, { action: 'recall', query: 'drawing' })).cases[0].id, entry.id)
     assert.deepEqual(await call(sessionId, { action: 'rules', rule_action: 'list' }), [])
+    assert.deepEqual(await call(sessionId, { action: 'judges' }), { judges: [], threshold: 0.7 })
     assert.ok((await call(sessionId, log)).id)
   }
   assert.equal(s.rt.isCustomerPart('a'), false)
@@ -637,6 +640,64 @@ test('triage tools restrict current and historical customer parts but not normal
   assert.equal((await call('a', { action: 'rules', rule_action: 'list' })).length, 2)
   await call('a', { action: 'rules', rule_action: 'remove', id: rule.id })
   assert.equal((await call('a', { action: 'review' })).misroutes.length, 1)
+})
+
+test('customer triage handoffs queue in the main chat and advance after answers and dismissals', async (t) => {
+  const seed = TEAM()
+  seed.rooms.r1.log.push({ seq: 1, time: 1, botId: 'b', text: 'Earlier room history' })
+  const s = await start({ platform: 'wecom_kf', seed })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer', '退款申请')
+  const customer = s.prompts.at(-1).sessionId
+  s.imTurn(customer)
+  const tool = s.rt.teamTools.find(tool => tool.name === 'triage_cases')
+  const call = async (sessionId, args) => JSON.parse(await tool.execute(args, { agent: s.agentOf(sessionId) }))
+  s.rt.catalog = async () => [{ ref: 'p/one' }, { ref: 'p/two' }]
+  s.rt.assembleLlm = async options => ({ finish: { kind: 'stop' }, blocks: () => [{ type: 'text', text: JSON.stringify({ route: options.model === 'one' ? 'Finance' : 'Sales', confidence: 0.9, reason: 'Check the case\nwith staff' }) }] })
+  await call('a', { action: 'judges', models: ['p/one', 'p/two'], threshold: 0.7 })
+  const ask = s.rt.teamTools.find(tool => tool.name === 'ask_user')
+  await ask.execute({ question: 'An existing question', options: [{ label: 'Continue' }] }, { agent: s.agentOf('a') })
+  const existing = s.rt.state.questions.a.id
+  const args = { action: 'vote', summary: '退款申请，附件为发票，老客户', routes: ['Finance', 'Sales'] }
+  const first = await call(customer, args)
+  const second = await call(customer, { ...args, summary: '另一个客户问题' })
+  assert.equal(first.decision, 'handoff')
+  assert.equal(first.route, undefined)
+  assert.match(first.instructions, /Do not route or call message_bot/)
+  assert.match(first.holding_reply, /您好.*专人/)
+  assert.equal(s.rt.state.questions.a.id, existing)
+  assert.equal(s.rt.state.questions[customer], undefined)
+  let pending = (await call('a', { action: 'review' })).pending_handoffs
+  assert.equal(pending.length, 2)
+  assert.equal(pending[0].handoff.sessionId, customer)
+  const main = s.agentOf('a')
+  main.followup = message => {
+    main.lastFollowup = message
+    s.emitEvent('a', 'user/message', { source: message.source, content: message.content })
+  }
+  await s.rt.answerQuestion('a', existing, { selected: ['Continue'] })
+  await s.rt.syncTriageHandoffs()
+  const card = s.rt.state.questions.a
+  assert.equal(card.id, `triage-${first.case_id}`)
+  assert.match(card.question, /退款申请/)
+  assert.deepEqual(card.options.map(option => option.label), ['Finance', 'Sales', "I'll handle it myself"])
+  assert.equal(card.detail.includes('\n'), false)
+  assert.match(card.detail, /p\/one: Finance.*p\/two: Sales/)
+  assert.equal(s.rt.state.questions[customer], undefined)
+  s.rt.closeCard('a', card, 'dismissed')
+  delete s.rt.state.questions.a
+  await s.rt.save()
+  await s.rt.syncTriageHandoffs()
+  assert.equal(s.rt.state.questions.a.id, `triage-${second.case_id}`)
+  await s.rt.answerQuestion('a', s.rt.state.questions.a.id, { selected: ["I'll handle it myself"] })
+  await s.rt.syncTriageHandoffs()
+  assert.equal(s.rt.state.questions.a, undefined)
+  pending = (await call('a', { action: 'review' })).pending_handoffs
+  assert.deepEqual(pending, [])
+  await s.flush()
+  assert.equal(s.fake.sent.some(message => message.text?.includes('Customer case')), false)
+  assert.equal(s.rt.chatOf('a'), 'a')
 })
 
 test('typing carries the chat key, not the chat record', async (t) => {

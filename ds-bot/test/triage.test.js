@@ -69,6 +69,7 @@ test('triage voting requires agreement, quorum and confidence and rejects invali
   const yes = { route: 'finance', confidence: 0.9, reason: 'refund' }
   for (const [responses, decision] of [
     [[yes, yes, yes], 'route'],
+    [[{ ...yes, confidence: 0.7 }, { ...yes, confidence: 0.7 }, { ...yes, confidence: 0.7 }], 'route'],
     [[yes, yes, new Error('offline')], 'route'],
     [[yes, yes, { ...yes, route: 'sales' }], 'handoff'],
     [[{ ...yes, confidence: 0.2 }, { ...yes, confidence: 0.3 }, { ...yes, confidence: 0.1 }], 'handoff'],
@@ -96,6 +97,57 @@ test('triage starts all judges before awaiting any of their responses', async (t
   }
   assert.equal((await s.call({ action: 'vote', summary: 'case', routes: ['a', 'b'] })).decision, 'route')
   assert.equal(started, 3)
+})
+
+test('reasoning metadata is not a vote and truncated responses hand off', async (t) => {
+  const s = await votingBank(t)
+  let kind = 'stop'
+  s.rt.assembleLlm = async () => ({ finish: { kind }, blocks: () => [
+    { type: 'thinking', text: 'Private reasoning is not JSON output' },
+    { type: 'text', text: JSON.stringify({ route: 'a', confidence: 0.7, reason: 'match' }) },
+  ] })
+  const args = { action: 'vote', summary: 'case', routes: ['a', 'b'] }
+  assert.equal((await s.call(args)).decision, 'route')
+  kind = 'max-tokens'
+  const result = await s.call(args)
+  assert.equal(result.decision, 'handoff')
+  assert.equal(result.votes[0].valid, false)
+})
+
+test('pending handoffs survive bank reload and remain visible after a review', async (t) => {
+  const s = await votingBank(t)
+  Object.assign(s.rt, { state: { questions: {} }, chatOf: () => 'main', isCustomerPart: id => id === 'customer', save: async () => {} })
+  s.replies(['invalid'])
+  const result = await s.call({ action: 'vote', summary: 'case summary', routes: ['a', 'b'] })
+  await s.bank.syncHandoffs()
+  assert.equal(s.rt.state.questions.main.id, `triage-${result.case_id}`)
+  assert.equal(s.rt.state.questions.customer, undefined)
+  const next = triageBank(s.home, () => {}, s.rt)
+  await next.syncHandoffs()
+  for (let i = 0; i < 2; i++) assert.equal(JSON.parse(await next({ action: 'review' })).pending_handoffs.length, 1)
+  delete s.rt.state.questions.main
+  await next.syncHandoffs()
+  assert.equal(JSON.parse(await next({ action: 'review' })).pending_handoffs.length, 0)
+})
+
+test('case eviction never discards pending human handoffs and fails closed when all are pending', async (t) => {
+  const s = await votingBank(t)
+  const cases = Array.from({ length: 2000 }, (_, index) => ({ id: String(index), summary: 'case', handoff: { status: 'pending' } }))
+  await mkdir(join(s.home, 'triage'))
+  const path = join(s.home, 'triage', 'cases.jsonl')
+  const encode = () => cases.map(entry => JSON.stringify(entry) + '\n').join('')
+  await writeFile(path, encode())
+  const args = { action: 'log', customer: 'c', summary: 's', routed_to: 'r', reason: 'why' }
+  await assert.rejects(s.call(args), /case limit/)
+  assert.equal(await readFile(path, 'utf8'), encode())
+  cases[2].handoff.status = 'handled'
+  await writeFile(path, encode())
+  const result = await s.call(args)
+  const saved = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.equal(saved.length, 2000)
+  assert.equal(saved[0].id, '0')
+  assert.equal(saved.some(entry => entry.id === '2'), false)
+  assert.equal(saved.at(-1).id, result.id)
 })
 
 test('triage ranks Chinese cases, learns misroutes and reviews once', async () => {
