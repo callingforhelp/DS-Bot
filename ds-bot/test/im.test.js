@@ -183,7 +183,7 @@ test('public customers can answer numbered question cards but not control comman
   assert.equal(s.agentOf('a').cancelled, undefined)
 })
 
-test('a failed customer question card cannot consume a number until delivery succeeds', async (t) => {
+test('a failed customer question card cannot consume the number that supersedes it', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
   const conn = await add(s, { corpId: 'test', secret: 'test' })
@@ -196,14 +196,16 @@ test('a failed customer question card cannot consume a number until delivery suc
   assert.equal(s.fake.sent.length, 1)
   await dm(s, 'customer', '1')
   assert.equal(s.prompts.length, 2)
-  assert.ok(s.rt.state.questions.a)
+  s.imTurn('a')
+  await s.rt.save()
+  await s.flush()
+  assert.equal(s.rt.state.questions.a, undefined)
   assert.equal(s.agentOf('a').followed, undefined)
   await s.rt.imEndpoint('im-retry', { id: conn.id })
   await s.flush()
   await dm(s, 'customer', '1')
   assert.equal(s.rt.state.questions.a, undefined)
-  assert.equal(s.agentOf('a').followed, 1)
-  assert.equal(s.prompts.length, 2)
+  assert.equal(s.agentOf('a').followed, undefined)
 })
 
 test('replayed customer message IDs cannot answer twice or become prompts after a card closes', async (t) => {
