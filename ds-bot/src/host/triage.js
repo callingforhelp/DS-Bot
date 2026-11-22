@@ -64,6 +64,10 @@ export function triageBank(home, writable = () => {}) {
         for (const key of ['customer', 'summary', 'attachments_summary', 'routed_to', 'reason']) entry[key] = clean(args[key])
         cases.push(entry)
         if (cases.length > MAX_CASES) cases.splice(0, cases.length - MAX_CASES)
+        let bytes = cases.reduce((size, item) => size + Buffer.byteLength(JSON.stringify(item)) + 1, 0)
+        while (bytes > MAX_BYTES && cases.length > 1) {
+          bytes -= Buffer.byteLength(JSON.stringify(cases.shift())) + 1
+        }
         result = { id: entry.id }
       } else if (args.action === 'outcome') {
         const entry = cases.find(item => item.id === args.id)

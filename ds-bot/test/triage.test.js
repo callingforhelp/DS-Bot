@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { test } from 'node:test'
@@ -29,5 +29,25 @@ test('triage ranks Chinese cases, learns misroutes and reviews once', async () =
     assert.deepEqual(await call({ action: 'rules', rule_action: 'list' }), [])
     await assert.rejects(bank({ action: 'outcome', id: 'missing', result: 'correct' }), /not found/)
     await assert.rejects(bank({ action: 'log' }), /required/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('triage evicts oldest cases when a new case reaches the byte limit', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  try {
+    const limit = 16 * 1024 * 1024
+    const entry = { customer: 'c'.repeat(4000), summary: 's'.repeat(4000), attachments_summary: 'a'.repeat(4000), routed_to: 'r'.repeat(4000), reason: 'w'.repeat(4000) }
+    const line = JSON.stringify({ ...entry, id: 'oldest' }) + '\n'
+    const count = Math.floor(limit / Buffer.byteLength(line))
+    const path = join(dir, 'triage', 'cases.jsonl')
+    await mkdir(join(dir, 'triage'))
+    await writeFile(path, line.repeat(count))
+    const bank = triageBank(dir)
+    const result = JSON.parse(await bank({ action: 'log', ...entry }))
+    const cases = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    assert.equal(cases.length, count)
+    assert.equal(cases.at(-1).id, result.id)
+    assert.ok((await stat(path)).size <= limit)
+    assert.equal(cases.filter(item => item.id === 'oldest').length, count - 1)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
