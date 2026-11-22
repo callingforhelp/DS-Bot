@@ -1,10 +1,10 @@
-// Registers the bundled goal-grill and report-ds-bot-issue skills when the skills service is available.
+// Registers the bundled goal-grill, report-ds-bot-issue, and paradev-delegation skills when the skills service is available.
 import { readFileSync } from 'node:fs'
 import { dirname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PROVIDER = 'ds-bot-goal'
-const SKILLS = ['goal-grill', 'report-ds-bot-issue']
+const SKILLS = ['goal-grill', 'report-ds-bot-issue', 'paradev-delegation']
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), 'skills')
 
 function parseSkill(raw, path) {

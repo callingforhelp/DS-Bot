@@ -87,6 +87,16 @@ const TOOLS = [
           description:
             'Role in the ParaDev workspace: worker (default implementer) or reviewer (separate review terminal in the same workspace).',
         },
+        bot: {
+          type: 'string',
+          description:
+            'Optional target Bot name or ID on local Mac DS Bot when target="dsbot" (defaults to Main Bot).',
+        },
+        group: {
+          type: 'string',
+          description:
+            'Optional target Group name or ID on local Mac DS Bot when target="dsbot" (send_to_group).',
+        },
         aws_session_id: {
           type: 'string',
           description: 'Optional AWS ds-bot session ID to receive completion callback.',
@@ -300,6 +310,8 @@ async function handleToolCall(name, args) {
       cwd: args?.cwd,
       local_only: Boolean(args?.local_only),
       role: args?.role,
+      bot: args?.bot,
+      group: args?.group,
       aws_session_id: args?.aws_session_id || DEFAULT_SESSION_ID,
     });
     return {

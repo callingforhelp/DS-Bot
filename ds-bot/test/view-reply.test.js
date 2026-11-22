@@ -101,6 +101,15 @@ test('the bundled report skill can be invoked by the model and by the user', asy
   assert.match((await provider.get(item)).content, /prepare_ds_bot_issue.*show_view/)
 })
 
+test('the bundled paradev-delegation skill can be invoked and guides background task_start', async () => {
+  const provider = goalProvider()
+  const item = (await provider.list()).find(skill => skill.name === 'paradev-delegation')
+  assert.deepEqual(item.invocation, { modelInvocable: true, userInvocable: true })
+  const loaded = await provider.get(item)
+  assert.match(loaded.content, /task_start/)
+  assert.match(loaded.content, /paradev/)
+})
+
 test('only the matching affirmative view reply publishes the redacted issue shown to the user', async (t) => {
   const { call, show, team, sent, stop } = await start()
   t.after(stop)
