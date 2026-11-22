@@ -19,9 +19,15 @@ export function chunks(text) {
 }
 
 function client(fields, env, signal) {
+  let base = BASE
+  if (process.env.DSBOT_TEST_WECOM_KF_BASE_URL) {
+    const url = new URL(process.env.DSBOT_TEST_WECOM_KF_BASE_URL)
+    if (url.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) || url.username || url.password) throw new Error('Test WeCom endpoint must be loopback HTTP')
+    base = url.href.endsWith('/') ? url.href : `${url.href}/`
+  }
   let token
   let until = 0
-  const fetch = (path, options = {}) => env.fetch(`${BASE}${path}`, { ...options, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000) })
+  const fetch = (path, options = {}) => env.fetch(`${base}${path}`, { ...options, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000) })
   const access = async () => {
     if (token && Date.now() < until) return token
     const answer = await (await fetch(`gettoken?${new URLSearchParams({ corpid: fields.corpId, corpsecret: fields.secret })}`)).json()

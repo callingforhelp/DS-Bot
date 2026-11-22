@@ -288,6 +288,7 @@ export function install(rt) {
   // Turns that may be a member's late result waking a group up again: wait for the first
   // message of the turn before dropping the chat's origin (see the turn/start handler).
   const pendingReset = new Set()
+  const turnContext = new Set(['agent-instructions', 'runtime-context', 'skill-catalog', 'time-context'])
   // Request id of an IM message → the chat it came from, until that message shows up.
   const requests = new Map()
   // IM origin held across a part switch until the resumed/handoff message opens.
@@ -1112,11 +1113,10 @@ export function install(rt) {
     if (stopped || rt.readOnly() !== undefined || exists()) return
     const fields = await readWecomEnv()
     if (!fields || stopped || rt.readOnly() !== undefined || exists()) return
-    const botId = state.mainBotIds.find(id => rt.botOf(id)) ?? Object.keys(state.bots)[0] ?? null
     const conn = {
-      id: `im_${randomBytes(4).toString('hex')}`, platform: 'wecom_kf', botId,
+      id: `im_${randomBytes(4).toString('hex')}`, platform: 'wecom_kf', botId: null,
       settings: { corpId: fields.corpId, openKfId: fields.openKfId }, secrets: {},
-      enabled: botId !== null, paired: [], requests: [], chats: {}, createdAt: Date.now(),
+      enabled: false, paired: [], requests: [], chats: {}, createdAt: Date.now(),
     }
     await saveSecrets(conn, imPlatform('wecom_kf'), fields)
     if (stopped || rt.readOnly() !== undefined || exists()) {
@@ -1401,6 +1401,8 @@ export function install(rt) {
       } else if (source?.kind === SOURCE_KIND && source.role === 'post') {
         // A member's late result relayed into the group's own Session. The group's work
         // is still the answer to the chat that asked, wherever the member runs.
+      } else if (turnContext.has(source?.kind)) {
+        // Harness adds these context messages to the same turn; they are not a new source.
       } else {
         // A message from the Web UI, a peer Bot or a scheduled task: this turn is not an
         // IM chat's to answer, even when an earlier turn of this Session was.

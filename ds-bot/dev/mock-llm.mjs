@@ -124,6 +124,35 @@ function decide(body) {
   }).filter(message => message.role !== 'user' || message.content.length > 0)
   const last = messages.at(-1)
   const blocks = Array.isArray(last?.content) ? last.content : []
+  if (process.env.MOCK_TRIAGE_E2E === '1') {
+    if (system.includes('You are a customer-service routing judge.')) {
+      const evidence = JSON.parse(textOf(last.content))
+      const index = evidence.summary.includes('DISAGREE') && body.model.includes('flash') ? 1 : 0
+      return [text(JSON.stringify({ route: evidence.routes[index], confidence: 0.95, reason: 'scripted triage judge' }))]
+    }
+    const result = blocks.find(block => block.type === 'tool_result')
+    const call = [...messages].reverse().find(message => message.role === 'assistant' && message.content?.some?.(block => block.type === 'tool_use'))
+    const used = call?.content.find(block => block.type === 'tool_use' && block.id === result?.tool_use_id)
+    if (result && used?.name === 'triage_cases') {
+      const raw = typeof result.content === 'string' ? result.content : textOf(result.content)
+      let value
+      try { value = JSON.parse(raw) } catch { return [text(`分诊工具拒绝：${raw}`)] }
+      if (value.decision === 'handoff') return [text(value.holding_reply)]
+      if (value.decision === 'route') return [text('已安排报价专员跟进。'), tool('message_bot', { to: value.delivery.target, message: 'E2E_ROUTED_CASE：客户需要报价，请审核。' })]
+      return [text(`分诊结果：${raw}`)]
+    }
+    const prompt = textOf(last?.content)
+    const latest = [...prompt.matchAll(/(?:^|\n)User: ([^\n]*)/g)].at(-1)
+    const replied = latest !== undefined && /\n(?:Chief|Quote): /.test(prompt.slice(latest.index + latest[0].length))
+    const currentUser = latest === undefined ? textBlocks(last?.content).at(-1)?.trim() : replied ? '' : latest[1].trim()
+    const command = /^分诊测试 (\{[^\n]+\})$/.exec(currentUser ?? '')
+    if (command && used?.name !== 'triage_cases') return [tool('triage_cases', JSON.parse(command[1]))]
+    if (!result) {
+      if (textOf(last?.content).includes('B_ONLY_CONTEXT_875')) return [text('客户B专属回复：订单进度正在核对。')]
+      const messagesText = textOf(last?.content)
+      if (messagesText.includes('E2E_ROUTED_CASE') && messagesText.includes('[Reply from Quote]')) return [text('报价专员已接手。')]
+    }
+  }
   // A side-chat question (side.js). The first line is the marker; the reply is
   // fixed and calls nothing. Its count of earlier answers proves follow-ups
   // carry the chat's finished pairs.

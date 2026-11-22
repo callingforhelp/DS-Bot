@@ -146,16 +146,22 @@ test('WeCom startup seeds once through secret-set and sign-in never writes the e
   t.after(() => { process.env.DSBOT_ENV_FILE = previous })
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)
-  for (let i = 0; i < 100 && !s.fake.handlers; i++) await s.flush()
+  await s.rt.load()
+  await s.flush()
   const conns = Object.values(s.rt.state.im.connections)
   assert.equal(conns.length, 1)
   const conn = conns[0]
   assert.equal(conn.platform, 'wecom_kf')
-  assert.equal(conn.botId, 'a')
+  assert.equal(conn.botId, null)
+  assert.equal(conn.enabled, false)
+  assert.equal(s.fake.handlers, null)
   assert.deepEqual(conn.settings, { corpId: 'fake-corp', openKfId: 'fake-account' })
   assert.equal(s.rt.secretValue(conn.secrets.secret), 'fake-seed-secret')
   assert.equal(JSON.stringify(s.rt.imView()).includes('fake-seed-secret'), false)
   assert.equal(readFileSync(join(s.home, 'state.json'), 'utf8').includes('fake-seed-secret'), false)
+  await s.rt.imEndpoint('im-update', { id: conn.id, botId: 'b', enabled: true })
+  assert.equal(conn.botId, 'b')
+  assert.equal(conn.enabled, true)
   await s.rt.imEndpoint('im-update', { id: conn.id, fields: { secret: 'fake-updated-secret' } })
   assert.equal(s.rt.secretValue(conn.secrets.secret), 'fake-updated-secret')
   assert.equal(readFileSync(path, 'utf8'), content)
@@ -655,6 +661,10 @@ test('triage tools restrict current and historical customer parts but not normal
   const first = await s.rt.customerPart('a', conn.id, 'dm-customer')
   const tool = s.rt.teamTools.find(tool => tool.name === 'triage_cases')
   const call = async (sessionId, args) => JSON.parse(await tool.execute(args, { agent: s.agentOf(sessionId) }))
+  await assert.rejects(
+    () => tool.execute({ action: 'vote', summary: 'route this', routes: ['quote', 'unregistered'] }, { agent: s.agentOf(first) }),
+    /registered agent types/,
+  )
   const log = { action: 'log', customer: 'customer', summary: 'part drawing', routed_to: 'sales', reason: 'quote' }
   const entry = await call(first, log)
   const forbidden = [
@@ -705,12 +715,12 @@ test('customer triage handoffs queue in the main chat and advance after answers 
   const tool = s.rt.teamTools.find(tool => tool.name === 'triage_cases')
   const call = async (sessionId, args) => JSON.parse(await tool.execute(args, { agent: s.agentOf(sessionId) }))
   s.rt.catalog = async () => [{ ref: 'p/one' }, { ref: 'p/two' }]
-  s.rt.assembleLlm = async options => ({ finish: { kind: 'stop' }, blocks: () => [{ type: 'text', text: JSON.stringify({ route: options.model === 'one' ? 'Finance' : 'Sales', confidence: 0.9, reason: 'Check the case\nwith staff' }) }] })
+  s.rt.assembleLlm = async options => ({ finish: { kind: 'stop' }, blocks: () => [{ type: 'text', text: JSON.stringify({ route: options.model === 'one' ? 'quote' : 'order_status', confidence: 0.9, reason: 'Check the case\nwith staff' }) }] })
   await call('a', { action: 'judges', models: ['p/one', 'p/two'], threshold: 0.7 })
   const ask = s.rt.teamTools.find(tool => tool.name === 'ask_user')
   await ask.execute({ question: 'An existing question', options: [{ label: 'Continue' }] }, { agent: s.agentOf('a') })
   const existing = s.rt.state.questions.a.id
-  const args = { action: 'vote', summary: '退款申请，附件为发票，老客户', routes: ['Finance', 'Sales'] }
+  const args = { action: 'vote', summary: '退款申请，附件为发票，老客户', routes: ['quote', 'order_status'] }
   const first = await call(customer, args)
   const second = await call(customer, { ...args, summary: '另一个客户问题' })
   assert.equal(first.decision, 'handoff')
@@ -732,9 +742,13 @@ test('customer triage handoffs queue in the main chat and advance after answers 
   const card = s.rt.state.questions.a
   assert.equal(card.id, `triage-${first.case_id}`)
   assert.match(card.question, /退款申请/)
-  assert.deepEqual(card.options.map(option => option.label), ['Finance', 'Sales', "I'll handle it myself"])
+  assert.deepEqual(card.options.map(option => option.label), ['quote', 'order_status', "I'll handle it myself"])
   assert.equal(card.detail.includes('\n'), false)
-  assert.match(card.detail, /p\/one: Finance.*p\/two: Sales/)
+  const detail = JSON.parse(card.detail)
+  assert.deepEqual(detail.source, { bot_id: 'a', customer_session_id: customer })
+  assert.equal(detail.case.summary, args.summary)
+  assert.deepEqual(detail.candidate_destinations.map(entry => entry.route), ['quote', 'order_status'])
+  assert.deepEqual(detail.votes.map(vote => vote.judge), ['p/one', 'p/two'])
   assert.equal(s.rt.state.questions[customer], undefined)
   s.rt.closeCard('a', card, 'dismissed')
   delete s.rt.state.questions.a
@@ -1302,6 +1316,22 @@ test('reply origin: an IM turn answers its own chat, and only that chat', async 
   s.emitEvent('a', 'assistant/message', { message: { content: [{ type: 'text', text: 'only for u1' }] } })
   await s.flush()
   assert.deepEqual(s.fake.sent.map(entry => entry.chat.key), ['dm-u1'])
+})
+
+test('reply origin: Harness turn context preserves a public customer reply target', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer-A', '客户A的问题')
+  const sessionId = s.prompts.at(-1).sessionId
+  s.imTurn(sessionId)
+  for (const kind of ['agent-instructions', 'runtime-context', 'skill-catalog', 'time-context']) {
+    s.emitEvent(sessionId, 'user/message', { source: { kind }, content: [{ type: 'text', text: 'turn context' }] })
+  }
+  s.emitEvent(sessionId, 'assistant/message', { message: { content: [{ type: 'text', text: 'customer reply' }] } })
+  await s.flush()
+  assert.deepEqual(s.fake.sent.map(entry => entry.chat.key), ['dm-customer-A'])
+  assert.equal(s.rt.chatOf('a'), 'a')
 })
 
 test('reply origin: a Web turn does not reach IM', async (t) => {

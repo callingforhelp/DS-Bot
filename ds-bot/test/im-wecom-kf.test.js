@@ -29,6 +29,25 @@ test('kf check selects first account and reports bad credentials', async () => {
   await assert.rejects(adapter.check(fields, fake({ gettoken: [{ errcode: 40001, errmsg: 'invalid credential' }] })), /invalid credential/)
   await assert.rejects(adapter.check(fields, fake({ list: [{ account_list: [] }] })), /account not found/)
 })
+test('kf test endpoint overrides are restricted to loopback HTTP', async () => {
+  const previous = process.env.DSBOT_TEST_WECOM_KF_BASE_URL
+  try {
+    for (const value of ['http://127.0.0.1:9876/cgi-bin/', 'http://[::1]:9876/cgi-bin/']) {
+      process.env.DSBOT_TEST_WECOM_KF_BASE_URL = value
+      const env = fake()
+      const original = env.fetch
+      env.fetch = (url, options) => { assert.ok(url.startsWith(value)); return original(url, options) }
+      await adapter.check(fields, env)
+    }
+    for (const value of ['https://example.com/', 'http://192.168.1.1/', 'http://user:password@localhost/']) {
+      process.env.DSBOT_TEST_WECOM_KF_BASE_URL = value
+      await assert.rejects(adapter.check(fields, fake()), /loopback/)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.DSBOT_TEST_WECOM_KF_BASE_URL
+    else process.env.DSBOT_TEST_WECOM_KF_BASE_URL = previous
+  }
+})
 test('kf token cache, refresh, byte chunks and permanent failures', async () => {
   const env = fake({ send_msg: [{ errcode: 42001 }, { msgid: 'ok' }] })
   const connection = adapter.connect(fields, env, { onStatus() {}, async onMessage() {} })
