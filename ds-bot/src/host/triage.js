@@ -38,6 +38,18 @@ export function triageBank(home, writable = () => {}) {
     writable()
     await replaceFile(temp, path, writable)
   }
+  const writeCases = async (cases) => {
+    for (const entry of cases) {
+      if (entry.misroute?.at !== undefined) entry.misrouted_at = Math.max(entry.misrouted_at ?? 0, entry.misroute.at)
+      delete entry.misroute
+    }
+    const lines = cases.map(item => JSON.stringify(item) + '\n')
+    let bytes = lines.reduce((size, line) => size + Buffer.byteLength(line), 0)
+    while ((bytes > MAX_BYTES || lines.length > MAX_CASES) && lines.length > 1) {
+      bytes -= Buffer.byteLength(lines.shift())
+    }
+    await write('cases.jsonl', lines.join(''))
+  }
   return args => {
     const run = async () => {
       writable()
@@ -63,19 +75,14 @@ export function triageBank(home, writable = () => {}) {
         const entry = { id: randomUUID(), created: now }
         for (const key of ['customer', 'summary', 'attachments_summary', 'routed_to', 'reason']) entry[key] = clean(args[key])
         cases.push(entry)
-        if (cases.length > MAX_CASES) cases.splice(0, cases.length - MAX_CASES)
-        let bytes = cases.reduce((size, item) => size + Buffer.byteLength(JSON.stringify(item)) + 1, 0)
-        while (bytes > MAX_BYTES && cases.length > 1) {
-          bytes -= Buffer.byteLength(JSON.stringify(cases.shift())) + 1
-        }
         result = { id: entry.id }
       } else if (args.action === 'outcome') {
         const entry = cases.find(item => item.id === args.id)
         if (!entry) throw new Error('Triage case not found')
         if (!['correct', 'misrouted', 'resolved'].includes(args.result)) throw new Error('Invalid outcome')
-        if (entry.outcome?.result === 'misrouted') entry.misroute = entry.outcome
+        if (entry.outcome?.result === 'misrouted') entry.misrouted_at = entry.outcome.at
         entry.outcome = { result: args.result, correct_route: clean(args.correct_route), lesson: clean(args.lesson), at: now }
-        if (args.result === 'misrouted') entry.misroute = entry.outcome
+        if (args.result === 'misrouted') entry.misrouted_at = now
         if (args.result === 'misrouted' && clean(args.lesson)) addRule(args.lesson, entry.id)
         result = entry
       } else if (args.action === 'rules') {
@@ -84,10 +91,10 @@ export function triageBank(home, writable = () => {}) {
         else if (args.rule_action === 'list') result = state.rules
         else throw new Error('rule_action must be add, remove or list')
       } else if (args.action === 'review') {
-        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes: cases.filter(item => (item.misroute?.at ?? (item.outcome?.result === 'misrouted' ? item.outcome.at : 0)) > state.reviewed), rules: state.rules }
+        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes: cases.filter(item => (item.misrouted_at ?? item.misroute?.at ?? (item.outcome?.result === 'misrouted' ? item.outcome.at : 0)) > state.reviewed), rules: state.rules }
         state.reviewed = now
       } else throw new Error('Unknown triage action')
-      if (['log', 'outcome'].includes(args.action)) await write('cases.jsonl', cases.map(item => JSON.stringify(item)).join('\n') + '\n')
+      if (['log', 'outcome'].includes(args.action)) await writeCases(cases)
       await write('rules.json', JSON.stringify(state))
       return JSON.stringify(result)
     }

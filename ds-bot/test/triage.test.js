@@ -70,7 +70,30 @@ test('triage review retains misroutes that were subsequently resolved', async (t
     assert.deepEqual(review.cases, [])
     assert.equal(review.misroutes.length, 1)
     assert.equal(review.misroutes[0].outcome.result, 'resolved')
-    assert.equal(review.misroutes[0].misroute.correct_route, 'engineering')
+    assert.equal(review.misroutes[0].misrouted_at, 2000)
+    assert.equal(review.misroutes[0].misroute, undefined)
     assert.deepEqual((await call({ action: 'review' })).misroutes, [])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('triage outcome writes evict oldest cases and compact legacy misroute records', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
+  try {
+    const limit = 16 * 1024 * 1024
+    const line = JSON.stringify({ id: 'oldest', summary: 's'.repeat(4000), customer: 'c'.repeat(4000), attachments_summary: 'a'.repeat(4000), routed_to: 'r'.repeat(4000), reason: 'w'.repeat(4000) }) + '\n'
+    const target = JSON.stringify({ id: 'target', summary: 'recent', misroute: { at: 100, lesson: 'legacy lesson' } }) + '\n'
+    const count = Math.floor((limit - 1000 - Buffer.byteLength(target)) / Buffer.byteLength(line))
+    const padding = limit - 1000 - Buffer.byteLength(target) - count * Buffer.byteLength(line)
+    const path = join(dir, 'triage', 'cases.jsonl')
+    await mkdir(join(dir, 'triage'))
+    await writeFile(path, line.repeat(count) + JSON.stringify({ id: 'padding', summary: 'x'.repeat(padding) }) + '\n' + target)
+    await triageBank(dir)({ action: 'outcome', id: 'target', result: 'misrouted', correct_route: 'r'.repeat(4000), lesson: 'l'.repeat(4000) })
+    const stored = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    assert.ok((await stat(path)).size <= limit)
+    assert.equal(stored.filter(item => item.id === 'oldest').length, count - 1)
+    assert.equal(stored.at(-1).id, 'target')
+    assert.equal(stored.at(-1).misroute, undefined)
+    assert.equal(typeof stored.at(-1).misrouted_at, 'number')
+    assert.equal(stored.at(-1).outcome.result, 'misrouted')
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
