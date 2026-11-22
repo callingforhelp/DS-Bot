@@ -800,7 +800,7 @@ export function install(rt) {
       await sendText(conn, msg.chat, text(stopped ? 'stopped' : 'idle'))
       return
     }
-    if (imPlatform(conn.platform)?.public !== true && NUMBERS.test(body)) {
+    if (NUMBERS.test(body)) {
       const picked = body.trim().split(/\s+/).map(Number)
       const held = newestOpenCard(conn, msg.chat.key)
       // Anything that does not clearly answer the newest open card — a stale
@@ -817,7 +817,7 @@ export function install(rt) {
             if (answered !== false) return
           }
         }
-      } else if (held !== undefined && held.cardKey.startsWith('a:')
+      } else if (imPlatform(conn.platform)?.public !== true && held !== undefined && held.cardKey.startsWith('a:')
         && picked.length === 1 && (picked[0] === 1 || picked[0] === 2)
         && rt.approvalsView().some(entry => `a:${entry.id}` === held.cardKey)) {
         const answered = await answerApprovalCard(conn, msg.chat, held.cardKey, picked[0] === 1 ? 'allow' : 'reject')

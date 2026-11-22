@@ -159,6 +159,28 @@ test('public platforms never receive approval cards during reconciliation', asyn
   assert.equal(s.fake.sent.length, 0)
 })
 
+test('public customers can answer numbered question cards but not control commands', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer', 'hello')
+  s.imTurn('a')
+  s.rt.state.questions.a = { id: 'public-question', question: 'Which?', options: [{ label: 'yes' }, { label: 'no' }] }
+  await s.rt.save()
+  await s.flush()
+  assert.match(s.fake.sent.at(-1).text, /1\. yes/)
+  await dm(s, 'customer', '9')
+  assert.ok(s.rt.state.questions.a)
+  await dm(s, 'customer', '2')
+  assert.equal(s.rt.state.questions.a, undefined)
+  assert.equal(s.agentOf('a').followed, 1)
+  const sent = s.fake.sent.length
+  await dm(s, 'customer', '/start')
+  await dm(s, 'customer', '/stop')
+  assert.equal(s.fake.sent.length, sent)
+  assert.equal(s.agentOf('a').cancelled, undefined)
+})
+
 test('two concurrent syncs start exactly one adapter', async (t) => {
   const s = await start()
   t.after(s.stop)
