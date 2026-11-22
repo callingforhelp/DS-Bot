@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler
 from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1133,6 +1134,196 @@ class ParaDevRunnerTest(unittest.TestCase):
                 )
                 self.assertEqual(res["status"], "failed")
                 self.assertIn("Invalid Git branch name", res["error"])
+
+    def test_dsbot_runner_local_mcp_bot_and_group_waiting(self) -> None:
+        calls: list[tuple[str, dict]] = []
+        mode = {"scenario": "bot"}
+
+        class FakeMcpHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                if self.headers.get("Authorization") != "Bearer test-mcp-tok":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                method = req.get("method")
+                params = req.get("params") or {}
+                tool_name = params.get("name")
+                args = params.get("arguments") or {}
+                calls.append((tool_name or method, args))
+
+                if tool_name == "list_bots":
+                    result = {
+                        "bots": [
+                            {"id": "helper", "name": "Helper", "main": False, "working": False},
+                            {"id": "chief", "name": "Chief", "main": True, "working": False},
+                        ]
+                    }
+                elif tool_name == "send_to_bot":
+                    result = {"sent": True, "after": 1000}
+                elif tool_name == "send_to_group":
+                    result = {"sent": True, "after": 2000}
+                elif tool_name == "wait_for_reply":
+                    if mode["scenario"] == "bot":
+                        result = {
+                            "done": True,
+                            "working": False,
+                            "after": 1500,
+                            "messages": [
+                                {
+                                    "kind": "assistant",
+                                    "from": "Chief",
+                                    "text": "Opened PR https://github.com/callingforhelp/DS-Bot/pull/99",
+                                    "time": 1500,
+                                }
+                            ],
+                        }
+                    else:
+                        result = {"done": False, "working": True, "after": 2000, "messages": []}
+                elif tool_name == "list_waiting":
+                    if mode["scenario"] == "group_waiting":
+                        result = {
+                            "waiting": [
+                                {
+                                    "kind": "approval",
+                                    "bot": "Coder",
+                                    "group": "Ops",
+                                    "tool": "bash",
+                                    "reason": "run deploy",
+                                }
+                            ],
+                            "answerIn": "DS Bot on this computer",
+                        }
+                    else:
+                        result = {"waiting": [], "answerIn": "DS Bot on this computer"}
+                else:
+                    result = {}
+
+                body = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req.get("id"),
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(result)}],
+                            "structuredContent": result,
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeMcpHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            mcp_url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+            with patch("worker.subprocess.run") as sub_run:
+                res = default_dsbot_runner(
+                    {"task": "check PR", "timeout_sec": 30},
+                    "/nonexistent/dsh",
+                    "/nonexistent/patch.yml",
+                    mcp_url=mcp_url,
+                    mcp_token="test-mcp-tok",
+                )
+                sub_run.assert_not_called()
+            self.assertEqual(res["status"], "succeeded")
+            self.assertEqual(res["pr_url"], "https://github.com/callingforhelp/DS-Bot/pull/99")
+            self.assertIn("[Chief] Opened PR", res["result_summary"])
+            self.assertEqual([c[0] for c in calls[:3]], ["list_bots", "send_to_bot", "wait_for_reply"])
+            self.assertEqual(calls[1][1]["bot"], "Chief")
+
+            calls.clear()
+            mode["scenario"] = "group_waiting"
+            with patch("worker.subprocess.run") as sub_run:
+                res_g = default_dsbot_runner(
+                    {"task": "@Coder deploy", "group": "Ops", "timeout_sec": 30},
+                    "/nonexistent/dsh",
+                    "/nonexistent/patch.yml",
+                    mcp_url=mcp_url,
+                    mcp_token="test-mcp-tok",
+                )
+                sub_run.assert_not_called()
+            self.assertEqual(res_g["status"], "succeeded")
+            self.assertIn("[LOCAL_DSBOT_WAITING]", res_g["result_summary"])
+            self.assertIn("run deploy", res_g["result_summary"])
+            self.assertEqual(calls[0], ("send_to_group", {"group": "Ops", "text": "@Coder deploy"}))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_dsbot_runner_fallback_only_before_send(self) -> None:
+        # Unreachable MCP fails before send -> safe fallback to headless CLI
+        headless_ok = subprocess.CompletedProcess(
+            args=["dsh"], returncode=0, stdout="headless reply", stderr=""
+        )
+        with patch("worker.subprocess.run", return_value=headless_ok) as sub_run:
+            res = default_dsbot_runner(
+                {"task": "fallback task", "bot": "Chief", "timeout_sec": 10},
+                "/usr/local/bin/dsh",
+                "/tmp/patch.yml",
+                mcp_url="http://127.0.0.1:1/mcp",
+                mcp_token="test-mcp-tok",
+            )
+            sub_run.assert_called_once()
+        self.assertEqual(res["status"], "succeeded")
+        self.assertEqual(res["result_summary"], "headless reply")
+
+        # Post-send wait error must NOT fall back to headless CLI (prevents duplicate execution)
+        class FailWaitHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                tool_name = (req.get("params") or {}).get("name")
+                if tool_name == "send_to_bot":
+                    result = {"sent": True, "after": 1000}
+                    body = json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req.get("id"),
+                            "result": {
+                                "content": [{"type": "text", "text": json.dumps(result)}],
+                                "structuredContent": result,
+                            },
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"wait failed")
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), FailWaitHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            with patch("worker.subprocess.run") as sub_run:
+                res_err = default_dsbot_runner(
+                    {"task": "do once", "bot": "Chief", "timeout_sec": 10},
+                    "/usr/local/bin/dsh",
+                    "/tmp/patch.yml",
+                    mcp_url=f"http://127.0.0.1:{srv.server_address[1]}/mcp",
+                    mcp_token="test-mcp-tok",
+                )
+                sub_run.assert_not_called()
+            self.assertEqual(res_err["status"], "failed")
+            self.assertIn("MCP HTTP 500", res_err["error"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

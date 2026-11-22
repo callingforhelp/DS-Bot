@@ -1,54 +1,43 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { Context } from '@deepseek-ai/cordis'
-import { LlmRuntime } from '@deepseek-ai/dsh-llm'
-import { install } from '../src/host/local-agents/index.js'
-import { LocalAgentAdapter } from '../src/host/local-agents/adapter.js'
-import { refreshSearchDirs } from '../src/host/local-agents/discover.js'
-import { fakeContext } from './fake-ctx.js'
+import { presetOf } from '../src/host/local-agents/index.js'
+import { cliMode } from '../src/host/local-agents/engines.js'
 
-// The preset a local agent runs under follows what DSH enforces on its Session when the
-// Bot and its group set none: a Bot left on DSH's full-access default (approval policy
-// `never`) must not get a CLI that asks, since every ask would be rejected.
-async function presetHost(t, { current, bot = {}, room } = {}) {
-  await refreshSearchDirs()
-  const owner = new Context()
-  const llm = new LlmRuntime(owner)
-  const adapters = []
-  const register = llm.registerAdapter.bind(llm)
-  llm.registerAdapter = (ids, adapter) => { if (adapter instanceof LocalAgentAdapter) adapters.push(adapter); return register(ids, adapter) }
-  const services = { llm }
-  if (current !== undefined) services.permissionPresets = { current: () => { if (current instanceof Error) throw current; return current }, catalog: () => ({ options: [], defaultPreset: current }) }
-  const ctx = fakeContext({ services })
-  const warnings = []
-  const rt = {
-    ctx, state: { bots: {}, localAgents: { custom: [], sessions: {} } }, warn: (...args) => warnings.push(args), save: async () => {},
-    selfOf: () => 'b1', botOf: id => (id === 'b1' ? { id: 'b1', name: 'Devin Manager', ...bot } : undefined),
-    groupOwners: new Map(room ? [['s1', { roomId: 'r1' }]] : []), roomOf: id => (id === 'r1' ? room : undefined),
-    resolveAgent: async () => ({ session: { header: { id: 's1' } } }),
+// #1539: a Bot with no preset of its own runs on DSH's default preset, the one the user
+// is shown (permissions.js keeps that applied to the Session). A hard-coded
+// workspace-write opened the local agent in a stricter mode than the setting, so a Bash
+// call went through the CLI's permission prompt and, with approvals off, was denied.
+function runtime({ defaultPreset = 'danger-full-access', catalog = true } = {}) {
+  const bots = { b: { id: 'b', name: 'Writer' } }
+  return {
+    bots,
+    rt: {
+      botOf: id => bots[id],
+      selfOf: id => (id === 'g1' || id === 'chat' ? 'b' : undefined),
+      groupOwners: new Map([['g1', { botId: 'b', roomId: 'r1' }]]),
+      roomOf: id => (id === 'r1' ? { id: 'r1', name: 'Ops', permission: 'read-only' } : undefined),
+      permissionCatalog: catalog ? () => ({ defaultPreset, options: [] }) : () => undefined,
+    },
   }
-  t.after(async () => { await ctx.dispose(); await owner.fiber.dispose() })
-  install(rt)
-  // Registration follows CLI discovery, which is asynchronous on a cold start.
-  for (let i = 0; i < 500 && adapters.length === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10))
-  assert.ok(adapters.length > 0, 'the local agents adapter registered')
-  return { presetFor: id => adapters[0].deps.presetFor(id), warnings }
 }
 
-test("a Bot with no preset of its own follows DSH's preset for the Session", async (t) => {
-  const { presetFor } = await presetHost(t, { current: 'danger-full-access' })
-  assert.equal(await presetFor('s1'), 'danger-full-access')
+test('a Bot without a preset runs a local agent on the profile default', () => {
+  const { rt } = runtime()
+  // The Bot's own chat: the profile's default, and the mode the CLI opens with.
+  assert.equal(presetOf(rt, 'chat'), 'danger-full-access')
+  assert.equal(cliMode('claude', presetOf(rt, 'chat')), 'bypassPermissions')
 })
 
-test("the Bot's and the group's own presets still win over DSH's", async (t) => {
-  assert.equal(await (await presetHost(t, { current: 'danger-full-access', bot: { permission: 'read-only' } })).presetFor('s1'), 'read-only')
-  assert.equal(await (await presetHost(t, { current: 'danger-full-access', bot: { permission: 'read-only' }, room: { id: 'r1', permission: 'workspace-write' } })).presetFor('s1'), 'workspace-write')
+test('the group preset wins, then the Bot\'s own, then the profile default', () => {
+  const { bots, rt } = runtime({ defaultPreset: 'workspace-write' })
+  assert.equal(presetOf(rt, 'g1'), 'read-only')
+  bots.b.permission = 'danger-full-access'
+  assert.equal(presetOf(rt, 'chat'), 'danger-full-access')
+  assert.equal(cliMode('claude', presetOf(rt, 'chat')), 'bypassPermissions')
 })
 
-test('workspace-write stays the fallback without DSH presets, for a custom setting, or when the Session cannot be read', async (t) => {
-  assert.equal(await (await presetHost(t, {})).presetFor('s1'), 'workspace-write')
-  assert.equal(await (await presetHost(t, { current: 'custom' })).presetFor('s1'), 'workspace-write')
-  const broken = await presetHost(t, { current: new Error('no session') })
-  assert.equal(await broken.presetFor('s1'), 'workspace-write')
-  assert.ok(broken.warnings.some(args => String(args[0]).includes('permission preset')))
+test('without a permission service the old fallback stands', () => {
+  const { rt } = runtime({ catalog: false })
+  assert.equal(presetOf(rt, 'chat'), 'workspace-write')
+  assert.equal(cliMode('claude', presetOf(rt, 'chat')), 'acceptEdits')
 })

@@ -597,7 +597,18 @@ export function install(rt) {
   // (the admin's own tools do not count) — only resets the check count; the round
   // still gets its check. An admin that passes waits for the user, and two checks
   // without progress mark the goal idle until something happens.
-  async function goalDrive(room, round) {
+  const driving = new Map()
+
+  function goalDrive(room, round) {
+    if (room === undefined) return Promise.resolve()
+    const previous = driving.get(room.id) ?? Promise.resolve()
+    const next = previous.catch(() => {}).then(() => driveGoal(room, round))
+    driving.set(room.id, next)
+    next.finally(() => { if (driving.get(room.id) === next) driving.delete(room.id) }).catch(() => {})
+    return next
+  }
+
+  async function driveGoal(room, round) {
     const goal = room.goal
     const admin = room.admin === undefined || room.admin === null ? undefined : rt.botOf(room.admin)
     if (goal === undefined || goal.status !== 'active' || goal.idle === true || admin === undefined || !room.members.includes(admin.id)) return
@@ -634,13 +645,11 @@ export function install(rt) {
     await queueGoalRelay(room, 'nudge', '[Goal check]', 'DS Bot', decision.routing)
   }
 
-  // Member work can outlive the round it grew out of; the round-end check then
-  // skips the room, and nothing else would wake the admin when the last of it
-  // settles. Settle — no round running, nobody working, no call batch, an
-  // empty inbox — runs the same check once: the fake round's one worked slot
-  // only says progress happened (the work that just ended), so the check gets
-  // a fresh budget.
-  const SETTLE_ROUND = Object.freeze({ stoppedOnly: false, slots: Object.freeze([{ id: '', worked: true }]) })
+  // Work can outlive its round, so settlement checks an otherwise quiet room.
+  // A settlement event is not evidence of progress: turn/end and subagent/end
+  // also fire after an admin [PASS] or a failed turn. Keep the slot non-empty
+  // to allow the check, but do not reset the idle check budget.
+  const SETTLE_ROUND = Object.freeze({ stoppedOnly: false, slots: Object.freeze([{ id: '', worked: false }]) })
 
   async function goalSettled(room) {
     if (room === undefined) return
@@ -727,7 +736,7 @@ export function install(rt) {
       const member = rt.botOf(self)
       if (member === undefined) return 'Only Bots on the team can use group_goal.'
       const action = String(args.action ?? '')
-      let room = rt.roomOf(rt.groupOwners.get(exec.agent?.id)?.roomId)
+      let room = rt.roomOf(rt.groupOwners.get(exec.agent?.id)?.roomId ?? rt.taskOwners?.get(exec.agent?.id)?.roomId)
       if (room === undefined) {
         if (String(args.group ?? '').trim() === '') return required('group', action)
         const picked = rt.pickRoom(args.group, self)

@@ -821,6 +821,40 @@ class BrokerTest(unittest.TestCase):
         finally:
             restarted.close()
 
+    def test_dsbot_bot_and_group_fields_roundtrip(self) -> None:
+        st, data = self._req(
+            "POST",
+            "/v1/jobs",
+            {
+                "target": "dsbot",
+                "task": "check local status",
+                "aws_session_id": "s1",
+                "bot": "Coder",
+                "group": "Ops",
+            },
+            token="prod-secret",
+        )
+        self.assertEqual(st, 201)
+        job_id = data["job"]["job_id"]
+        self.assertEqual(data["job"]["bot"], "Coder")
+        self.assertEqual(data["job"]["group"], "Ops")
+
+        st, got = self._req("GET", f"/v1/jobs/{job_id}", token="prod-secret")
+        self.assertEqual(st, 200)
+        self.assertEqual(got["job"]["bot"], "Coder")
+        self.assertEqual(got["job"]["group"], "Ops")
+
+        st, claim = self._req(
+            "POST",
+            "/v1/worker/claim",
+            {"worker_id": "mac-1", "hostname": "mini"},
+            token="work-secret",
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(claim["job"]["job_id"], job_id)
+        self.assertEqual(claim["job"]["bot"], "Coder")
+        self.assertEqual(claim["job"]["group"], "Ops")
+
 
 if __name__ == "__main__":
     unittest.main()
