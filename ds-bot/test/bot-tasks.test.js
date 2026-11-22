@@ -368,8 +368,37 @@ test('customer tasks stay private and retained, and ordinary task APIs cannot ac
     const result = await env.tool(name).execute({ task: ordinaryTask.id, text: 'Should not be accessible' }, execOf(customerAgent))
     assert.doesNotMatch(result, /Unrelated private work|Do not expose this/)
   }
+  for (const name of ['list_bots', 'read', 'shell', 'create_bot', 'late_registered_tool']) {
+    const denials = env.ctx.guards.map(guard => guard({ agent: customerAgent, name, arguments: {} })).filter(Boolean)
+    assert.ok(denials.some(message => /not available in customer conversations/.test(message)), `${name} must be denied by the host guard`)
+  }
+  assert.equal(env.ctx.guards.map(guard => guard({ agent: customerAgent, name: 'ask_user', arguments: {} })).filter(Boolean).length, 0)
   assert.equal(ordinaryTask.status, 'running')
   assert.equal(env.deliveries.filter(delivery => delivery.role === 'task-report').length, 0)
+})
+
+test('Main Bot emergency stop cancels customer work without settling or reporting it', async (t) => {
+  const customerTask = {
+    id: 'customer_kf01', title: 'Customer conversation', origin: 'customer',
+    customer: { connId: 'wecom', chatKey: 'customer-a' }, status: 'running', sessionId: 'customer-a', startedAt: 1,
+  }
+  const team = makeTeam({ bots: { a: { ...makeTeam().bots.a, tasks: [customerTask] } } })
+  const env = await startEnv({ team })
+  t.after(env.stop)
+  const task = env.rt.botOf('a').tasks[0]
+  const agent = await env.rt.resolveAgent(task.sessionId)
+  agent.inbox.nextTurn.push({ id: 'queued-turn' })
+  agent.inbox.nextStep.push({ id: 'queued-step' })
+  let cleared = 0
+  agent.inbox.clear = () => { cleared++; agent.inbox.nextStep.splice(0); agent.inbox.nextTurn.splice(0) }
+  await env.rt.stopAllTasksOfBot(env.rt.botOf('a'), 'emergency stop')
+  assert.equal(task.status, 'waiting_customer')
+  assert.deepEqual(task.customer, { connId: 'wecom', chatKey: 'customer-a' })
+  assert.equal(cleared, 1)
+  assert.deepEqual(agent.inbox.nextTurn, [])
+  assert.deepEqual(agent.inbox.nextStep, [])
+  assert.ok(agent.cancelled.length > 0)
+  assert.equal(env.deliveries.some(delivery => delivery.role === 'task-report' && delivery.taskId === task.id), false)
 })
 
 test('nested task_* tools and interactive cards (ask_user/show_view/request_secret) are blocked for tasks, and tasks stay read-only', async (t) => {

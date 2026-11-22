@@ -408,7 +408,8 @@ export function install(rt) {
   // after a restart — has no IM origin, and its replies, views and cards stay in the app.
   // Nothing is persisted: after a restart there is no origin, so nothing goes out. A
   // A Bot's origin lasts through its turn; a task result or conflicting source can end it.
-  // Public customer threads are accepted without pairing, but their origins stay session-scoped.
+  // Public customer task origins remain session-scoped between turns so an approved
+  // specialist reply can return to the same customer.
   const paired = (conn, senderId) => imPlatform(conn.platform)?.public === true || (conn.paired ?? []).some(entry => entry.id === senderId)
   // Session id → the chat its running turn came from.
   const origins = new Map()
@@ -1247,6 +1248,7 @@ export function install(rt) {
   }
 
   // ------------------------------------------------------------------ cards
+  const cardSpeaker = (sessionId, bot) => rt.isCustomerPart?.(sessionId) === true ? 'Customer support' : bot?.name ?? '?'
   const cardText = {
     question: (bot, question) => {
       const options = (question.options ?? []).map((option, index) => `${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`).join('\n')
@@ -1331,7 +1333,7 @@ export function install(rt) {
         const origin = cardOrigin(sessionId, question)
         if (origin === undefined || origin.conn.id !== conn.id) continue
         const buttons = imPlatform(conn.platform)?.buttons === true ? cardButtons.question(question) : undefined
-        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], cardText.question(bot.name, question), buttons, true)
+        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], cardText.question(cardSpeaker(sessionId, bot), question), buttons, true)
       }
       // Approvals: one card per open approval id, resent to chats whose earlier send dropped.
       for (const entry of rt.approvalsView?.() ?? []) {
@@ -1374,7 +1376,7 @@ export function install(rt) {
         const picks = choices.length === 0 ? '' : `\n${choices.map((choice, index) => `${index + 1}. ${choice.label}`).join('\n')}\n(${text('numbers')})`
         const buttons = imPlatform(conn.platform)?.buttons === true && choices.length > 0
           ? choices.map((choice, index) => ({ data: `v:${view.id}:${index}`, label: choice.label })) : undefined
-        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], `${text('viewShow', { bot: bot.name })}${form !== '' ? `\n${form}` : view.title ? `\n${view.title}` : ''}${picks}`, buttons, choices.length > 0,
+        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], `${text('viewShow', { bot: cardSpeaker(sessionId, bot) })}${form !== '' ? `\n${form}` : view.title ? `\n${view.title}` : ''}${picks}`, buttons, choices.length > 0,
           view.issueDraft === undefined && choices.length === 0 ? view.view : undefined)
       }
     }
@@ -1888,7 +1890,7 @@ export function install(rt) {
     if (event.type === 'turn/start') {
       const room = rt.roomOf(session.id)
       if (room === undefined) {
-        resetOrigin(session.id)
+        if (rt.isCustomerPart?.(session.id) !== true) resetOrigin(session.id)
       } else {
         const working = rt.roomActive?.(room.id)
           || [...rt.groupOwners].some(([id, owner]) => owner.roomId === room.id && rt.live.get(id)?.turn !== undefined)
@@ -1989,7 +1991,7 @@ export function install(rt) {
       // working and post later; only a Bot's turn ending ends the chat's claim. A
       // pending reset means the turn never got a message to classify, so apply it now.
       if (rt.roomOf(session.id) === undefined) {
-        resetOrigin(session.id)
+        if (rt.isCustomerPart?.(session.id) !== true) resetOrigin(session.id)
         detachHeldOrigin(session.id)
       } else if (pendingReset.delete(session.id)) {
         resetOrigin(session.id)

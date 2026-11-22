@@ -999,3 +999,69 @@ test('recovery does not duplicate a request a newly started live turn already ow
   assert.equal(host.agentOf('b').calls.length, 0, 'a request already owned by a live turn must not be delivered again')
   await host.stop()
 })
+
+test('reply delivery uses a generic header for customer sessions and preserves staff headers', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-dedup-customer-delivery-'))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(baseSeed()))
+  const host = await createRestartHost(t, home, new Map())
+  t.after(async () => {
+    await host.stop()
+    rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+  })
+
+  const { rt, agentOf } = host
+  rt.isCustomerPart = sessionId => sessionId === 'a'
+  rt.openWork('customer-work', { from: 'a', to: 'b' })
+  await rt.deliver({ fromId: 'b', fromName: 'Writer', toId: 'a', text: 'The reply is ready.', role: 'reply', replyTo: 'customer-work', exchangeId: 'customer-reply', work: 'customer-work' })
+  const customerReply = textOf(agentOf('a').calls.at(-1))
+  assert.match(customerReply, /^\[Reply from Customer support\]\n/)
+  assert.doesNotMatch(customerReply, /\b(?:Writer|Chief)\b/)
+
+  rt.isCustomerPart = () => false
+  rt.openWork('staff-work', { from: 'a', to: 'b' })
+  await rt.deliver({ fromId: 'b', fromName: 'Writer', toId: 'a', text: 'The staff reply is ready.', role: 'reply', replyTo: 'staff-work', exchangeId: 'staff-reply', work: 'staff-work' })
+  const staffReply = textOf(agentOf('a').calls.at(-1))
+  assert.match(staffReply, /^\[Reply from Writer · for the work Chief asked you for; your answer goes to Chief once everything you handed on is back\]\n/)
+})
+
+test('customer turn failure notices omit internal Bot and provider details', async (t) => {
+  const { rt, agents, tool, stepGate, modes, deliveries } = await createLoopRig(t)
+  modes.requestId = 'customer-failure-id'
+
+  await tool('message_bot', { to: 'Writer', message: 'Review this customer request' }, 'a')
+  await settle(() => rt.live.get('b')?.tool === 'wait_step')
+  rt.isCustomerPart = sessionId => sessionId === 'a'
+  stepGate.resolve()
+  await agents.get('b').whenIdle()
+  await settle(() => deliveries.some(entry => entry.sessionId === 'a' && entry.source.role === 'reply'))
+
+  const reply = deliveries.find(entry => entry.sessionId === 'a' && entry.source.role === 'reply')
+  assert.match(reply.text, /^\[Reply from Customer support\]\nCustomer support could not complete this reply\./)
+  assert.doesNotMatch(reply.text, /\b(?:Writer|Chief|INVALID_REQUEST|400)\b|invalid tool payload|customer-failure-id/)
+})
+
+test('customer failed-send fallback omits internal Bot and provider details', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-dedup-customer-fallback-'))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(baseSeed()))
+  const host = await createRestartHost(t, home, new Map())
+  t.after(async () => {
+    await host.stop()
+    rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+  })
+
+  const { rt, agentOf } = host
+  rt.isCustomerPart = sessionId => sessionId === 'a'
+  const deliver = rt.deliver.bind(rt)
+  let attempts = 0
+  rt.deliver = args => {
+    attempts += 1
+    if (attempts === 1) return Promise.reject(Object.assign(new Error('private provider endpoint'), { code: 'SERVER', status: 503 }))
+    return deliver(args)
+  }
+  answerSender(rt, 'b', { kind: 'bot', role: 'request', exchangeId: 'customer-fallback-request', senderSessionId: 'a' }, 'The specialist answer')
+  await settle(() => agentOf('a').calls.length === 1)
+
+  const reply = textOf(agentOf('a').calls[0])
+  assert.match(reply, /^\[Reply from Customer support\]\nCustomer support could not send this reply\. Please try again later\./)
+  assert.doesNotMatch(reply, /\b(?:Writer|Chief|SERVER|503)\b|private provider endpoint/)
+})

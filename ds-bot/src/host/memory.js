@@ -891,6 +891,7 @@ export function install(rt) {
 
   function sectionFor(sessionId) {
     if (sessionId === undefined) return ''
+    if (rt.isCustomerPart?.(sessionId)) return ''
     const bot = rt.botOf(rt.selfOf(sessionId))
     if (bot === undefined) return ''
     // A section frozen under another role (made a Main Bot or a group admin since, or no
@@ -958,6 +959,7 @@ export function install(rt) {
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted || !Array.isArray(decision.messages)) return decision
+    if (rt.isCustomerPart?.(agent.id)) return decision
     await rt.load()
     const roomId = roomIdOf(agent.id)
     const bot = rt.botOf(rt.selfOf(agent.id))

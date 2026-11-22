@@ -76,6 +76,7 @@ export function install(rt) {
       const botTasks = rt.taskViewOf?.(state.bots[bot.id]) ?? []
       const customerSessions = (state.bots[bot.id].tasks ?? []).filter(task => task?.origin === 'customer').map(task => ({
         sessionId: task.sessionId,
+        reference: rt.customerReferenceOf?.(task.sessionId) ?? task.id.slice(-8).toUpperCase(),
         parts: (task.segments ?? []).map(segment => segment.sessionId),
         startedAt: task.startedAt,
         updatedAt: task.updatedAt ?? task.startedAt,

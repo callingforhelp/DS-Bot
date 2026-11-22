@@ -56,7 +56,7 @@ await once(server, 'listening')
 const env = {
   ...process.env, DSBOT_TEST_WECOM_KF_BASE_URL: `http://127.0.0.1:${server.address().port}/cgi-bin/`,
   DSBOT_ENV_FILE: join(home, 'no-startup-seed.env'), MOCK_TRIAGE_E2E: '1',
-  MOCK_WATCH: 'A_ONLY_CONTEXT_234', MOCK_LOG_CHARS: '160000', MOCK_LOG_TOOLS: '1',
+  MOCK_WATCH: 'A_ONLY_CONTEXT_234,STAFF_CONTEXT_SENTINEL_73C9,mock/', MOCK_LOG_CHARS: '160000', MOCK_LOG_TOOLS: '1',
   CONTEXT_WINDOW: '100000', CHECK_RATIO: '0.45',
 }
 async function bench(action) {
@@ -95,10 +95,10 @@ function message(customer, text, file = false) {
 }
 const command = args => `分诊测试 ${JSON.stringify(args)}`
 async function staff(sessionId, args) { await api('send', { sessionId, text: command(args) }); await settle() }
-async function customer(args) {
+async function customer(customerId, args) {
   const before = sent.length
-  message('customer-A', command(args))
-  await until(() => sent.length > before, 'customer tool reply')
+  message(customerId, command(args))
+  await until(() => sent.slice(before).some(value => value.touser === customerId), `customer ${customerId} tool reply`)
   await settle()
   return sent.slice(before)
 }
@@ -118,18 +118,85 @@ try {
   await settle()
   const quote = await api('create-bot', { name: 'Quote', role: 'Quotation specialist', instructions: 'Review customer quotation requests.' })
   await settle()
+  const quoteId = quote.id ?? Object.values((await state()).bots).find(bot => bot.name === 'Quote').id
+  const quoteSession = (await state()).bots[quoteId].sessionId ?? quoteId
   const foreground = (await state()).bots[chief.id].sessionId ?? chief.id
+  const staffSentinel = `STAFF_CONTEXT_SENTINEL_73C9 ${models.at(-1).ref}`
+  await api('update-bot', { id: chief.id, instructions: `${staffSentinel} is private staff guidance.` })
+  await api('send', { sessionId: foreground, text: `记住 ${staffSentinel}；这是仅限员工的记忆。` })
+  await api('update-bot', { id: quoteId, instructions: `${staffSentinel} is private specialist staff guidance.` })
+  await api('send', { sessionId: quoteSession, text: `记住 ${staffSentinel}；这是仅限员工的专员记忆。` })
+  await settle()
   await api('im-add', { platform: 'wecom_kf', botId: chief.id, fields: { corpId: 'stand-in-corp', secret: 'stand-in-secret', openKfId: 'kf-e2e' } })
   const mainBeforeCustomers = await api('chat', { botId: chief.id })
+  const customerReplyBefore = sent.length
+  message('customer-A', 'MOCK_ROSTER_GUARD：团队现在有哪些机器人？')
+  await until(() => sent.slice(customerReplyBefore).some(value => value.touser === 'customer-A'), 'warm customer reply')
+  const customerReply = sent.slice(customerReplyBefore).filter(value => value.touser === 'customer-A').map(value => value.text?.content ?? '').join('\n')
+  assert.match(customerReply, /您好/)
+  assert.doesNotMatch(customerReply, /现在的班底|model ids|Group chats: none you can see|STAFF_CONTEXT_SENTINEL_73C9|Error: This tool is not available|附件没读成/)
+  const firstCustomerTask = (await state()).bots[chief.id].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
+  assert.ok(firstCustomerTask)
+  const customerModelCalls = (await calls()).filter(call => call.session === firstCustomerTask.sessionId)
+  const assertPrivateCustomerCalls = modelCalls => {
+    assert.ok(modelCalls.length > 0)
+    for (const call of modelCalls) {
+      assert.equal(call.customerPrompt, true)
+      const request = JSON.stringify(call.customerRequest)
+      assert.ok(call.customerRequest)
+      assert.doesNotMatch(request, /STAFF_CONTEXT_SENTINEL_73C9|deepseek-v4-pro|Chief|Quote|model ids|Group chats: none you can see|<system-reminder>|Instructions from: AGENTS\.md|# AGENTS\.md|coding agent|Current runtime context|available_skills|Current working directory/)
+      assert.deepEqual([...(call.toolNames ?? [])].sort(), ['ask_user', 'message_bot', 'triage_cases'])
+    }
+  }
+  const assertNoCustomerFileReads = modelCalls => {
+    assert.ok(modelCalls.every(call => !call.out?.some(block => block.type === 'tool_use' && ['read', 'read_file', 'read_image'].includes(block.name))))
+  }
+  assert.ok(customerModelCalls.length > 0)
+  assert.ok(customerModelCalls.every(call => call.watchHit !== true && call.customerPrompt === true
+    && call.staffIdentity !== true && call.teamRules !== true && call.memorySection !== true
+    && !call.toolNames?.includes('list_bots')))
+  assertPrivateCustomerCalls(customerModelCalls)
+  assert.ok(customerModelCalls.some(call => call.out?.some(block => block.type === 'tool_use' && block.name === 'list_bots')))
+  assert.ok(customerModelCalls.some(call => JSON.stringify(call.customerRequest).includes('Error: This tool is not available in customer conversations.')))
+  assertNoCustomerFileReads(customerModelCalls)
+  const rosterTranscript = await api('customer-page', { sessionId: firstCustomerTask.sessionId })
+  assert.ok(JSON.stringify(rosterTranscript).includes(customerReply))
+  console.log('PASS customer WeCom reply contains no roster or staff-context sentinel')
+  await settle()
+  const stepReplyBefore = sent.length
   message('customer-A', '客户A：请核对支架图纸并报价 A_ONLY_CONTEXT_234')
   message('customer-A', '', true)
-  await until(async () => mediaReads > 0 && (await calls()).some(call => call.last?.includes('Test bracket')), 'STEP facts reach model')
+  await until(async () => mediaReads > 0 && (await calls()).some(call => call.last?.includes('Test bracket'))
+    && sent.slice(stepReplyBefore).some(value => value.touser === 'customer-A' && value.text?.content?.includes('CARTESIAN_POINT bounding box')), 'STEP facts acknowledged')
   await settle()
-  const a = (await state()).bots[chief.id].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
+  let a = (await state()).bots[chief.id].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
   assert.ok(a)
   assert.equal((await state()).bots[chief.id].sessionId ?? chief.id, foreground)
-  assert.ok((await calls()).some(call => call.session === a.sessionId && call.last?.includes('SI_UNIT(.MILLI.,.METRE.)')))
+  const stepCalls = (await calls()).filter(call => call.session === a.sessionId && call.last?.includes('Test bracket'))
+  assertPrivateCustomerCalls(stepCalls)
+  assertNoCustomerFileReads(stepCalls)
+  const stepRequest = JSON.stringify(stepCalls.map(call => call.customerRequest))
+  assert.ok(stepRequest.includes('Products: Test bracket'))
+  assert.ok(stepRequest.includes('Length unit: SI_UNIT(.MILLI.,.METRE.)'))
+  assert.ok(stepRequest.includes('CARTESIAN_POINT bounding box in file units: [-1, 2, 3] to [10, 20, 30]'))
+  const stepAcknowledgement = sent.slice(stepReplyBefore).filter(value => value.touser === 'customer-A').map(value => value.text?.content ?? '').join('\n')
+  assert.ok(stepAcknowledgement.includes('Products: Test bracket'))
+  assert.ok(stepAcknowledgement.includes('Length unit: SI_UNIT(.MILLI.,.METRE.)'))
+  assert.ok(stepAcknowledgement.includes('CARTESIAN_POINT bounding box in file units: [-1, 2, 3] to [10, 20, 30]'))
+  assert.doesNotMatch(stepAcknowledgement, /Error: This tool is not available|附件没读成/)
   passed('A has a background thread and real STEP media facts reach the mock model')
+  const oldCustomerSession = a.sessionId
+  message('customer-A', '撑爆')
+  await until(async () => {
+    const task = (await state()).bots[chief.id].tasks.find(item => item.origin === 'customer' && item.customer?.chatKey === 'customer-A')
+    return task !== undefined && task.sessionId !== oldCustomerSession
+  }, 'customer A true context rollover')
+  await settle()
+  a = (await state()).bots[chief.id].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
+  assert.equal(a.segments.filter(segment => segment.sessionId === oldCustomerSession).length, 1)
+  assert.equal(a.segments.length, 1)
+  assert.notEqual(a.sessionId, oldCustomerSession)
+  passed('A rollover keeps exactly one historical segment for the prior customer session')
   message('customer-B', '客户B：订单现在到哪一步 B_ONLY_CONTEXT_875')
   const beforeB = sent.length
   try {
@@ -160,10 +227,46 @@ try {
   passed('B is isolated, replies address the correct external user and foreground stays unchanged')
   await staff(foreground, { action: 'judges', models: models.slice(0, 2).map(model => model.ref) })
   await staff(foreground, { action: 'types', type_action: 'edit', type: 'quote', target: 'Quote' })
-  await customer({ action: 'vote', summary: 'AGREE_CASE：支架报价', routes: ['quote', 'order_status'] })
-  assert.ok((await calls()).some(call => call.last?.includes('E2E_ROUTED_CASE') && call.session !== a.sessionId))
-  passed('two agreeing mock judges route through the real message_bot delivery')
-  const replies = await customer({ action: 'vote', summary: 'DISAGREE：客户需要确认责任归属', routes: ['quote', 'order_status'] })
+  const routeAStart = sent.length
+  await customer('customer-A', { action: 'vote', summary: 'AGREE_CASE：支架报价 A_ONLY_CONTEXT_234', routes: ['quote', 'order_status'] })
+  await until(() => sent.slice(routeAStart).some(value => value.touser === 'customer-A' && value.text?.content?.includes('报价专员已核对您的需求')), 'A specialist reply sent to WeCom')
+  await settle()
+  const specialistA = (await state()).bots[quoteId].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
+  assert.ok(specialistA)
+  assert.notEqual(specialistA.sessionId, quoteSession)
+  const specialistCallsA = (await calls()).filter(call => call.session === specialistA.sessionId)
+  assert.ok(specialistCallsA.length > 0)
+  assert.ok(specialistCallsA.every(call => call.watchHit !== true && call.customerPrompt === true
+    && call.staffIdentity !== true && call.teamRules !== true && call.memorySection !== true))
+  assertPrivateCustomerCalls(specialistCallsA)
+  assert.ok(sent.slice(routeAStart).every(value => value.touser === 'customer-A'))
+  assert.match(sent.slice(routeAStart).map(value => value.text?.content ?? '').join('\n'), /报价专员已核对您的需求/)
+  const customerAAfterRoute = (await calls()).filter(call => call.session === a.sessionId && call.customerPrompt === true)
+  assertPrivateCustomerCalls(customerAAfterRoute)
+  assertNoCustomerFileReads(customerAAfterRoute)
+  assert.ok(customerAAfterRoute.some(call => JSON.stringify(call.customerRequest).includes('[Reply from Customer support]')))
+  const routeBStart = sent.length
+  await customer('customer-B', { action: 'vote', summary: 'AGREE_CASE：订单查询 B_ONLY_CONTEXT_875', routes: ['quote', 'order_status'] })
+  await until(() => sent.slice(routeBStart).some(value => value.touser === 'customer-B' && value.text?.content?.includes('报价专员已核对您的需求')), 'B specialist reply sent to WeCom')
+  await settle()
+  const specialistB = (await state()).bots[quoteId].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-B')
+  assert.ok(specialistB && specialistB.sessionId !== specialistA.sessionId)
+  const specialistCallsB = (await calls()).filter(call => call.session === specialistB.sessionId)
+  assert.ok(specialistCallsB.length > 0)
+  assert.ok(specialistCallsB.every(call => call.watchHit !== true && call.customerPrompt === true
+    && call.staffIdentity !== true && call.teamRules !== true && call.memorySection !== true))
+  assertPrivateCustomerCalls(specialistCallsB)
+  assert.ok(sent.slice(routeBStart).every(value => value.touser === 'customer-B'))
+  assert.match(sent.slice(routeBStart).map(value => value.text?.content ?? '').join('\n'), /报价专员已核对您的需求/)
+  const customerBAfterRoute = (await calls()).filter(call => call.session === b.sessionId && call.customerPrompt === true)
+  assertPrivateCustomerCalls(customerBAfterRoute)
+  assertNoCustomerFileReads(customerBAfterRoute)
+  assert.ok(customerBAfterRoute.some(call => JSON.stringify(call.customerRequest).includes('[Reply from Customer support]')))
+  const allCustomerCalls = (await calls()).filter(call => call.customerPrompt === true)
+  assertPrivateCustomerCalls(allCustomerCalls)
+  assertNoCustomerFileReads(allCustomerCalls)
+  passed('A and B route to separate specialist customer tasks and each reply reaches only its original WeCom user')
+  const replies = await customer('customer-A', { action: 'vote', summary: 'DISAGREE：客户需要确认责任归属', routes: ['quote', 'order_status'] })
   const handoff = (await state()).questions[foreground]
   assert.ok(handoff?.id.startsWith('triage-'))
   assert.equal((await state()).questions[a.sessionId], undefined)
@@ -173,22 +276,22 @@ try {
   assert.ok(handoff.detail.includes('Customer conversation'))
   assert.doesNotMatch(handoff.detail, /customer_session_id|candidate_destinations|\{"case"/)
   assert.ok(replies.some(value => value.touser === 'customer-A' && /您好.*专人/.test(value.text?.content)))
-  const quoteId = quote.id ?? Object.values((await state()).bots).find(bot => bot.name === 'Quote').id
   await staff(quoteId, { action: 'review' })
-  assert.ok((await calls()).some(call => call.last?.includes('"status":"pending"') && call.last.includes('DISAGREE')))
+  assert.ok((await calls()).some(call => call.triageToolResults?.some(result => result.includes('"status":"pending"') && result.includes('DISAGREE'))))
   passed('disagreement creates a main-chat handoff, sends a Chinese holding reply and appears in review')
   for (const args of [
     { action: 'rules', rule_action: 'add', text: 'INJECTED_RULE' },
     { action: 'outcome', id: 'forbidden', result: 'resolved' },
     { action: 'types', type_action: 'edit', type: 'quote', target: 'INJECTED_TARGET' },
   ]) {
-    const denied = await customer(args)
+    const denied = await customer('customer-A', args)
     assert.ok(denied.some(value => /outside customer conversations/.test(value.text?.content)))
   }
   passed('real customer turns cannot add rules, write outcomes or edit types')
   const before = await readFile(join(home, 'bot', 'state.json'), 'utf8')
   const page = await api('customer-page', { sessionId: a.sessionId })
   assert.ok(JSON.stringify(page).includes('A_ONLY_CONTEXT_234'))
+  assert.ok(JSON.stringify(page).includes('报价专员已核对您的需求'))
   assert.equal(await readFile(join(home, 'bot', 'state.json'), 'utf8'), before)
   assert.equal((await state()).bots[chief.id].sessionId ?? chief.id, foreground)
   passed('staff read-only customer page returns A transcript without writes or foreground changes')
