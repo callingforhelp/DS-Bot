@@ -132,7 +132,7 @@ export function triageBank(home, writable = () => {}, rt) {
     writable()
     await replaceFile(temp, path, writable)
   }
-  const writeCases = async (cases, retained, rules = []) => {
+  const writeCases = async (cases, retained, rules) => {
     for (const entry of cases) {
       if (entry.misroute !== undefined) entry.misroute = misrouteDetails(entry.misroute)
     }
@@ -256,7 +256,7 @@ export function triageBank(home, writable = () => {}, rt) {
           }))
           retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', ...(customerSource ? { customer_source: customerSource } : {}), ...(result.delivery ? { delivery: result.delivery } : {}), handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes, candidates, ...(result.required_judges ? { required_judges: result.required_judges } : {}) } }
           cases.push(retained)
-          await writeCases(cases, retained)
+          await writeCases(cases, retained, state.rules)
           hasPending = true
           if (!customerSession) result.case_id = retained.id
           result.instructions = result.required_judges

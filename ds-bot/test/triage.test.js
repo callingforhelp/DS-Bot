@@ -317,6 +317,37 @@ test('case eviction never discards pending human handoffs and fails closed when 
   assert.equal(saved.at(-1).id, result.id)
 })
 
+test('vote can record a handoff at capacity by evicting cases with published lessons', async (t) => {
+  const s = await votingBank(t)
+  const cases = Array.from({ length: 2000 }, (_, index) => ({
+    id: `published-${index}`, created: index + 1, summary: 'previous case',
+    outcome: { result: 'resolved', at: index + 1, lesson: `lesson ${index}` },
+  }))
+  const rules = cases.map(entry => ({
+    id: `rule-${entry.id}`, text: `Sanitized ${entry.id}`, from_case: entry.id,
+    created: entry.outcome.at, hits: 0,
+  }))
+  const dir = join(s.home, 'triage')
+  await mkdir(dir)
+  const path = join(dir, 'cases.jsonl')
+  await writeFile(path, cases.map(entry => JSON.stringify(entry)).join('\n') + '\n')
+  await writeFile(join(dir, 'rules.json'), JSON.stringify({ rules, reviewed: 0 }))
+  await s.call({ action: 'judges', models: ['p/one', 'p/two'] })
+  s.replies([
+    { route: 'quote', confidence: 0.9, reason: 'quote' },
+    { route: 'drawing_review', confidence: 0.9, reason: 'drawing' },
+  ])
+
+  const result = await s.call({ action: 'vote', summary: 'new customer request', routes: ['quote', 'drawing_review'] })
+
+  assert.equal(result.decision, 'handoff')
+  const saved = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.equal(saved.length, 2000)
+  assert.equal(saved.some(entry => entry.id === 'published-0'), false)
+  assert.equal(saved.at(-1).id, result.case_id)
+  assert.equal(saved.at(-1).handoff.status, 'pending')
+})
+
 test('triage ranks Chinese cases, publishes sanitized rules and reviews once', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ds-triage-'))
   const bank = triageBank(dir)
