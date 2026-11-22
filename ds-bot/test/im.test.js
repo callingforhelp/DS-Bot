@@ -982,7 +982,8 @@ test('customer triage handoffs queue in the main chat and advance after answers 
   assert.match(card.detail, /Customer conversation/)
   assert.ok(card.detail.includes(`#${reference}`))
   assert.doesNotMatch(card.detail, /Consensus confidence/)
-  assert.match(card.detail, /No consensus\. Valid votes: 2\/2; quorum: 2/)
+  assert.match(card.detail, /No consensus\. The judges selected different routes\./)
+  assert.match(card.detail, /Valid votes: 2\/2; quorum: 2/)
   assert.doesNotMatch(card.detail, /customer_session_id|bot_id|candidate_destinations|\{"case"/)
   assert.equal(s.rt.state.questions[customer], undefined)
   s.rt.closeCard('a', card, 'dismissed')
@@ -1020,7 +1021,7 @@ test('handoff waits for the valid-vote quorum before attributing an empty target
   await s.rt.syncTriageHandoffs()
   const detail = s.rt.state.questions.a.detail
   assert.match(detail, /Insufficient valid votes: 1 of 2; 2 required/)
-  assert.match(detail, /No consensus\. Valid votes: 1\/2; quorum: 2/)
+  assert.match(detail, /Valid votes: 1\/2; quorum: 2/)
   assert.doesNotMatch(detail, /agreed on quote, but no destination|Consensus confidence/)
 })
 
