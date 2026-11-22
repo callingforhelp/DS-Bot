@@ -1,0 +1,15 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('Original triage test part'),'2;1');
+FILE_NAME('triage-part.step','2026-11-22',('DS Bot'),('DS Bot'),'','','');
+FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));
+ENDSEC;
+DATA;
+#1=PRODUCT('part-1','Test bracket','',());
+#2=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));
+#3=CARTESIAN_POINT('',(-1.,2.,3.));
+#4=CARTESIAN_POINT('',(10.,20.,30.));
+#5=CYLINDRICAL_SURFACE('',#6,2.);
+#6=ADVANCED_FACE('',(),#5,.T.);
+ENDSEC;
+END-ISO-10303-21;

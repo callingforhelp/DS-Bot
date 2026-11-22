@@ -28663,6 +28663,18 @@ function BtwTurnTail({ turn, sessionId, useRoster, actions }) {
 // src/shared/im-platforms.js
 var IM_PLATFORMS = [
   {
+    id: "wecom_kf",
+    name: "WeCom Customer Service",
+    fields: [
+      { key: "corpId", label: "Corporation ID" },
+      { key: "secret", label: "Secret", secret: true },
+      { key: "openKfId", label: "Customer service account ID (optional)", optional: true }
+    ],
+    public: true,
+    buttons: false,
+    groups: false
+  },
+  {
     id: "telegram",
     name: "Telegram",
     fields: [{ key: "token", label: "Bot token", secret: true }],
@@ -35881,7 +35893,7 @@ function AddView({ platform, roster, actions, onBack }) {
   const [busy, setBusy] = (0, import_react45.useState)(false);
   const [error, setError] = (0, import_react45.useState)(null);
   const set = (key, value) => setFields((current2) => ({ ...current2, [key]: value }));
-  const missing = shown.fields.some((field) => !field.options && String(fields[field.key] ?? "").trim() === "");
+  const missing = shown.fields.some((field) => !field.options && !field.optional && String(fields[field.key] ?? "").trim() === "");
   const add = () => {
     if (busy || botId === "" || missing) return;
     setBusy(true);

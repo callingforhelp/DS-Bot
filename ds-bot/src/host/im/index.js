@@ -10,6 +10,7 @@ import { viewCardText } from '../parts.js'
 import { imPlatform, IM_PLATFORMS } from '../../shared/im-platforms.js'
 import { REPLY_KIND, SOURCE_KIND } from '../constants.js'
 import { adapters } from './platforms/index.js'
+import { summarizeStep } from './step.js'
 
 const RECONCILE_MS = 15_000
 const RUNTIME_SAVE_MS = 400
@@ -445,7 +446,7 @@ export function install(rt) {
   // working, so its origin lives until another source writes in the group or the user
   // is unpaired. A request lives until the message it names is admitted, however long
   // that message waits in the queue behind a busy Bot.
-  const paired = (conn, senderId) => (conn.paired ?? []).some(entry => entry.id === senderId)
+  const paired = (conn, senderId) => imPlatform(conn.platform)?.public === true || (conn.paired ?? []).some(entry => entry.id === senderId)
   // Session id → the chat its running turn came from.
   const origins = new Map()
   const mixed = new Set()
@@ -785,12 +786,12 @@ export function install(rt) {
     const body = String(msg.text ?? '').trim()
     const chat = conn.chats[msg.chat.key]
     const target = resolveTarget(conn, chat)
-    if (/^\/start(?:@\S+)?\s*$/.test(body)) {
+    if (imPlatform(conn.platform)?.public !== true && /^\/start(?:@\S+)?\s*$/.test(body)) {
       const name = target === undefined ? undefined : targetName(conn, target)
       await sendText(conn, msg.chat, name === undefined ? text(msg.chat.kind === 'group' ? 'unboundGroup' : 'unbound') : text('greeting', { name }))
       return
     }
-    if (/^\/stop(?:@\S+)?\s*$/.test(body)) {
+    if (imPlatform(conn.platform)?.public !== true && /^\/stop(?:@\S+)?\s*$/.test(body)) {
       if (target === undefined) {
         await sendText(conn, msg.chat, text(msg.chat.kind === 'group' ? 'unboundGroup' : 'unbound'))
         return
@@ -799,7 +800,7 @@ export function install(rt) {
       await sendText(conn, msg.chat, text(stopped ? 'stopped' : 'idle'))
       return
     }
-    if (NUMBERS.test(body)) {
+    if (imPlatform(conn.platform)?.public !== true && NUMBERS.test(body)) {
       const picked = body.trim().split(/\s+/).map(Number)
       const held = newestOpenCard(conn, msg.chat.key)
       // Anything that does not clearly answer the newest open card — a stale
@@ -847,6 +848,8 @@ export function install(rt) {
     for (const image of msg.images ?? []) content.push({ type: 'image', mediaType: image.mediaType, data: image.data })
     const env = await envFor(conn)
     for (const file of msg.files ?? []) {
+      const summary = summarizeStep(file.name, file.data)
+      if (summary) content.push({ type: 'text', text: summary })
       try {
         const receiptId = await env.uploadFile(uploadTo, file)
         content.push({ type: 'file', receiptId })
@@ -875,6 +878,7 @@ export function install(rt) {
   }
 
   const onAction = (conn) => async (action) => {
+    if (imPlatform(conn.platform)?.public === true) return
     if (!paired(conn, action.sender.id)) return
     const data = String(action.data ?? '')
     const chat = { key: action.chat.key, kind: action.chat.kind, title: action.chat.title }
@@ -1251,7 +1255,7 @@ export function install(rt) {
       if (platform.login === 'qr') throw new Error('This platform signs in by scanning a code; not available yet')
       const fields = cleanFields(platform, body.fields)
       for (const field of platform.fields) {
-        if (!field.options && (fields[field.key] === undefined || String(fields[field.key]).trim() === '')) throw new Error(`${field.label} is required`)
+        if (!field.options && !field.optional && (fields[field.key] === undefined || String(fields[field.key]).trim() === '')) throw new Error(`${field.label} is required`)
       }
       const env = await envFor({ id: 'im_check', platform: platform.id, settings: fields, secrets: {} }, { get: () => ({}), set: () => {} })
       const { account } = await checkAccount(platform, fields, env)
@@ -1548,6 +1552,7 @@ export function install(rt) {
         const sessionId = data.roomId !== undefined ? (rt.roomOf(data.roomId)?.sessionId ?? data.roomId) : chatOfBot(data.botId)
         const origin = originOf(sessionId)
         if (origin === undefined) return
+        if (imPlatform(origin.conn.platform)?.public === true) return
         const bot = rt.botOf(data.botId)
         const buttons = imPlatform(origin.conn.platform)?.buttons === true ? cardButtons.approval(data.id) : undefined
         await sendCard(origin.conn, `a:${data.id}`, [{ chatKey: origin.chatKey, chat: origin.chat }], cardText.approval(bot?.name ?? '?', data), buttons)

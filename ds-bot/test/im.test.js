@@ -127,6 +127,23 @@ const gm = (s, senderId, text, { mentioned = true, chat = { key: 'g1', kind: 'gr
   chat, sender: { id: senderId, name: `User ${senderId}` }, text, mentioned, ...extra,
 })
 
+test('public customer platforms admit strangers but refuse control commands and card answers', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'stranger', '你好')
+  assert.equal(s.prompts.length, 1)
+  assert.deepEqual(s.rt.state.im.connections[conn.id].paired, [])
+  await dm(s, 'stranger', '/stop')
+  assert.equal(s.agentOf('a').cancelled, undefined)
+  assert.equal(s.prompts.length, 2)
+  s.rt.state.questions.a = { id: 'q-public', question: 'Pick', options: [{ label: 'yes' }] }
+  await dm(s, 'stranger', '1')
+  await s.fake.handlers.onAction({ chat: { key: 'dm-stranger', kind: 'direct' }, sender: { id: 'stranger' }, data: 'q:q-public:0' })
+  assert.ok(s.rt.state.questions.a)
+  assert.equal(s.prompts.length, 3)
+})
+
 test('two concurrent syncs start exactly one adapter', async (t) => {
   const s = await start()
   t.after(s.stop)
