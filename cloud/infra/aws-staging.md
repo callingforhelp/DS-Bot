@@ -73,7 +73,11 @@ Command output; read it in an interactive Session Manager shell.
 
 ## Planned, not deployed
 
-- **Off-host backup of DS Bot `/data`**: designed only; see RISKS.md R11 and R37.
+- **Off-host backup of DS Bot `/data`** on the instance: designed only; see RISKS.md R11 and R37.
+
+The Mac side is covered separately: `scripts/backup-mac.mjs` backs up `~/.ds-bot`, the lineage archive and the
+git-ignored `*.local.md` notes, encrypted, off the Mac (RISKS.md R49, R50). The real IDs in this file's local twin are
+also recoverable from the `Project=ds-bot-cloud-mvp` tag query above.
 
 ## Teardown (in this order)
 
