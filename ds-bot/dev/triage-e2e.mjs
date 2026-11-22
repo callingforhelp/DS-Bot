@@ -293,8 +293,13 @@ try {
   const answerStart = sent.length
   const primaryCallsBeforeAnswer = (await calls()).filter(call => call.session === a.sessionId).length
   message('customer-A', '型号甲')
-  await until(async () => sent.slice(answerStart).some(value => value.touser === 'customer-A' && value.text?.content?.includes('已确认型号甲')),
-    'specialist answer returned through primary')
+  await until(async () => {
+    const primaryForwarded = (await calls()).some(call => call.session === a.sessionId
+      && call.last?.includes('[Reply from Customer support]')
+      && call.out?.some(block => block.type === 'text' && block.text.includes('已确认型号甲')))
+    return sent.slice(answerStart).some(value => value.touser === 'customer-A' && value.text?.content?.includes('已确认型号甲'))
+      && primaryForwarded
+  }, 'specialist answer returned through primary')
   await settle()
   const answerMessages = sent.slice(answerStart)
   assert.equal(answerMessages.filter(value => value.touser === 'customer-A' && value.text?.content?.includes('已确认型号甲')).length, 1)
@@ -309,6 +314,9 @@ try {
   assert.equal(answeredState.questions[specialistClarificationTask.sessionId], undefined)
   assert.equal(answeredState.questions[a.sessionId], undefined)
   const answerCalls = (await calls()).filter(call => call.session === a.sessionId).slice(primaryCallsBeforeAnswer)
+  assert.ok(answerCalls.some(call => call.last?.includes('[Reply from Customer support]')
+    && call.out?.some(block => block.type === 'text' && block.text.includes('已确认型号甲'))),
+  'primary receives the specialist reply and returns its acknowledgement')
   assert.ok(answerCalls.some(call => call.out?.some(block => block.type === 'tool_use' && block.name === 'triage_cases'
     && block.input?.action === 'vote' && block.input.summary?.includes('型号甲'))), 'primary obtains a new vote for the customer answer')
   assert.ok(answerCalls.some(call => call.triageToolResults?.some(result => result.includes('"decision":"route"') && result.includes('"route":"quote"'))),
