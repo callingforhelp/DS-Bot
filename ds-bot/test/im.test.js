@@ -1604,7 +1604,7 @@ test('reply origin: unbinding or rebinding the chat stops a running group turn f
   assert.equal(s.fake.sent.length, 0, 'a rebound chat gets no lines from the old target')
 })
 
-test('reply origin: a member result that wakes the group after its relay turn still reaches the chat', async (t) => {
+test('reply origin: context before a member result that wakes the group preserves its chat', async (t) => {
   const s = await start()
   t.after(s.stop)
   const { one } = await pairedConn(s)
@@ -1619,6 +1619,9 @@ test('reply origin: a member result that wakes the group after its relay turn st
   // the group's own Session and starts a turn for it. The turn starts (and looks idle)
   // before its user/message arrives, which must not clear the chat that asked.
   s.emitEvent('r1', 'turn/start', { turn: 2 })
+  s.emitEvent('r1', 'user/message', {
+    source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'context for the turn' }],
+  })
   s.emitEvent('r1', 'user/message', {
     source: { kind: 'bot', form: 'relay', role: 'post', exchangeId: 'e2', senderName: 'Writer', senderSessionId: 'b', roomId: 'r1' },
     content: [{ type: 'text', text: '[Group post from Writer]\nlast result' }],

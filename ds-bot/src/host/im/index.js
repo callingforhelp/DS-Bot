@@ -1380,9 +1380,10 @@ export function install(rt) {
       const source = event.data?.source
       const imOrigin = source?.imOrigin
       const rpcId = source?.rpcId
+      const context = turnContext.has(source?.kind)
       // A late member result or part-switch handoff continues the work the chat asked for;
       // any other first message starts a fresh turn, which clears the previous turn's origin.
-      if (pendingReset.delete(session.id) && !(typeof imOrigin === 'string' || (source?.kind === SOURCE_KIND && source.role === 'post'))) resetOrigin(session.id)
+      if (!context && pendingReset.delete(session.id) && !(typeof imOrigin === 'string' || (source?.kind === SOURCE_KIND && source.role === 'post'))) resetOrigin(session.id)
       if (typeof imOrigin === 'string') {
         const resumed = resumedOrigins.get(imOrigin)
         resumedOrigins.delete(imOrigin)
@@ -1402,7 +1403,7 @@ export function install(rt) {
       } else if (source?.kind === SOURCE_KIND && source.role === 'post') {
         // A member's late result relayed into the group's own Session. The group's work
         // is still the answer to the chat that asked, wherever the member runs.
-      } else if (turnContext.has(source?.kind)) {
+      } else if (context) {
         // Harness adds these context messages to the same turn; they are not a new source.
       } else {
         // A message from the Web UI, a peer Bot or a scheduled task: this turn is not an
