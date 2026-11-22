@@ -199,9 +199,13 @@ class BrokerStore:
             self.conn.commit()
 
     def enqueue_job(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        target = str(payload.get("target") or "paradev").strip()
-        if target not in ("paradev", "dsbot", "shell", "paradev_register", "git_sync"):
-            raise ValueError("target must be one of: paradev, dsbot, shell, paradev_register, git_sync")
+        target = str(payload.get("target") or "dsbot").strip()
+        if target in ("paradev", "paradev_register"):
+            raise ValueError(
+                "ParaDev has been removed; use target='dsbot' (default) with optional bot/group, or target='git_sync'."
+            )
+        if target not in ("dsbot", "git_sync"):
+            raise ValueError("target must be one of: dsbot, git_sync")
         task = str(payload.get("task") or "").strip()
         if not task:
             raise ValueError("task is required")
@@ -408,15 +412,6 @@ class BrokerStore:
         agent = str(payload.get("agent") or "").strip() or None
         worktree_path = str(payload.get("worktree_path") or "").strip() or None
 
-        # Fallback: parse [paradev workspace_id=... terminal_id=...] trailer
-        trailer = re.search(r"\[paradev ([^\]]+)\]", raw_summary)
-        if trailer:
-            kv = dict(re.findall(r"(\w+)=(\S+)", trailer.group(1)))
-            workspace_id = workspace_id or str(kv.get("workspace_id") or "").strip() or None
-            terminal_id = terminal_id or str(kv.get("terminal_id") or "").strip() or None
-            role = role or str(kv.get("role") or "").strip().lower() or None
-            agent = agent or str(kv.get("agent") or "").strip() or None
-
         with self._lock, self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             row = self.conn.execute(
@@ -425,8 +420,6 @@ class BrokerStore:
             if row is None:
                 return False, None
             if row["status"] in ("succeeded", "failed") and row["worker_id"] == worker_id:
-                # The first completion owns the registry update. Legacy jobs may
-                # only have a timestamp from a later delivery attempt.
                 return True, self._row_to_dict(row)
             if row["status"] not in ("running", "lease_lost") or (
                 row["worker_id"] and row["worker_id"] != worker_id
@@ -469,102 +462,7 @@ class BrokerStore:
             updated = self.conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
-            if updated is not None:
-                self._record_paradev_session(
-                    updated, workspace_id, terminal_id, role, agent, worktree_path,
-                    job_id, now,
-                )
         return True, self._row_to_dict(updated)
-
-    def _record_paradev_session(
-        self,
-        job: sqlite3.Row,
-        workspace_id: Optional[str],
-        terminal_id: Optional[str],
-        role: Optional[str],
-        agent: Optional[str],
-        worktree_path: Optional[str],
-        job_id: str,
-        now: float,
-    ) -> None:
-        """Upsert paradev_sessions from a finished job. Caller must hold self._lock."""
-        eff_ws = workspace_id or job["workspace_id"]
-        if not eff_ws or eff_ws == "local":
-            return
-        eff_repo = job["repo"]
-        eff_cwd = job["cwd"]
-        eff_branch = job["branch"]
-        eff_role = role or job["role"] or "worker"
-        eff_terminal = terminal_id or job["terminal_id"]
-        eff_agent = agent or job["agent"]
-        eff_worktree = worktree_path or job["worktree_path"]
-        existing = self.conn.execute(
-            """
-            SELECT session_key, repo, cwd, branch
-            FROM paradev_sessions
-            WHERE workspace_id = ?
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (eff_ws,),
-        ).fetchone()
-        if existing is not None:
-            session_key = existing["session_key"]
-            eff_repo = eff_repo or existing["repo"]
-            eff_cwd = eff_cwd or existing["cwd"]
-            eff_branch = eff_branch or existing["branch"]
-        else:
-            session_key = f"{eff_repo or eff_cwd or eff_ws}:{eff_branch or 'default'}"
-        if eff_terminal == "dsbot-headless":
-            eff_terminal = None
-        worker_tid = eff_terminal if eff_role != "reviewer" else None
-        reviewer_tid = eff_terminal if eff_role == "reviewer" else None
-        self.conn.execute(
-            """
-            INSERT INTO paradev_sessions (
-                session_key, repo, cwd, branch, workspace_id,
-                worktree_path, worker_terminal_id, reviewer_terminal_id,
-                agent, last_job_id, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(session_key) DO UPDATE SET
-                repo = COALESCE(excluded.repo, paradev_sessions.repo),
-                cwd = COALESCE(excluded.cwd, paradev_sessions.cwd),
-                branch = COALESCE(excluded.branch, paradev_sessions.branch),
-                workspace_id = excluded.workspace_id,
-                worktree_path = CASE
-                    WHEN paradev_sessions.workspace_id = excluded.workspace_id
-                    THEN COALESCE(excluded.worktree_path, paradev_sessions.worktree_path)
-                    ELSE excluded.worktree_path
-                END,
-                worker_terminal_id = CASE
-                    WHEN paradev_sessions.workspace_id = excluded.workspace_id
-                    THEN COALESCE(excluded.worker_terminal_id, paradev_sessions.worker_terminal_id)
-                    ELSE excluded.worker_terminal_id
-                END,
-                reviewer_terminal_id = CASE
-                    WHEN paradev_sessions.workspace_id = excluded.workspace_id
-                    THEN COALESCE(excluded.reviewer_terminal_id, paradev_sessions.reviewer_terminal_id)
-                    ELSE excluded.reviewer_terminal_id
-                END,
-                agent = COALESCE(excluded.agent, paradev_sessions.agent),
-                last_job_id = excluded.last_job_id,
-                updated_at = excluded.updated_at
-            WHERE excluded.updated_at >= paradev_sessions.updated_at
-            """,
-            (
-                session_key,
-                eff_repo,
-                eff_cwd,
-                eff_branch,
-                eff_ws,
-                eff_worktree,
-                worker_tid,
-                reviewer_tid,
-                eff_agent,
-                job_id,
-                now,
-            ),
-        )
 
     def reconcile_worker(
         self, worker_id: str, hostname: str = "", capabilities: Optional[list[str]] = None
@@ -656,15 +554,6 @@ class BrokerStore:
                 "SELECT status, COUNT(*) AS cnt FROM jobs GROUP BY status"
             ).fetchall()
         return {r["status"]: r["cnt"] for r in rows}
-
-    def list_paradev_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 200))
-        with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM paradev_sessions ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [dict(r) for r in rows]
 
     def _decision_to_dict(self, row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:
         if row is None:
@@ -1056,16 +945,6 @@ def make_handler(
                     return
                 online, _ = store.is_mac_online()
                 self._send_json(200, {"ok": True, "mac_online": online, "job": job})
-                return
-
-            if path == "/v1/paradev/sessions":
-                if not self._check_auth(producer_token, worker_token):
-                    return
-                limit = int((qs.get("limit") or ["20"])[0])
-                self._send_json(
-                    200,
-                    {"ok": True, "sessions": store.list_paradev_sessions(limit=limit)},
-                )
                 return
 
             if path == "/v1/decisions":

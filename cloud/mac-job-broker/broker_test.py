@@ -2,7 +2,6 @@
 import http.client
 import json
 import os
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -71,7 +70,6 @@ class BrokerTest(unittest.TestCase):
             "POST",
             "/v1/jobs",
             {
-                "target": "paradev",
                 "task": "build mac app",
                 "aws_session_id": "s1",
                 "idempotency_key": "idem-1",
@@ -80,6 +78,7 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(st, 201)
         self.assertFalse(data["mac_online"])
+        self.assertEqual(data["job"]["target"], "dsbot")
         job_id = data["job"]["job_id"]
 
         # Idempotent duplicate returns 200 with same job_id
@@ -87,7 +86,6 @@ class BrokerTest(unittest.TestCase):
             "POST",
             "/v1/jobs",
             {
-                "target": "paradev",
                 "task": "build mac app",
                 "aws_session_id": "s1",
                 "idempotency_key": "idem-1",
@@ -145,7 +143,7 @@ class BrokerTest(unittest.TestCase):
 
     def test_sweep_lease_lost(self) -> None:
         job, _ = self.store.enqueue_job(
-            {"target": "paradev", "task": "t", "aws_session_id": "s1"}
+            {"target": "dsbot", "task": "t", "aws_session_id": "s1"}
         )
         claimed = self.store.claim_next_job("mac-1", lease_ttl_sec=-5)
         self.assertIsNotNone(claimed)
@@ -250,35 +248,30 @@ class BrokerTest(unittest.TestCase):
             "POST",
             "/v1/jobs",
             {
-                "target": "paradev",
-                "task": "follow up in existing workspace",
+                "task": "follow up on local task",
                 "aws_session_id": "s1",
-                "workspace_id": "ws-abc123",
-                "terminal_id": "term-9",
-                "agent": "devin",
                 "cwd": "/Users/chief/projects/local-app",
                 "local_only": True,
+                "bot": "Chief",
             },
             token="prod-secret",
         )
         self.assertEqual(st, 201)
         job = data["job"]
-        self.assertEqual(job["workspace_id"], "ws-abc123")
-        self.assertEqual(job["terminal_id"], "term-9")
-        self.assertEqual(job["agent"], "devin")
+        self.assertEqual(job["target"], "dsbot")
         self.assertEqual(job["cwd"], "/Users/chief/projects/local-app")
         self.assertIs(job["local_only"], True)
+        self.assertEqual(job["bot"], "Chief")
         job_id = job["job_id"]
 
         st, got = self._req("GET", f"/v1/jobs/{job_id}", token="prod-secret")
         self.assertEqual(st, 200)
-        self.assertEqual(got["job"]["workspace_id"], "ws-abc123")
+        self.assertEqual(got["job"]["cwd"], "/Users/chief/projects/local-app")
         self.assertIs(got["job"]["local_only"], True)
 
         st, listed = self._req("GET", "/v1/jobs?limit=5", token="prod-secret")
         self.assertEqual(st, 200)
         self.assertEqual(listed["jobs"][0]["job_id"], job_id)
-        self.assertEqual(listed["jobs"][0]["terminal_id"], "term-9")
 
         st, claim = self._req(
             "POST",
@@ -289,367 +282,34 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(st, 200)
         claimed = claim["job"]
         self.assertEqual(claimed["job_id"], job_id)
-        self.assertEqual(claimed["workspace_id"], "ws-abc123")
-        self.assertEqual(claimed["terminal_id"], "term-9")
-        self.assertEqual(claimed["agent"], "devin")
         self.assertEqual(claimed["cwd"], "/Users/chief/projects/local-app")
         self.assertIs(claimed["local_only"], True)
+        self.assertEqual(claimed["bot"], "Chief")
 
-    def test_paradev_sessions_worker_and_reviewer(self) -> None:
-        st, data = self._req(
+    def test_default_target_dsbot_and_paradev_rejected(self) -> None:
+        st_default, data_default = self._req(
             "POST",
             "/v1/jobs",
-            {
-                "target": "paradev",
-                "task": "implement feature",
-                "aws_session_id": "s1",
-                "repo": "demo-app",
-                "branch": "main",
-            },
+            {"task": "check local mac status", "aws_session_id": "s1"},
             token="prod-secret",
         )
-        self.assertEqual(st, 201)
-        worker_job_id = data["job"]["job_id"]
-        self.assertEqual(data["job"]["role"], "worker")
+        self.assertEqual(st_default, 201)
+        self.assertEqual(data_default["job"]["target"], "dsbot")
 
-        st, claim = self._req(
-            "POST",
-            "/v1/worker/claim",
-            {"worker_id": "mac-1", "hostname": "mini"},
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-        self.assertEqual(claim["job"]["job_id"], worker_job_id)
+        for removed in ("paradev", "paradev_register"):
+            st_bad, err_bad = self._req(
+                "POST",
+                "/v1/jobs",
+                {"target": removed, "task": "legacy", "aws_session_id": "s1"},
+                token="prod-secret",
+            )
+            self.assertEqual(st_bad, 400)
+            self.assertIn("ParaDev has been removed", err_bad.get("error", ""))
 
-        # Worker reports workspace/terminal via [paradev ...] trailer fallback
-        st, done = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": worker_job_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "Done [paradev workspace_id=ws-1 terminal_id=term-worker role=worker agent=codex]",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-        self.assertEqual(done["job"]["workspace_id"], "ws-1")
-        self.assertEqual(done["job"]["terminal_id"], "term-worker")
-
-        st, data = self._req(
-            "POST",
-            "/v1/jobs",
-            {
-                "target": "paradev",
-                "task": "review the change",
-                "aws_session_id": "s1",
-                "repo": "demo-app",
-                "branch": "main",
-                "workspace_id": "ws-1",
-                "role": "reviewer",
-            },
-            token="prod-secret",
-        )
-        self.assertEqual(st, 201)
-        reviewer_job_id = data["job"]["job_id"]
-        self.assertEqual(data["job"]["role"], "reviewer")
-
-        st, claim = self._req(
-            "POST",
-            "/v1/worker/claim",
-            {"worker_id": "mac-1", "hostname": "mini"},
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-        self.assertEqual(claim["job"]["job_id"], reviewer_job_id)
-
-        # Reviewer reports via explicit payload fields
-        st, done = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": reviewer_job_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "Review posted",
-                "workspace_id": "ws-1",
-                "terminal_id": "term-reviewer",
-                "role": "reviewer",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-
-        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
-        self.assertEqual(st, 200)
-        self.assertEqual(len(sessions["sessions"]), 1)
-        sess = sessions["sessions"][0]
-        self.assertEqual(sess["workspace_id"], "ws-1")
-        self.assertEqual(sess["worker_terminal_id"], "term-worker")
-        self.assertEqual(sess["reviewer_terminal_id"], "term-reviewer")
-        self.assertEqual(sess["repo"], "demo-app")
-        self.assertEqual(sess["branch"], "main")
-        self.assertEqual(sess["last_job_id"], reviewer_job_id)
-
-    def test_paradev_session_key_reuse_and_headless_guard(self) -> None:
-        # Job 1: worker enqueued with repo/branch anchors the session
-        st, data = self._req(
-            "POST",
-            "/v1/jobs",
-            {
-                "target": "paradev",
-                "task": "implement feature",
-                "aws_session_id": "s1",
-                "repo": "demo-app",
-                "branch": "main",
-            },
-            token="prod-secret",
-        )
-        self.assertEqual(st, 201)
-        job1_id = data["job"]["job_id"]
-
-        st, claim = self._req(
-            "POST",
-            "/v1/worker/claim",
-            {"worker_id": "mac-1", "hostname": "mini"},
-            token="work-secret",
-        )
-        self.assertEqual(claim["job"]["job_id"], job1_id)
-
-        st, _ = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": job1_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "done",
-                "workspace_id": "ws-1",
-                "terminal_id": "term-w",
-                "role": "worker",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-
-        # Job 2: workspace-only reviewer follow-up must reuse demo-app:main
-        st, data = self._req(
-            "POST",
-            "/v1/jobs",
-            {
-                "target": "paradev",
-                "task": "review the change",
-                "aws_session_id": "s1",
-                "workspace_id": "ws-1",
-                "role": "reviewer",
-            },
-            token="prod-secret",
-        )
-        self.assertEqual(st, 201)
-        job2_id = data["job"]["job_id"]
-
-        st, claim = self._req(
-            "POST",
-            "/v1/worker/claim",
-            {"worker_id": "mac-1", "hostname": "mini"},
-            token="work-secret",
-        )
-        self.assertEqual(claim["job"]["job_id"], job2_id)
-
-        st, _ = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": job2_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "review done",
-                "workspace_id": "ws-1",
-                "terminal_id": "term-r",
-                "role": "reviewer",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-
-        # Job 3: headless dsbot job in same workspace must not clobber terminals
-        st, data = self._req(
-            "POST",
-            "/v1/jobs",
-            {
-                "target": "paradev",
-                "task": "headless dsbot pass",
-                "aws_session_id": "s1",
-                "workspace_id": "ws-1",
-            },
-            token="prod-secret",
-        )
-        self.assertEqual(st, 201)
-        job3_id = data["job"]["job_id"]
-
-        st, claim = self._req(
-            "POST",
-            "/v1/worker/claim",
-            {"worker_id": "mac-1", "hostname": "mini"},
-            token="work-secret",
-        )
-        self.assertEqual(claim["job"]["job_id"], job3_id)
-
-        st, _ = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": job3_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "headless pass done",
-                "workspace_id": "ws-1",
-                "terminal_id": "dsbot-headless",
-                "agent": "dsbot",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-
-        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
-        self.assertEqual(st, 200)
-        self.assertEqual(len(sessions["sessions"]), 1)
-        sess = sessions["sessions"][0]
-        self.assertEqual(sess["session_key"], "demo-app:main")
-        self.assertEqual(sess["workspace_id"], "ws-1")
-        self.assertEqual(sess["worker_terminal_id"], "term-w")
-        self.assertEqual(sess["reviewer_terminal_id"], "term-r")
-
-    def _run_paradev_job(self, enqueue_fields, complete_fields):
-        st, data = self._req(
-            "POST",
-            "/v1/jobs",
-            {
-                "target": "paradev",
-                "task": "t",
-                "aws_session_id": "s1",
-                **enqueue_fields,
-            },
-            token="prod-secret",
-        )
-        self.assertEqual(st, 201)
-        job_id = data["job"]["job_id"]
-        st, claim = self._req(
-            "POST",
-            "/v1/worker/claim",
-            {"worker_id": "mac-1", "hostname": "mini"},
-            token="work-secret",
-        )
-        self.assertEqual(claim["job"]["job_id"], job_id)
-        st, done = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": job_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "done",
-                **complete_fields,
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-        return job_id
-
-    def test_paradev_session_workspace_rotation_clears_stale_terminals(self) -> None:
-        self._run_paradev_job(
-            {"repo": "demo-app", "branch": "main"},
-            {"workspace_id": "ws-old", "terminal_id": "term-w-old", "role": "worker"},
-        )
-        self._run_paradev_job(
-            {"workspace_id": "ws-old", "role": "reviewer"},
-            {"workspace_id": "ws-old", "terminal_id": "term-r-old", "role": "reviewer"},
-        )
-        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
-        self.assertEqual(st, 200)
-        self.assertEqual(len(sessions["sessions"]), 1)
-        self.assertEqual(sessions["sessions"][0]["reviewer_terminal_id"], "term-r-old")
-
-        # Same repo:branch rotates to a brand-new workspace -> stale reviewer cleared
-        job3_id = self._run_paradev_job(
-            {"repo": "demo-app", "branch": "main"},
-            {"workspace_id": "ws-new", "terminal_id": "term-new-w", "role": "worker"},
-        )
-        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
-        self.assertEqual(st, 200)
-        self.assertEqual(len(sessions["sessions"]), 1)
-        sess = sessions["sessions"][0]
-        self.assertEqual(sess["session_key"], "demo-app:main")
-        self.assertEqual(sess["workspace_id"], "ws-new")
-        self.assertEqual(sess["worker_terminal_id"], "term-new-w")
-        self.assertIsNone(sess["reviewer_terminal_id"])
-
-        # Idempotent retry of the same completion still leaves the session correct
-        st, done = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": job3_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "done",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
-        self.assertEqual(st, 200)
-        self.assertEqual(len(sessions["sessions"]), 1)
-        self.assertEqual(sessions["sessions"][0]["workspace_id"], "ws-new")
-        self.assertEqual(sessions["sessions"][0]["worker_terminal_id"], "term-new-w")
-        self.assertIsNone(sessions["sessions"][0]["reviewer_terminal_id"])
-
-    def test_out_of_order_retry_does_not_clobber_newer_workspace(self) -> None:
-        job1_id = self._run_paradev_job(
-            {"repo": "demo-app", "branch": "main"},
-            {"workspace_id": "ws-old", "terminal_id": "term-old", "role": "worker"},
-        )
-        self._run_paradev_job(
-            {"repo": "demo-app", "branch": "main"},
-            {"workspace_id": "ws-new", "terminal_id": "term-new", "role": "worker"},
-        )
-        self._run_paradev_job(
-            {"workspace_id": "ws-new", "role": "reviewer"},
-            {"workspace_id": "ws-new", "terminal_id": "term-rev", "role": "reviewer"},
-        )
-
-        # Simulate a late delivery mark that bumps job1.updated_at AFTER ws-new completed
-        self.store.mark_delivery(job1_id, True)
-
-        # Delayed idempotent retry of job1's completion must not roll back ws-new
-        st, done = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": job1_id,
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "done",
-                "workspace_id": "ws-old",
-                "terminal_id": "term-old",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-        self.assertTrue(done["ok"])
-
-        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
-        self.assertEqual(st, 200)
-        self.assertEqual(len(sessions["sessions"]), 1)
-        sess = sessions["sessions"][0]
-        self.assertEqual(sess["session_key"], "demo-app:main")
-        self.assertEqual(sess["workspace_id"], "ws-new")
-        self.assertEqual(sess["worker_terminal_id"], "term-new")
-        self.assertEqual(sess["reviewer_terminal_id"], "term-rev")
+        st_sess, _ = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
+        self.assertEqual(st_sess, 404)
 
     def test_preupgrade_row_mark_delivery_preserves_completed_at(self) -> None:
-        # Simulate a pre-upgrade finished row: completed_at NULL, old updated_at
         old_ts = time.time() - 100
         with self.store._lock:
             self.store.conn.execute(
@@ -660,166 +320,19 @@ class BrokerTest(unittest.TestCase):
                     workspace_id, terminal_id, role,
                     delivery_state, delivery_attempts,
                     created_at, updated_at, expires_at
-                ) VALUES (?, 'paradev', 'old task', 'demo-app', 'main', 900,
+                ) VALUES (?, 'dsbot', 'old task', 'demo-app', 'main', 900,
                           's1', 'succeeded', 1, 'mac-1',
-                          'ws-old', 'term-old', 'worker',
+                          NULL, NULL, 'worker',
                           'delivered', 1, ?, ?, ?)
                 """,
                 ("mac_oldjob1", old_ts, old_ts, old_ts + 86400),
             )
             self.store.conn.commit()
 
-        self._run_paradev_job(
-            {"repo": "demo-app", "branch": "main"},
-            {"workspace_id": "ws-new", "terminal_id": "term-new", "role": "worker"},
-        )
-        self._run_paradev_job(
-            {"workspace_id": "ws-new", "role": "reviewer"},
-            {"workspace_id": "ws-new", "terminal_id": "term-rev", "role": "reviewer"},
-        )
-
-        # mark_delivery must backfill completed_at from the pre-bump updated_at
         self.store.mark_delivery("mac_oldjob1", True)
         old_job = self.store.get_job("mac_oldjob1")
         self.assertEqual(old_job["completed_at"], old_ts)
         self.assertGreater(old_job["updated_at"], old_job["completed_at"])
-
-        # Delayed retry uses completed_at (t_old), so it cannot clobber ws-new
-        st, done = self._req(
-            "POST",
-            "/v1/worker/complete",
-            {
-                "job_id": "mac_oldjob1",
-                "worker_id": "mac-1",
-                "status": "succeeded",
-                "result_summary": "done",
-                "workspace_id": "ws-old",
-                "terminal_id": "term-old",
-            },
-            token="work-secret",
-        )
-        self.assertEqual(st, 200)
-
-        st, sessions = self._req("GET", "/v1/paradev/sessions", token="prod-secret")
-        self.assertEqual(st, 200)
-        self.assertEqual(len(sessions["sessions"]), 1)
-        sess = sessions["sessions"][0]
-        self.assertEqual(sess["workspace_id"], "ws-new")
-        self.assertEqual(sess["worker_terminal_id"], "term-new")
-        self.assertEqual(sess["reviewer_terminal_id"], "term-rev")
-
-    def test_complete_job_rolls_back_when_session_upsert_fails(self) -> None:
-        st, data = self._req(
-            "POST",
-            "/v1/jobs",
-            {
-                "target": "paradev",
-                "task": "t",
-                "aws_session_id": "s1",
-                "repo": "demo-app",
-            },
-            token="prod-secret",
-        )
-        self.assertEqual(st, 201)
-        job_id = data["job"]["job_id"]
-        st, claim = self._req(
-            "POST",
-            "/v1/worker/claim",
-            {"worker_id": "mac-1", "hostname": "mini"},
-            token="work-secret",
-        )
-        self.assertEqual(claim["job"]["job_id"], job_id)
-
-        def boom(*args, **kwargs):
-            raise RuntimeError("simulated session upsert failure")
-
-        orig = self.store._record_paradev_session
-        self.store._record_paradev_session = boom
-        try:
-            with self.assertRaises(Exception):
-                self._req(
-                    "POST",
-                    "/v1/worker/complete",
-                    {
-                        "job_id": job_id,
-                        "worker_id": "mac-1",
-                        "status": "succeeded",
-                        "result_summary": "done",
-                        "workspace_id": "ws-1",
-                        "terminal_id": "term-1",
-                    },
-                    token="work-secret",
-                )
-        finally:
-            self.store._record_paradev_session = orig
-
-        # The UPDATE jobs write must have been rolled back; an unrelated commit
-        # must not resurrect it.
-        self.store.touch_worker("mac-1")
-        job = self.store.get_job(job_id)
-        self.assertEqual(job["status"], "running")
-        self.assertIsNone(job["completed_at"])
-        self.assertIsNone(job["result_summary"])
-
-    def test_delivered_legacy_completion_retry_preserves_newer_workspace(self) -> None:
-        old_id = self._run_paradev_job(
-            {"repo": "demo-app", "branch": "main"},
-            {"workspace_id": "ws-old", "terminal_id": "term-old"},
-        )
-        self._run_paradev_job(
-            {"repo": "demo-app", "branch": "main"},
-            {"workspace_id": "ws-new", "terminal_id": "term-new"},
-        )
-        self.store.mark_delivery(old_id, True)
-        with self.store._lock, self.store.conn:
-            self.store.conn.execute("UPDATE jobs SET completed_at = NULL WHERE job_id = ?", (old_id,))
-
-        restarted = BrokerStore(self.db_path)
-        try:
-            ok, _ = restarted.complete_job({
-                "job_id": old_id, "worker_id": "mac-1", "status": "succeeded",
-                "workspace_id": "ws-old", "terminal_id": "term-old",
-            })
-            self.assertTrue(ok)
-            self.assertEqual(
-                [(s["workspace_id"], s["worker_terminal_id"]) for s in restarted.list_paradev_sessions()],
-                [("ws-new", "term-new")],
-            )
-        finally:
-            restarted.close()
-
-    def test_completion_rolls_back_when_registry_write_fails(self) -> None:
-        job, _ = self.store.enqueue_job({
-            "target": "paradev", "task": "t", "aws_session_id": "s1", "repo": "demo-app",
-        })
-        job_id = job["job_id"]
-        self.assertEqual(self.store.claim_next_job("mac-1")["job_id"], job_id)
-        with self.store._lock, self.store.conn:
-            self.store.conn.execute("""
-                CREATE TRIGGER reject_session BEFORE INSERT ON paradev_sessions
-                BEGIN SELECT RAISE(ABORT, 'registry write failed'); END
-            """)
-        payload = {
-            "job_id": job_id, "worker_id": "mac-1", "status": "succeeded",
-            "workspace_id": "ws-1", "terminal_id": "term-1",
-        }
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "registry write failed"):
-            self.store.complete_job(payload)
-        self.store.touch_worker("mac-2")
-
-        restarted = BrokerStore(self.db_path)
-        try:
-            self.assertEqual(restarted.get_job(job_id)["status"], "running")
-            self.assertEqual(restarted.list_paradev_sessions(), [])
-            self.assertEqual([j["job_id"] for j in restarted.reconcile_worker("mac-1")], [job_id])
-            with restarted._lock, restarted.conn:
-                restarted.conn.execute("DROP TRIGGER reject_session")
-            ok, done = restarted.complete_job(payload)
-            self.assertTrue(ok)
-            self.assertIsNotNone(done["completed_at"])
-            self.assertEqual(restarted.list_paradev_sessions()[0]["last_job_id"], job_id)
-        finally:
-            restarted.close()
 
     def test_dsbot_bot_and_group_fields_roundtrip(self) -> None:
         st, data = self._req(
