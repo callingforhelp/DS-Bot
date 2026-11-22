@@ -25,6 +25,7 @@ const TYPING_MS = 4_000
 const NUMBERS = /^\s*\d+(\s+\d+)*\s*$/
 
 const secretField = key => key.replace(/[A-Z]/g, char => `_${char}`).toUpperCase()
+const stoppedInbound = () => Object.assign(new Error('IM connection stopped before message admission'), { retryInbound: true })
 
 export function install(rt) {
   const { ctx, state } = rt
@@ -706,7 +707,7 @@ export function install(rt) {
       return
     }
     if (imPlatform(conn.platform)?.public === true && msg.chat.kind === 'direct') {
-      if (runner.stopped === true) return
+      if (runner.stopped === true) throw stoppedInbound()
       const target = resolveTarget(conn, conn.chats[msg.chat.key])
       if (target?.botId !== undefined) {
         const key = typeof msg.messageId === 'string' && msg.messageId !== ''
@@ -714,10 +715,10 @@ export function install(rt) {
         if (customerFailures.exhausted(key)) return
         try {
           await rt.customerPart(target.botId, conn.id, msg.chat.key)
-          if (runner.stopped === true) return
+          if (runner.stopped === true) throw stoppedInbound()
           customerFailures.success(key)
         } catch (error) {
-          if (runner.stopped === true) return
+          if (runner.stopped === true) throw stoppedInbound()
           if (customerFailures.fail(conn.id, key, error?.permanent === true)) {
             throw Object.assign(new Error('Customer conversation could not be opened', { cause: error }), { retryInbound: true })
           }
@@ -961,6 +962,7 @@ export function install(rt) {
       const handle = adapter.connect(fieldsOf(conn), env, {
         onMessage: (msg) => {
           const current = fresh(conn.id)
+          if (current === undefined && platform?.public === true) return Promise.reject(stoppedInbound())
           return current === undefined ? undefined : onMessage(current, runner)(msg).catch(error => {
             rt.warn('ds-bot: im message failed: %s', reasonOf(error))
             if (error?.retryInbound === true) throw error
