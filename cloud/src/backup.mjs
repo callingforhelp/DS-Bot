@@ -152,7 +152,7 @@ export async function restoreBackup({ file, passphrase, to, refuse = [] }) {
       throw error
     }
     mkdirSync(target, { recursive: true, mode: 0o700 })
-    const list = spawnSync('tar', ['-tzf', tarPath], { encoding: 'utf8' })
+    const list = spawnSync('tar', ['-tzf', tarPath], { encoding: 'utf8', maxBuffer: 1 << 30 })
     if (list.status !== 0) throw new Error('backup archive is unreadable')
     for (const member of list.stdout.split('\n').filter(Boolean)) {
       if (member.startsWith('/') || member.split('/').includes('..')) throw new Error('backup archive has an unsafe path')
