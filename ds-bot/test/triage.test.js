@@ -158,6 +158,11 @@ test('customer routing uses isolated specialist sessions and rejects control arg
     const result = await s.call({ action: 'vote', summary: `Private request ${sessionId}`, routes: ['triage_test_quote', 'triage_test_after_sales'] }, sessionId)
     assert.equal(result.decision, 'route')
     assert.equal(result.delivery.target, 'triage_test_quote')
+    await s.call({ action: 'log', customer: 'Customer A', summary: 'safe log before dispatch', routed_to: 'triage_test_quote', reason: 'support case' }, sessionId)
+    await s.call({ action: 'recall', query: `Private request ${sessionId}` }, sessionId)
+    await s.call({ action: 'types' }, sessionId)
+    await s.call({ action: 'rules', rule_action: 'list' }, sessionId)
+    assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'triage_test_quote', message: 'Please help' }), true)
     assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'triage_test_quote', message: 'Please help', reply_to: 'user' }), false)
     assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'other', message: 'Please help' }), false)
     assert.equal(await s.rt.dispatchCustomerRoute(sessionId, { to: 'triage_test_quote', message: 'Please help', reply_to: 'user' }), undefined)
@@ -165,6 +170,11 @@ test('customer routing uses isolated specialist sessions and rejects control arg
     assert.equal(await s.rt.dispatchCustomerRoute(sessionId, { to: 'triage_test_quote', message: `Please help ${sessionId}` }), sessionId === 'customer-C'
       ? 'The case could not be sent to the support team. Please contact them directly.'
       : 'Your case has been sent to the support team.')
+    s.replies([new Error('judge offline'), new Error('judge offline')])
+    const reVote = await s.call({ action: 'vote', summary: `Re-vote ${sessionId}`, routes: ['triage_test_quote', 'triage_test_after_sales'] }, sessionId)
+    assert.equal(reVote.decision, 'handoff')
+    assert.equal(s.rt.canUseCustomerRoute(sessionId, { to: 'triage_test_quote', message: 'Stale grant' }), false)
+    assert.equal(await s.rt.dispatchCustomerRoute(sessionId, { to: 'triage_test_quote', message: 'Stale grant' }), undefined)
   }
   assert.equal(targetSessions.size, 3)
   assert.notEqual(targetSessions.get('specialist:conn-A:chat-A'), targetSessions.get('specialist:conn-B:chat-B'))
