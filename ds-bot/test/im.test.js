@@ -270,6 +270,29 @@ test('public customer platforms admit strangers but refuse control commands and 
   assert.equal(s.prompts.length, 3)
 })
 
+test('ask_user fails closed when a public customer chat binding makes its origin stale', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer-A', 'hello')
+  const sessionId = s.prompts.at(-1).sessionId
+  s.imTurn(sessionId)
+  assert.equal(s.rt.hasDirectImOrigin(sessionId), true)
+
+  await s.rt.imEndpoint('im-chat', { id: conn.id, chatKey: 'dm-customer-A', target: { botId: 'b' } })
+  assert.equal(s.rt.hasDirectImOrigin(sessionId), false)
+  let concluded = false
+  const result = await s.rt.teamTools.find(tool => tool.name === 'ask_user').execute(
+    { question: 'Which option?', options: [{ label: 'One' }, { label: 'Two' }] },
+    { agent: { id: sessionId }, concludeTurn() { concluded = true } },
+  )
+
+  assert.match(result, /primary customer-support Bot/)
+  assert.doesNotMatch(result, /Chief|Writer/)
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(concluded, false)
+})
+
 test('public platforms never receive approval cards during reconciliation', async (t) => {
   const s = await start({ platform: 'wecom_kf' })
   t.after(s.stop)

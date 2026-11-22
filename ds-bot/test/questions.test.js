@@ -47,16 +47,17 @@ async function start() {
       if (listener.length >= 2) listener({ id }, { type, seq: ++seq, data })
     }
   }
+  const concluded = []
   const ask = (sessionId, callId) => rt.teamTools.find(d => d.name === 'ask_user').execute(
     { question: 'Which name?', options: [{ label: 'Lookout' }, { label: 'Scout' }] },
-    { agent: { id: sessionId }, callId, concludeTurn() {} },
+    { agent: { id: sessionId }, callId, concludeTurn() { concluded.push({ sessionId, callId }) } },
   )
   const questions = async () => (await (await route.fetch(new Request('http://localhost/api/bot', {
     method: 'POST', body: JSON.stringify({ endpoint: 'state', payload: {} }),
   }))).json()).value.questions
   // Loading once fills the Session-owner indexes turns.js filters events by.
   await rt.teamTools.find(d => d.name === 'list_bots').execute({}, { agent: { id: 'chief' } })
-  return { emit, ask, questions, stop: async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true, maxRetries: 5 }) } }
+  return { rt, emit, ask, questions, concluded, stop: async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true, maxRetries: 5 }) } }
 }
 
 const text = value => [{ type: 'text', text: value }]
@@ -89,4 +90,18 @@ test('a card asked in a visible turn stays at its call', async (t) => {
   emit('writer', 'user/message', { content: text('[Message from Chief · the user sees your reply here]\nIntroduce yourself'), source: { kind: 'bot', role: 'request', audience: 'user', senderSessionId: 'chief', senderName: 'Chief', exchangeId: 'x2', hop: 0 } })
   await ask('writer', 'call-3')
   assert.equal((await questions()).writer.callId, 'call-3')
+})
+
+test('a customer specialist without a live IM origin gets relay guidance and leaves its turn open', async (t) => {
+  const { rt, ask, questions, concluded, stop } = await start()
+  t.after(stop)
+  const sessionId = await rt.customerPart('writer', 'conn-a', 'customer-A')
+
+  assert.equal(rt.hasDirectImOrigin(sessionId), false)
+  const feedback = await ask(sessionId, 'specialist-ask')
+
+  assert.match(feedback, /clarification and choices.*primary customer-support Bot/)
+  assert.doesNotMatch(feedback, /Chief|Writer/)
+  assert.equal((await questions())[sessionId], undefined)
+  assert.deepEqual(concluded, [])
 })

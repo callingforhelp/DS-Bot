@@ -266,6 +266,30 @@ try {
   assertPrivateCustomerCalls(allCustomerCalls)
   assertNoCustomerFileReads(allCustomerCalls)
   passed('A and B route to separate specialist customer tasks and each reply reaches only its original WeCom user')
+  const clarificationStart = sent.length
+  await customer('customer-A', { action: 'vote', summary: 'E2E_SPECIALIST_ASK_USER：报价需要确认型号', routes: ['quote', 'order_status'] })
+  const specialistClarificationTask = (await state()).bots[quoteId].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
+  await until(async () => {
+    const specialistCalls = (await calls()).filter(call => call.session === specialistClarificationTask.sessionId)
+    const cardAttempt = specialistCalls.findIndex(call => call.out?.some(block => block.type === 'tool_use' && block.name === 'ask_user'))
+    const followedFeedback = cardAttempt !== -1 && specialistCalls.slice(cardAttempt + 1)
+      .some(call => call.out?.some(block => block.type === 'text' && block.text.includes('请客户确认产品型号')))
+    const primaryForwarded = (await calls()).some(call => call.session === a.sessionId
+      && call.last?.includes('[Reply from Customer support]')
+      && call.out?.some(block => block.type === 'text' && block.text.includes('请客户确认产品型号')))
+    const clarification = sent.slice(clarificationStart).filter(value => value.touser === 'customer-A'
+      && value.text?.content?.includes('请客户确认产品型号'))
+    return followedFeedback && primaryForwarded && clarification.length === 1
+      && (await state()).questions[specialistClarificationTask.sessionId] === undefined
+  }, 'specialist clarification returned through primary')
+  const clarificationMessages = sent.slice(clarificationStart)
+  assert.ok(clarificationMessages.length > 0 && clarificationMessages.every(value => value.touser === 'customer-A'))
+  assert.equal(clarificationMessages.filter(value => value.touser === 'customer-B').length, 0)
+  const clarificationText = clarificationMessages.map(value => value.text?.content ?? '').join('\n')
+  assert.match(clarificationText, /请客户确认产品型号/)
+  assert.doesNotMatch(clarificationText, /STAFF_CONTEXT_SENTINEL|Chief|Quote|E2E_SPECIALIST_ASK_USER/)
+  assert.equal((await state()).questions[specialistClarificationTask.sessionId], undefined)
+  passed('a specialist ask_user returns Chinese clarification through primary to A only, without a hidden card or staff name')
   message('customer-A', 'E2E_ASK_CARD_A')
   await until(async () => (await state()).questions[a.sessionId]?.options?.length === 3
     && sent.some(value => value.touser === 'customer-A' && value.text?.content?.includes('E2E_A_OPTION_ONE')), 'A customer question card')

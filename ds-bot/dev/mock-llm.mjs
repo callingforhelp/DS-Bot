@@ -145,7 +145,7 @@ function decide(body) {
       let value
       try { value = JSON.parse(raw) } catch { return [text(`分诊工具拒绝：${raw}`)] }
       if (value.decision === 'handoff') return [text(value.holding_reply)]
-      if (value.decision === 'route') return [text('已安排报价专员跟进。'), tool('message_bot', { to: value.delivery.target, message: 'E2E_ROUTED_CASE：客户需要报价，请审核。' })]
+      if (value.decision === 'route') return [text('已安排报价专员跟进。'), tool('message_bot', { to: value.delivery.target, message: used.input.summary?.includes('E2E_SPECIALIST_ASK_USER') ? 'E2E_SPECIALIST_ASK_USER：客户需要确认产品型号。' : 'E2E_ROUTED_CASE：客户需要报价，请审核。' })]
       let summary = '分诊已完成。'
       try {
         const value = JSON.parse(raw)
@@ -154,6 +154,13 @@ function decide(body) {
           : '暂时无法自动确定处理类型，已交由客服专员跟进。'
       } catch {}
       return [text(summary)]
+    }
+    if (system.includes('# Customer service') && textOf(last?.content).includes('Customer support request')
+      && textOf(last?.content).includes('E2E_SPECIALIST_ASK_USER')) {
+      return [tool('ask_user', { question: '请确认产品型号？', options: [{ label: '型号甲' }, { label: '型号乙' }] })]
+    }
+    if (result && used?.name === 'ask_user' && textOf(result.content).includes('live customer IM origin')) {
+      return [text('请客户确认产品型号：型号甲还是型号乙？')]
     }
     const prompt = textOf(last?.content)
     const latest = [...prompt.matchAll(/(?:^|\n)User: ([^\n]*)/g)].at(-1)
@@ -182,7 +189,7 @@ function decide(body) {
       ? /STEP summary \(triage-part\.step\):[\s\S]*?Cylindrical surfaces are only a hole\/boss hint, not a hole count\./.exec(latestContent)?.[0]
       : undefined
     if (stepSummary) return [text(`您好，已收到 STEP 图纸摘要，我会按这些信息核对：\n${stepSummary}`)]
-    const routedCase = JSON.stringify(messages).includes('E2E_ROUTED_CASE')
+    const routedCase = JSON.stringify(messages).includes('E2E_ROUTED_CASE') || JSON.stringify(messages).includes('E2E_SPECIALIST_ASK_USER')
     if (system.includes('# Customer service') && routedCase && latestContent.startsWith('[Reply from Customer support]\n')) {
       return [text(latestContent.slice('[Reply from Customer support]\n'.length))]
     }

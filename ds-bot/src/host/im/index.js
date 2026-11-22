@@ -537,6 +537,7 @@ export function install(rt) {
     return { conn, chatKey: entry.chatKey, chat, senderId: entry.senderId, binding: entry.binding }
   }
   rt.roomHasImOrigin = roomId => originOf(rt.roomOf(roomId)?.sessionId ?? roomId) !== undefined
+  rt.hasDirectImOrigin = sessionId => originOf(sessionId)?.chat.kind === 'direct'
   const cardOrigin = (sessionId, card) => {
     const owner = rt.groupOwners.get(sessionId)
     if (owner === undefined) {
