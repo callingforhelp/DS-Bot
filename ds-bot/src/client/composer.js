@@ -7,6 +7,7 @@ import { stepMenuFocus, useLinger, useViewport, viewBottom } from './motion.js'
 import { t } from './i18n.js'
 import { insertComposerNewline, sendsOnEnter } from './enter-key.js'
 import { enterSteers, steerable } from './enter-steer.js'
+import { staleComposerDraftText } from './composer-guards.js'
 
 // -------------------------------------------------------------------------
 // Composer: dictation mic and the voice-chat button. The shell's send
@@ -56,8 +57,11 @@ export function useDictation(onText) {
   return { listening, note, start, stop }
 }
 
-export function ComposerVoice({ sessionId, inputActions, actions, useUi, useRoster }) {
+export function ComposerVoice({ sessionId, inputActions, useInput, actions, useUi, useRoster }) {
   const enterToSend = useRoster(state => sendsOnEnter(state.prefs))
+  // Keep draftRef current without re-rendering ComposerVoice on every keystroke.
+  const draftRef = useRef('')
+  useInput?.((state) => { draftRef.current = state.draft ?? ''; return null })
   const composerRoot = useRef(null)
   useEffect(() => {
     const root = composerRoot.current?.closest('[data-composer-card]')
@@ -66,6 +70,38 @@ export function ComposerVoice({ sessionId, inputActions, actions, useUi, useRost
     root.addEventListener('keydown', onKey, true)
     return () => root.removeEventListener('keydown', onKey, true)
   }, [enterToSend, inputActions])
+  useEffect(() => {
+    const root = composerRoot.current?.closest('[data-composer-card]')
+    if (!root || typeof inputActions?.setDraft !== 'function') return undefined
+    let composing = false
+    let syncTimer = 0
+    const syncStaleDraft = () => {
+      syncTimer = 0
+      if (composing) return
+      const box = root.querySelector('[data-composer-input]')
+      const text = staleComposerDraftText(box, draftRef.current)
+      if (text !== null) inputActions.setDraft(text)
+    }
+    const scheduleSync = (delay) => {
+      clearTimeout(syncTimer)
+      syncTimer = setTimeout(syncStaleDraft, delay)
+    }
+    const onCompStart = () => { composing = true; clearTimeout(syncTimer) }
+    const onCompEnd = () => { composing = false; scheduleSync(45) }
+    const onInput = (event) => {
+      if (event.isComposing || composing) return
+      scheduleSync(160)
+    }
+    root.addEventListener('compositionstart', onCompStart, true)
+    root.addEventListener('compositionend', onCompEnd, true)
+    root.addEventListener('input', onInput, true)
+    return () => {
+      clearTimeout(syncTimer)
+      root.removeEventListener('compositionstart', onCompStart, true)
+      root.removeEventListener('compositionend', onCompEnd, true)
+      root.removeEventListener('input', onInput, true)
+    }
+  }, [sessionId, inputActions])
   const dictation = useDictation((text, final) => {
     if (final && inputActions) inputActions.insertText(text, inputActions.captureInsertion())
   })

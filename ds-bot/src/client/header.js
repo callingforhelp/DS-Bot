@@ -9,6 +9,7 @@ import { clockLabel, openingTurn, unseenSince } from './cells.js'
 import { GoalIsland, goalView } from './goal.js'
 import { RuntimeStatusPill } from './runtime-pill.js'
 import { viewBottom } from './motion.js'
+import { isComposerSeatMutation, readComposerHeight } from './composer-guards.js'
 import { t } from './i18n.js'
 
 // -------------------------------------------------------------------------
@@ -158,7 +159,12 @@ function useTranscriptView() {
   useEffect(() => {
     let frame = 0
     let watched = null
-    const observer = new MutationObserver(() => schedule())
+    let watchedSeat = null
+    const observer = new MutationObserver((records) => {
+      if (isComposerSeatMutation(records)) return
+      schedule()
+    })
+    const seatResize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => schedule()) : null
     const measure = () => {
       frame = 0
       const scroller = document.querySelector('[data-conversation-scroll]')
@@ -166,6 +172,12 @@ function useTranscriptView() {
         observer.disconnect()
         watched = scroller
         if (scroller) observer.observe(scroller, { childList: true, subtree: true })
+      }
+      const seat = scroller?.querySelector('[data-composer-seat]') ?? null
+      if (seat !== watchedSeat) {
+        seatResize?.disconnect()
+        watchedSeat = seat
+        if (seat) seatResize?.observe(seat)
       }
       if (!scroller) { setView(null); return }
       const box = scroller.getBoundingClientRect()
@@ -176,7 +188,7 @@ function useTranscriptView() {
         const at = sep.getBoundingClientRect()
         divider = at.bottom <= headerBottom ? 'above' : at.top >= box.bottom ? 'below' : 'in-view'
       }
-      const composer = parseFloat(getComputedStyle(scroller).getPropertyValue('--dsh-composer-height')) || 152
+      const composer = readComposerHeight(scroller)
       const next = {
         unpinned: scroller.querySelector('[class*="_toBottomSlot"]>button') !== null,
         divider,
@@ -195,6 +207,7 @@ function useTranscriptView() {
     return () => {
       cancelAnimationFrame(frame)
       observer.disconnect()
+      seatResize?.disconnect()
       document.removeEventListener('scroll', schedule, true)
       window.removeEventListener('resize', schedule)
       window.visualViewport?.removeEventListener('resize', schedule)
