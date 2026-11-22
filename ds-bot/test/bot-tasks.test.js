@@ -401,6 +401,111 @@ test('Main Bot emergency stop cancels customer work without settling or reportin
   assert.equal(env.deliveries.some(delivery => delivery.role === 'task-report' && delivery.taskId === task.id), false)
 })
 
+test('emergency stop cancels customer resources before batched persistence and keeps idle customer state', async (t) => {
+  const idleCustomers = Array.from({ length: 24 }, (_, index) => ({
+    id: `customer_idle_${index}`, title: `Customer ${index}`, origin: 'customer',
+    customer: { connId: 'wecom', chatKey: `customer-${index}` }, status: 'waiting_customer',
+    sessionId: `customer-idle-${index}`, startedAt: index + 1, updatedAt: index + 100,
+    segments: [{ sessionId: `customer-idle-old-${index}`, endedAt: index + 1 }],
+  }))
+  const activeCustomer = {
+    id: 'customer_active', title: 'Active customer', origin: 'customer',
+    customer: { connId: 'wecom', chatKey: 'customer-active' }, status: 'waiting_approval',
+    sessionId: 'customer-active', startedAt: 100, updatedAt: 200,
+    segments: [{ sessionId: 'customer-active-old', endedAt: 100 }],
+  }
+  const team = makeTeam({ bots: { a: { ...makeTeam().bots.a, tasks: [...idleCustomers, activeCustomer] } } })
+  const env = await startEnv({ team })
+  t.after(env.stop)
+  const bot = env.rt.botOf('a')
+  const customers = bot.tasks.filter(task => task.origin === 'customer')
+  const idleTasks = customers.slice(0, idleCustomers.length)
+  const activeTask = customers.at(-1)
+  const idleSnapshot = idleTasks.map(task => ({
+    status: task.status,
+    updatedAt: task.updatedAt,
+    customer: { ...task.customer },
+    segments: task.segments.map(segment => ({ ...segment })),
+  }))
+
+  await env.tool('task_start').execute({ title: 'Ordinary active task', brief: 'Stop this too' }, execOf(env.agentMap.get('dm-a')))
+  const ordinaryTask = bot.tasks.find(task => task.title === 'Ordinary active task')
+  activeTask.status = 'waiting_approval'
+  activeTask.updatedAt = 200
+  ordinaryTask.status = 'running'
+  const approvalsCancelled = []
+  const inboxesCleared = []
+  const agentsCancelled = []
+  const sessions = [...customers, ordinaryTask]
+  const agents = new Map()
+  env.rt.cancelApprovals = sessionId => approvalsCancelled.push(sessionId)
+  env.rt.runningJobs = sessionId => [{ id: `job-${sessionId}` }]
+  for (const task of sessions) {
+    const agent = await env.rt.resolveAgent(task.sessionId)
+    agents.set(task.sessionId, agent)
+    agent.inbox.nextTurn.push({ id: `turn-${task.sessionId}` })
+    agent.inbox.nextStep.push({ id: `step-${task.sessionId}` })
+    agent.inbox.clear = () => {
+      inboxesCleared.push(task.sessionId)
+      agent.inbox.nextTurn.splice(0)
+      agent.inbox.nextStep.splice(0)
+    }
+    const cancel = agent.cancel.bind(agent)
+    agent.cancel = cause => {
+      agentsCancelled.push(task.sessionId)
+      cancel(cause)
+    }
+  }
+
+  const customerResourcesCancelled = () => customers.every(task => approvalsCancelled.includes(task.sessionId)
+    && env.killedJobs.some(job => job.owner === task.sessionId)
+    && inboxesCleared.includes(task.sessionId)
+    && agentsCancelled.includes(task.sessionId))
+  let saveCalls = 0
+  let firstSaveSnapshot
+  const firstSaveStarted = Promise.withResolvers()
+  const firstSaveGate = Promise.withResolvers()
+  env.rt.save = async () => {
+    saveCalls++
+    if (saveCalls === 1) {
+      firstSaveSnapshot = {
+        customerResourcesCancelled: customerResourcesCancelled(),
+        activeCustomerStatus: activeTask.status,
+        idle: idleTasks.map(task => ({ status: task.status, updatedAt: task.updatedAt })),
+      }
+      firstSaveStarted.resolve()
+      await firstSaveGate.promise
+      throw new Error('disk failure')
+    }
+  }
+
+  const stopping = env.rt.stopAllTasksOfBot(bot, 'emergency stop').then(
+    () => ({}),
+    error => ({ error }),
+  )
+  await firstSaveStarted.promise
+  firstSaveGate.resolve()
+  const result = await stopping
+
+  assert.equal(result.error?.message, 'disk failure')
+  assert.equal(saveCalls, 2)
+  assert.equal(firstSaveSnapshot.customerResourcesCancelled, true)
+  assert.equal(firstSaveSnapshot.activeCustomerStatus, 'waiting_customer')
+  assert.deepEqual(firstSaveSnapshot.idle, idleSnapshot.map(({ status, updatedAt }) => ({ status, updatedAt })))
+  assert.deepEqual(idleTasks.map(task => ({ status: task.status, updatedAt: task.updatedAt, customer: task.customer, segments: task.segments })), idleSnapshot)
+  assert.equal(activeTask.status, 'waiting_customer')
+  assert.deepEqual(activeTask.customer, { connId: 'wecom', chatKey: 'customer-active' })
+  assert.deepEqual(activeTask.segments, [{ sessionId: 'customer-active-old', endedAt: 100 }])
+  assert.equal(bot.tasks.filter(task => task.origin === 'customer').length, idleCustomers.length + 1)
+  assert.equal(ordinaryTask.status, 'stopped')
+  assert.ok(agents.get(ordinaryTask.sessionId).cancelled.length > 0)
+  for (const task of customers) {
+    assert.deepEqual(agents.get(task.sessionId).inbox.nextTurn, [])
+    assert.deepEqual(agents.get(task.sessionId).inbox.nextStep, [])
+  }
+  assert.equal(env.deliveries.some(delivery => delivery.role === 'task-report' && customers.some(task => task.id === delivery.taskId)), false)
+})
+
 test('nested task_* tools and interactive cards (ask_user/show_view/request_secret) are blocked for tasks, and tasks stay read-only', async (t) => {
   const env = await startEnv()
   t.after(env.stop)

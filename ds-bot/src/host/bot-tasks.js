@@ -505,12 +505,14 @@ export function install(rt) {
     return wasActive
   }
 
-  async function stopCustomerTask(task, reason = 'stopped') {
+  function stopCustomerTask(task, reason = 'stopped') {
     if (!isCustomerTask(task) || !isLiveTask(task)) return false
     const sessionId = task.sessionId
-    task.status = 'waiting_customer'
-    task.updatedAt = Date.now()
-    await rt.save()
+    const changed = isActiveTask(task)
+    if (changed) {
+      task.status = 'waiting_customer'
+      task.updatedAt = Date.now()
+    }
     rt.cancelApprovals?.(sessionId)
     const jobs = ctx.get?.('jobs')
     for (const job of rt.runningJobs?.(sessionId) ?? []) {
@@ -519,21 +521,29 @@ export function install(rt) {
     const agent = ctx.get('agents')?.get(sessionId)
     agent?.inbox?.clear()
     agent?.cancel({ kind: 'hook', reason: 'ds-bot: customer work stopped' })
-    return true
+    return changed
   }
 
   async function stopAllTasksOfBot(bot, reason = 'stopped') {
     const rooms = new Set()
-    for (const task of bot.tasks ?? []) {
-      if (isCustomerTask(task) && isLiveTask(task)) await stopCustomerTask(task, reason)
-    }
-    for (const task of activeTasksOf(bot).filter(item => !isCustomerTask(item))) {
-      if (task.roomId !== undefined) rooms.add(task.roomId)
-      await stopTask(bot, task, reason, { notifyForeground: false })
-    }
-    for (const roomId of rooms) {
-      await rt.reconcileStoppedRoomTask?.(roomId, bot.id)
-        .catch(error => rt.warn('ds-bot: reconciling stopped group task for %s in %s failed: %s', bot.name, roomId, error))
+    let customerTasksChanged = false
+    try {
+      for (const task of bot.tasks ?? []) {
+        if (isCustomerTask(task) && isLiveTask(task)) {
+          if (isActiveTask(task)) customerTasksChanged = true
+          stopCustomerTask(task, reason)
+        }
+      }
+      for (const task of activeTasksOf(bot).filter(item => !isCustomerTask(item))) {
+        if (task.roomId !== undefined) rooms.add(task.roomId)
+        await stopTask(bot, task, reason, { notifyForeground: false })
+      }
+      for (const roomId of rooms) {
+        await rt.reconcileStoppedRoomTask?.(roomId, bot.id)
+          .catch(error => rt.warn('ds-bot: reconciling stopped group task for %s in %s failed: %s', bot.name, roomId, error))
+      }
+    } finally {
+      if (customerTasksChanged) await rt.save()
     }
   }
 
