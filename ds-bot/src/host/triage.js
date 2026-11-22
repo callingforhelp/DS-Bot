@@ -138,7 +138,7 @@ function handoffDetail(entry) {
             : agreedCandidate?.runtime === 'devin'
               ? `The judges agreed on ${agreedRoute}; the external agent requires staff dispatch.`
               : deliveryIneligible
-                ? `The judges agreed on ${agreedRoute}, but automatic dispatch is unavailable from this conversation. Staff must route this case from the Bot main chat.`
+                ? `The judges agreed on ${agreedRoute}, but automatic dispatch is unavailable. Staff must review and handle this case manually.`
           : 'The votes did not meet the routing agreement requirements.'
   const voteLines = votes.map(vote => {
     const route = vote.valid ? vote.route : 'No valid route'

@@ -262,6 +262,7 @@ test('staff group votes hand off outside targets but keep main-chat destinations
     ['Local outside', { id: 'local-outside', name: 'Local outside', model: 'local/model' }],
     ['Hosted outside', { id: 'hosted-outside', name: 'Hosted outside', model: 'p/one' }],
     ['Group member', { id: 'group-member', name: 'Group member', model: 'p/two' }],
+    ['Deleted Bot', { id: 'deleted-bot', name: 'Deleted Bot', model: 'p/two' }],
   ])
   const room = { id: 'group-1', name: 'Support group', members: ['bot', 'group-member'] }
   s.rt.findBot = name => targets.get(name)
@@ -280,6 +281,7 @@ test('staff group votes hand off outside targets but keep main-chat destinations
     ['triage_test_hosted_outside', 'Hosted outside', 'hosted specialist work'],
     ['triage_test_member', 'Group member', 'group specialist work'],
     ['triage_test_self', 'Main Bot', 'main bot work'],
+    ['triage_test_deleted', 'Deleted Bot', 'deleted specialist work'],
   ]
   for (const [type, target, handles] of definitions) {
     await s.call({ action: 'types', type_action: 'add', type, handles, examples: [`${handles} request`, `another ${handles} request`], runtime: 'ds-bot', target })
@@ -304,13 +306,14 @@ test('staff group votes hand off outside targets but keep main-chat destinations
       triage_test_hosted_outside: true,
       triage_test_member: true,
       triage_test_self: false,
+      triage_test_deleted: true,
     })
     await s.bank.syncHandoffs()
     assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), [route, "I'll handle it myself"])
     assert.equal(s.rt.state.questions[sessionId], undefined)
     if (route === 'triage_test_local_outside') {
       const detail = s.rt.state.questions.main.detail
-      assert.match(detail, /The judges agreed on triage_test_local_outside, but automatic dispatch is unavailable from this conversation\. Staff must route this case from the Bot main chat\./)
+      assert.match(detail, /The judges agreed on triage_test_local_outside, but automatic dispatch is unavailable\. Staff must review and handle this case manually\./)
       assert.match(detail, /Route confidence: 93%; required threshold: 70%\./)
       assert.doesNotMatch(detail, /No consensus|votes did not meet the routing agreement requirements/)
     }
@@ -324,6 +327,20 @@ test('staff group votes hand off outside targets but keep main-chat destinations
   assert.equal(cases.at(-1).handoff.candidates.find(candidate => candidate.route === 'triage_test_self').available, false)
   await s.bank.syncHandoffs()
   assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), ["I'll handle it myself"])
+
+  s.rt.state.questions.main = undefined
+  targets.delete('Deleted Bot')
+  s.replies(votesFor('triage_test_deleted'))
+  const deleted = await s.call({ action: 'vote', summary: 'Group request for deleted Bot', routes }, sessionId)
+  assert.equal(deleted.decision, 'handoff')
+  assert.equal(deleted.selected_type, 'triage_test_deleted')
+  const deletedCase = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line)).at(-1)
+  assert.equal(deletedCase.handoff.candidates.find(candidate => candidate.route === 'triage_test_deleted').available, false)
+  await s.bank.syncHandoffs()
+  const deletedCard = s.rt.state.questions.main
+  assert.deepEqual(deletedCard.options.map(option => option.label), ["I'll handle it myself"])
+  assert.match(deletedCard.detail, /The judges agreed on triage_test_deleted, but automatic dispatch is unavailable\. Staff must review and handle this case manually\./)
+  assert.match(deletedCard.detail, /Deleted Bot; unavailable, manual handling only/)
 
   s.rt.state.questions.main = undefined
   s.replies([
