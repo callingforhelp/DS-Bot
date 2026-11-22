@@ -168,6 +168,9 @@ function decide(body) {
         multiSelect: true,
       })]
     }
+    if (system.includes('# Customer service') && messages.some(message => message.role === 'user'
+      && textOf(message.content).includes('"kind":"answer_to_pending_question"')
+      && textOf(message.content).includes('E2E_B_OPTION_ONE'))) return [text('E2E_B_OPTION_ONE_ACK')]
     if (system.includes('# Customer service') && currentUser === '99') return [text('E2E_FREE_TEXT_99_ACK')]
     const requestsRoster = messages.some(message => message.role === 'user' && textOf(message.content).includes('MOCK_ROSTER_GUARD'))
     const rosterAttempted = messages.some(message => message.role === 'assistant' && message.content?.some?.(block => block.type === 'tool_use' && block.name === 'list_bots'))

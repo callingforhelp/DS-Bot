@@ -292,8 +292,17 @@ try {
   await until(async () => (await state()).questions[b.sessionId]?.id !== undefined
     && (await state()).questions[b.sessionId].id !== questionB.id
     && sent.slice(pickStart).some(value => value.touser === 'customer-B' && value.text?.content?.includes('E2E_B_OPTION_ONE')), 'replacement B question card')
+  const bCallsBeforePick = (await calls()).filter(call => call.session === b.sessionId && call.customerPrompt === true).length
   message('customer-B', '1')
-  await until(async () => (await state()).questions[b.sessionId] === undefined, 'B numbered answer')
+  await until(async () => {
+    const customerCalls = (await calls()).filter(call => call.session === b.sessionId && call.customerPrompt === true)
+    const answerCall = customerCalls.find(call => call.customerRequest?.messages?.some(message => message.role === 'user'
+      && message.text?.includes('answer_to_pending_question') && message.text.includes('E2E_B_OPTION_ONE')))
+    return (await state()).questions[b.sessionId] === undefined
+      && customerCalls.length > bCallsBeforePick
+      && answerCall !== undefined
+      && sent.slice(pickStart).some(value => value.touser === 'customer-B' && value.text?.content === 'E2E_B_OPTION_ONE_ACK')
+  }, 'B numbered answer model reply')
   await settle()
   assert.equal((await state()).questions[a.sessionId]?.id, questionA.id)
   assert.ok(sent.slice(pickStart).every(value => value.touser === 'customer-B'))

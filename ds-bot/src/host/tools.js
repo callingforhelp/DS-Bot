@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { readAvatar } from './avatar.js'
-import { COLORS, EXTRA_COLORS, MESSAGE_INLINE_MAX, ROOM_MODES, SOURCE_KIND, TEXT_KEPT } from './constants.js'
+import { COLORS, EXTRA_COLORS, MESSAGE_INLINE_MAX, REPLY_KIND, ROOM_MODES, SOURCE_KIND, TEXT_KEPT } from './constants.js'
 import { within } from './folders.js'
 import { missingFileRefs } from './claims.js'
 import { absoluteLinks } from './links.js'
@@ -63,7 +63,7 @@ const customerMessages = messages => {
   const filtered = messages.filter(message => {
     if (message.role === 'developer') return false
     if (message.role !== 'user') return true
-    return message.source?.kind === 'user' || message.source?.kind === SOURCE_KIND
+    return message.source?.kind === 'user' || message.source?.kind === SOURCE_KIND || message.source?.kind === REPLY_KIND
   })
   return filtered.length === messages.length ? messages : filtered
 }
