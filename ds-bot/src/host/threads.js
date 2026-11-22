@@ -72,7 +72,7 @@ export function startOpenPart(bot, freshId, startedAt = Date.now()) {
 // Makes a live background part current. Each chain travels with its parts.
 export function focusOpenPart(bot, sessionId) {
   const at = (bot.openParts ?? []).findIndex(part => part?.sessionId === sessionId)
-  if (at === -1) return false
+  if (at === -1 || bot.openParts[at].customer !== undefined) return false
   const [target] = bot.openParts.splice(at, 1)
   bot.openParts.push({ sessionId: currentSession(bot), segments: bot.segments ?? [] })
   bot.sessionId = target.sessionId

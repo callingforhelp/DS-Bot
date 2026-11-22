@@ -544,10 +544,15 @@ export function install(rt) {
   }
   // The Session a Bot writes into now, for a card that carries no Session of its own.
   const chatOfBot = botId => rt.botOf(botId) === undefined ? undefined : rt.chatOf(botId)
+  const customerSession = (conn, chatKey, botId) => (rt.botOf(botId)?.openParts ?? [])
+    .find(part => part.customer?.connId === conn.id && part.customer.chatKey === chatKey)?.sessionId
+  const targetSession = (conn, chatKey, target) => target?.roomId !== undefined
+    ? (rt.roomOf(target.roomId)?.sessionId ?? target.roomId)
+    : imPlatform(conn.platform)?.public === true ? customerSession(conn, chatKey, target?.botId) : chatOfBot(target?.botId)
   // A card answered here continues that turn: its replies belong to this chat too.
   const claimChat = (conn, chat, senderId) => {
     const target = conn.chats?.[chat.key]?.target ?? (chat.kind === 'direct' ? { botId: conn.botId } : undefined)
-    const sessionId = target?.roomId !== undefined ? (rt.roomOf(target.roomId)?.sessionId ?? target.roomId) : chatOfBot(target?.botId)
+    const sessionId = targetSession(conn, chat.key, target)
     claimOrigin(sessionId, conn.id, chat.key, senderId)
   }
 
@@ -715,6 +720,8 @@ export function install(rt) {
     const held = openCard(conn, chat.key, cardKey)
     if (held === undefined) return false
     const found = questionById(held.cardKey.slice(2))
+    if (found !== undefined && imPlatform(conn.platform)?.public === true
+      && found.sessionId !== customerSession(conn, chat.key, resolveTarget(conn, conn.chats?.[chat.key])?.botId)) return false
     if (found === undefined) {
       await sendCardReply(conn, chat, text('stale'))
       return 'stale'
@@ -823,12 +830,14 @@ export function install(rt) {
       await sendText(conn, msg.chat, text('readonly'))
       return
     }
-    const sessionId = target.botId ?? target.roomId
+    const customer = imPlatform(conn.platform)?.public === true
+    if (customer && (msg.chat.kind !== 'direct' || target.botId === undefined)) throw new Error('Public customer chats require a direct conversation bound to a Bot')
+    const sessionId = customer ? await rt.customerPart(target.botId, conn.id, msg.chat.key) : target.botId ?? target.roomId
     // The receipt has to sit on the Session that takes the message. A group's own
     // Session moves on to a fresh part (`room.sessionId`) while `room.id` stays the
     // first one, so uploading under the id leaves the receipt on a Session the
     // message never reaches and DSH drops the file (#1121).
-    const uploadTo = target.botId !== undefined
+    const uploadTo = customer ? sessionId : target.botId !== undefined
       ? rt.chatOf(target.botId)
       : rt.sessionOfRoom(rt.roomOf(target.roomId))
     const content = []
@@ -975,6 +984,7 @@ export function install(rt) {
       }
       // Approvals: one card per open approval id, resent to chats whose earlier send dropped.
       for (const entry of rt.approvalsView?.() ?? []) {
+        if (imPlatform(conn.platform)?.public === true) continue
         const cardKey = `a:${entry.id}`
         const bot = rt.botOf(entry.botId)
         const origin = originOf(entry.roomId !== undefined ? (rt.roomOf(entry.roomId)?.sessionId ?? entry.roomId) : chatOfBot(entry.botId))
@@ -985,6 +995,7 @@ export function install(rt) {
       }
       // Secret requests: text only — the key is typed on the computer or phone.
       for (const [botId, list] of Object.entries(state.secretRequests ?? {})) {
+        if (imPlatform(conn.platform)?.public === true) continue
         const bot = rt.botOf(botId)
         if (bot === undefined) continue
         for (const request of list) {
@@ -1082,8 +1093,8 @@ export function install(rt) {
     }
   }
 
-  const busyOf = (target) => {
-    if (target?.botId !== undefined) return rt.live.get(rt.chatOf(target.botId))?.turn !== undefined
+  const busyOf = (conn, chatKey, target) => {
+    if (target?.botId !== undefined) return rt.live.get(targetSession(conn, chatKey, target))?.turn !== undefined
     if (target?.roomId !== undefined) return (rt.roomWorkView?.()[target.roomId] ?? []).length > 0
     return false
   }
@@ -1125,7 +1136,7 @@ export function install(rt) {
       if (typeof runner.handle?.typing === 'function') {
         runner.typing = setInterval(() => {
           for (const { chatKey, chat, target } of targetsOf(fresh(conn.id) ?? conn)) {
-            if (target !== undefined && busyOf(target)) void runner.handle.typing({ key: chat.key ?? chatKey, kind: chat.kind, title: chat.title }).catch?.(() => {})
+            if (target !== undefined && busyOf(conn, chatKey, target)) void runner.handle.typing({ key: chat.key ?? chatKey, kind: chat.kind, title: chat.title }).catch?.(() => {})
           }
         }, TYPING_MS)
         runner.typing.unref?.()

@@ -2103,12 +2103,47 @@ export function install(rt) {
     if (now !== undefined && (now.ref !== picked?.ref || now.effort !== picked?.effort)) await selectRoute({ name: bot.name }, freshId, now)
   }
 
+  const customerParts = new Map()
+  async function customerPart(botId, connId, chatKey) {
+    await rt.load()
+    const bot = rt.botOf(botId)
+    if (bot === undefined) throw Object.assign(new Error('Unknown Bot'), { code: 'bot/not-found' })
+    const existing = (bot.openParts ?? []).find(part => part.customer?.connId === connId && part.customer.chatKey === chatKey)
+    if (existing !== undefined) return existing.sessionId
+    const key = JSON.stringify([botId, connId, chatKey])
+    if (customerParts.has(key)) return customerParts.get(key)
+    const pending = (async () => {
+      const agent = await rt.resolveAgent(rt.chatOf(botId))
+      const freshId = await rt.createSession(bot.name, { dir: rt.workDirOf({ botId }) })
+      const picked = await freshRoute(bot, agent.session)
+      if (picked !== undefined) await selectRoute({ name: bot.name }, freshId, picked)
+      await rt.applyPermission(bot, freshId, undefined)
+        .catch(error => rt.warn('ds-bot: permission for the customer part of %s not applied: %s', bot.name, error))
+      if (rt.botOf(botId) !== bot) {
+        await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true })
+        throw Object.assign(new Error('Unknown Bot'), { code: 'bot/not-found' })
+      }
+      ;(bot.openParts ??= []).push({ sessionId: freshId, segments: [], startedAt: Date.now(), customer: { connId, chatKey } })
+      rt.chatOwners.set(freshId, botId)
+      await rt.save()
+      const now = await freshRoute(bot, agent.session)
+      if (now !== undefined && (now.ref !== picked?.ref || now.effort !== picked?.effort)) await selectRoute({ name: bot.name }, freshId, now)
+      return freshId
+    })()
+    customerParts.set(key, pending)
+    try { return await pending } finally { customerParts.delete(key) }
+  }
+
   // Opening an earlier part again: it becomes the current one and the part that
   // was current joins the earlier ones where it sat.
   async function switchPart(botId, partId) {
     await rt.load()
     const bot = rt.botOf(botId)
     if (bot === undefined) throw Object.assign(new Error('Unknown Bot'), { code: 'bot/not-found' })
+    const thread = threadOfPart(bot, partId)
+    if (thread?.thread === 'open' && bot.openParts[thread.index].customer !== undefined) {
+      throw Object.assign(new Error('Customer conversations cannot become the foreground chat'), { code: 'bot/invalid' })
+    }
     const current = rt.chatOf(botId)
     if (partId === current) return false
     // A part opened while the Bot was busy is live. Making it current swaps the two
@@ -2162,5 +2197,5 @@ export function install(rt) {
     return true
   }
 
-  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, customerPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }

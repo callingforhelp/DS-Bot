@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { createRuntime } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
 import { adapters } from '../src/host/im/platforms/index.js'
+import { focusOpenPart, pushThreadPart } from '../src/host/threads.js'
 
 // A platform adapter that records sends/edits and lets the test feed inbound
 // messages, actions and statuses. `fail` makes send throw once per call queued.
@@ -72,6 +73,7 @@ async function start({ platform = 'telegram', adapter, seed, services = {}, runt
   const ctx = fakeContext({ services })
   const prompts = []
   const agents = new Map()
+  let created = 0
   const agentOf = id => {
     if (!agents.has(id)) agents.set(id, {
       id,
@@ -87,12 +89,14 @@ async function start({ platform = 'telegram', adapter, seed, services = {}, runt
     llm: { listProviders: () => [] },
     workspaceRegistry: { get: () => undefined, resolveByPath: async () => undefined, create: async () => ({ id: 'w1' }), archiveSession: async () => {} },
     sessionController: {
+      create: async () => ({ sessionId: `customer-${++created}` }),
       prompt: async (request) => { prompts.push(request); return { ok: true } },
       resolveAgent: async sessionId => ({ agent: agentOf(sessionId) }),
       selectModel: async () => {},
     },
     sessions: { flush: async () => {} },
   })
+  ctx.sessionTitle = { rename: async () => {} }
   const fake = adapter ?? fakeAdapter()
   const real = adapters[platform]
   adapters[platform] = fake
@@ -134,15 +138,16 @@ test('public customer platforms admit strangers but refuse control commands and 
   t.after(s.stop)
   const conn = await add(s, { corpId: 'test', secret: 'test' })
   await dm(s, 'stranger', '你好')
+  const sessionId = s.prompts.at(-1).sessionId
   assert.equal(s.prompts.length, 1)
   assert.deepEqual(s.rt.state.im.connections[conn.id].paired, [])
   await dm(s, 'stranger', '/stop')
-  assert.equal(s.agentOf('a').cancelled, undefined)
+  assert.equal(s.agentOf(sessionId).cancelled, undefined)
   assert.equal(s.prompts.length, 2)
-  s.rt.state.questions.a = { id: 'q-public', question: 'Pick', options: [{ label: 'yes' }] }
+  s.rt.state.questions[sessionId] = { id: 'q-public', question: 'Pick', options: [{ label: 'yes' }] }
   await dm(s, 'stranger', '1')
   await s.fake.handlers.onAction({ chat: { key: 'dm-stranger', kind: 'direct' }, sender: { id: 'stranger' }, data: 'q:q-public:0' })
-  assert.ok(s.rt.state.questions.a)
+  assert.ok(s.rt.state.questions[sessionId])
   assert.equal(s.prompts.length, 3)
 })
 
@@ -151,7 +156,8 @@ test('public platforms never receive approval cards during reconciliation', asyn
   t.after(s.stop)
   await add(s, { corpId: 'test', secret: 'test' })
   await dm(s, 'customer', 'hello')
-  s.imTurn('a')
+  const sessionId = s.prompts.at(-1).sessionId
+  s.imTurn(sessionId)
   s.rt.approvalsView = () => [{ id: 'public-approval', botId: 'a', tool: 'bash', reason: 'private approval' }]
   await s.rt.save()
   await s.flush()
@@ -166,21 +172,22 @@ test('public customers can answer numbered question cards but not control comman
   t.after(s.stop)
   await add(s, { corpId: 'test', secret: 'test' })
   await dm(s, 'customer', 'hello')
-  s.imTurn('a')
-  s.rt.state.questions.a = { id: 'public-question', question: 'Which?', options: [{ label: 'yes' }, { label: 'no' }] }
+  const sessionId = s.prompts.at(-1).sessionId
+  s.imTurn(sessionId)
+  s.rt.state.questions[sessionId] = { id: 'public-question', question: 'Which?', options: [{ label: 'yes' }, { label: 'no' }] }
   await s.rt.save()
   await s.flush()
   assert.match(s.fake.sent.at(-1).text, /1\. yes/)
   await dm(s, 'customer', '9')
-  assert.ok(s.rt.state.questions.a)
+  assert.ok(s.rt.state.questions[sessionId])
   await dm(s, 'customer', '2')
-  assert.equal(s.rt.state.questions.a, undefined)
-  assert.equal(s.agentOf('a').followed, 1)
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(s.agentOf(sessionId).followed, 1)
   const sent = s.fake.sent.length
   await dm(s, 'customer', '/start')
   await dm(s, 'customer', '/stop')
   assert.equal(s.fake.sent.length, sent)
-  assert.equal(s.agentOf('a').cancelled, undefined)
+  assert.equal(s.agentOf(sessionId).cancelled, undefined)
 })
 
 test('a failed customer question card cannot consume the number that supersedes it', async (t) => {
@@ -188,24 +195,25 @@ test('a failed customer question card cannot consume the number that supersedes 
   t.after(s.stop)
   const conn = await add(s, { corpId: 'test', secret: 'test' })
   await dm(s, 'customer', 'hello')
-  s.imTurn('a')
+  const sessionId = s.prompts.at(-1).sessionId
+  s.imTurn(sessionId)
   s.fake.fails.push(Object.assign(new Error('reply quota exhausted'), { permanent: true }))
-  s.rt.state.questions.a = { id: 'failed-question', question: 'Which?', options: [{ label: 'yes' }] }
+  s.rt.state.questions[sessionId] = { id: 'failed-question', question: 'Which?', options: [{ label: 'yes' }] }
   await s.rt.save()
   await s.flush()
   assert.equal(s.fake.sent.length, 1)
   await dm(s, 'customer', '1')
   assert.equal(s.prompts.length, 2)
-  s.imTurn('a')
+  s.imTurn(sessionId)
   await s.rt.save()
   await s.flush()
-  assert.equal(s.rt.state.questions.a, undefined)
-  assert.equal(s.agentOf('a').followed, undefined)
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(s.agentOf(sessionId).followed, undefined)
   await s.rt.imEndpoint('im-retry', { id: conn.id })
   await s.flush()
   await dm(s, 'customer', '1')
-  assert.equal(s.rt.state.questions.a, undefined)
-  assert.equal(s.agentOf('a').followed, undefined)
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(s.agentOf(sessionId).followed, undefined)
 })
 
 test('replayed customer message IDs cannot answer twice or become prompts after a card closes', async (t) => {
@@ -213,31 +221,32 @@ test('replayed customer message IDs cannot answer twice or become prompts after 
   t.after(s.stop)
   await add(s, { corpId: 'test', secret: 'test' })
   await dm(s, 'customer', 'hello', { messageId: 'greeting' })
-  s.imTurn('a')
-  s.rt.state.questions.a = { id: 'first-question', question: 'Which?', options: [{ label: 'yes' }] }
+  const sessionId = s.prompts.at(-1).sessionId
+  s.imTurn(sessionId)
+  s.rt.state.questions[sessionId] = { id: 'first-question', question: 'Which?', options: [{ label: 'yes' }] }
   await s.rt.save()
   await s.flush()
   await Promise.all([dm(s, 'customer', '1', { messageId: 'answer-one' }), dm(s, 'customer', '1', { messageId: 'answer-one' })])
-  assert.equal(s.rt.state.questions.a, undefined)
-  assert.equal(s.agentOf('a').followed, 1)
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(s.agentOf(sessionId).followed, 1)
   await dm(s, 'customer', '1', { messageId: 'answer-one' })
   assert.equal(s.prompts.length, 1)
-  s.rt.state.questions.a = { id: 'second-question', question: 'Again?', options: [{ label: 'yes' }] }
+  s.rt.state.questions[sessionId] = { id: 'second-question', question: 'Again?', options: [{ label: 'yes' }] }
   await s.rt.save()
   await s.flush()
   await dm(s, 'customer', '1', { messageId: 'answer-one' })
-  assert.ok(s.rt.state.questions.a)
+  assert.ok(s.rt.state.questions[sessionId])
   await dm(s, 'customer', '1', { messageId: 'answer-two' })
-  assert.equal(s.rt.state.questions.a, undefined)
-  assert.equal(s.agentOf('a').followed, 2)
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(s.agentOf(sessionId).followed, 2)
   assert.equal(s.prompts.length, 1)
 })
 
 test('legacy question cards without delivery flags or message IDs remain answerable', async (t) => {
   const seed = TEAM()
   seed.questions.a = { id: 'legacy-question', question: 'Which?', options: [{ label: 'yes' }] }
-  seed.im = { connections: { legacy: { id: 'legacy', platform: 'wecom_kf', botId: 'a', settings: {}, secrets: {}, enabled: true, paired: [], chats: { 'dm-customer': { kind: 'direct' } } } } }
-  const s = await start({ platform: 'wecom_kf', seed, runtime: { legacy: { cards: { 'q:legacy-question': [{ chatKey: 'dm-customer', text: '1. yes' }] } } } })
+  seed.im = { connections: { legacy: { id: 'legacy', platform: 'dingtalk', botId: 'a', settings: {}, secrets: {}, enabled: true, paired: [{ id: 'customer' }], chats: { 'dm-customer': { kind: 'direct' } } } } }
+  const s = await start({ platform: 'dingtalk', seed, runtime: { legacy: { cards: { 'q:legacy-question': [{ chatKey: 'dm-customer', text: '1. yes' }] } } } })
   t.after(s.stop)
   await s.rt.load()
   await dm(s, 'customer', '1')
@@ -257,13 +266,14 @@ test('a successful question send without a message ID remains answerable', async
   t.after(s.stop)
   await add(s, { corpId: 'test', secret: 'test' })
   await dm(s, 'customer', 'hello')
-  s.imTurn('a')
-  s.rt.state.questions.a = { id: 'idless-question', question: 'Which?', options: [{ label: 'yes' }] }
+  const sessionId = s.prompts.at(-1).sessionId
+  s.imTurn(sessionId)
+  s.rt.state.questions[sessionId] = { id: 'idless-question', question: 'Which?', options: [{ label: 'yes' }] }
   await s.rt.save()
   await s.flush()
   await dm(s, 'customer', '1')
-  assert.equal(s.rt.state.questions.a, undefined)
-  assert.equal(s.agentOf('a').followed, 1)
+  assert.equal(s.rt.state.questions[sessionId], undefined)
+  assert.equal(s.agentOf(sessionId).followed, 1)
   assert.equal(s.prompts.length, 1)
 })
 
@@ -282,6 +292,54 @@ test('two concurrent syncs start exactly one adapter', async (t) => {
   await s.flush()
   assert.equal(s.fake.connects, 1)
   assert.equal(s.rt.imStatusView()[conn.id].state, 'ready')
+})
+
+test('public customers have isolated background threads that survive rollover and cannot be focused', async (t) => {
+  const uploads = []
+  const s = await start({ platform: 'wecom_kf', services: { fileUploads: { uploadStream: async ({ sessionId }) => { uploads.push(sessionId); return { id: 'receipt' } } } } })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  await Promise.all([dm(s, 'first', 'hello'), dm(s, 'first', 'again')])
+  const first = s.prompts[0].sessionId
+  assert.equal(s.prompts[1].sessionId, first)
+  await dm(s, 'second', 'hello')
+  const second = s.prompts[2].sessionId
+  assert.notEqual(first, second)
+  const bot = s.rt.botOf('a')
+  assert.equal(bot.openParts.length, 2)
+  assert.equal(s.rt.chatOf('a'), 'a')
+  assert.deepEqual(bot.openParts[0].customer, { connId: conn.id, chatKey: 'dm-first' })
+  await dm(s, 'first', 'attachment', { files: [{ name: 'part.txt', data: Buffer.from('part') }] })
+  assert.deepEqual(uploads, [first])
+  assert.equal(s.prompts.at(-1).sessionId, first)
+  await assert.rejects(s.rt.switchPart('a', first), { code: 'bot/invalid' })
+  assert.equal(focusOpenPart(bot, first), false)
+  pushThreadPart(bot, first, 'rolled-customer', { sessionId: first, endedAt: Date.now() })
+  s.rt.chatOwners.delete(first)
+  s.rt.pastOwners.set(first, { botId: 'a' })
+  s.rt.chatOwners.set('rolled-customer', 'a')
+  await s.rt.save()
+  await dm(s, 'first', 'after rollover')
+  assert.equal(s.prompts.at(-1).sessionId, 'rolled-customer')
+  assert.equal(await s.rt.customerPart('a', conn.id, 'dm-first'), 'rolled-customer')
+  assert.deepEqual(bot.openParts[0].customer, { connId: conn.id, chatKey: 'dm-first' })
+  await assert.rejects(s.rt.switchPart('a', first), { code: 'bot/invalid' })
+  assert.equal(s.rt.chatOf('a'), 'a')
+  await assert.rejects(s.rt.customerPart('missing', conn.id, 'x'), { code: 'bot/not-found' })
+})
+
+test('customer thread creation errors are retryable without reserving a phantom thread', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  const conn = await add(s, { corpId: 'test', secret: 'test' })
+  const create = s.rt.createSession
+  s.rt.createSession = async () => { throw new Error('session unavailable') }
+  await assert.rejects(s.rt.customerPart('a', conn.id, 'dm-first'), /session unavailable/)
+  assert.equal(s.rt.botOf('a').openParts?.length ?? 0, 0)
+  s.rt.createSession = create
+  const id = await s.rt.customerPart('a', conn.id, 'dm-first')
+  assert.notEqual(id, 'a')
+  assert.equal(s.rt.botOf('a').openParts.length, 1)
 })
 
 test('typing carries the chat key, not the chat record', async (t) => {
