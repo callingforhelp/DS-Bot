@@ -922,6 +922,7 @@ export function install(rt) {
   }
 
   const sendCard = async (conn, cardKey, targets, body, buttons) => {
+    if (cardKey.startsWith('a:') && imPlatform(conn.platform)?.public === true) return
     const data = await cardsOf(conn.id)
     if (!runners.has(conn.id)) return
     const entries = data.cards[cardKey] ??= []

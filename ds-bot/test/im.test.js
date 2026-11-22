@@ -144,6 +144,21 @@ test('public customer platforms admit strangers but refuse control commands and 
   assert.equal(s.prompts.length, 3)
 })
 
+test('public platforms never receive approval cards during reconciliation', async (t) => {
+  const s = await start({ platform: 'wecom_kf' })
+  t.after(s.stop)
+  await add(s, { corpId: 'test', secret: 'test' })
+  await dm(s, 'customer', 'hello')
+  s.imTurn('a')
+  s.rt.approvalsView = () => [{ id: 'public-approval', botId: 'a', tool: 'bash', reason: 'private approval' }]
+  await s.rt.save()
+  await s.flush()
+  assert.equal(s.fake.sent.length, 0)
+  await s.rt.save()
+  await s.flush()
+  assert.equal(s.fake.sent.length, 0)
+})
+
 test('two concurrent syncs start exactly one adapter', async (t) => {
   const s = await start()
   t.after(s.stop)
