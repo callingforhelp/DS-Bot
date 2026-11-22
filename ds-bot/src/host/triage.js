@@ -25,6 +25,11 @@ const validType = entry => {
 }
 const clean = value => String(value ?? '').trim().slice(0, 4000)
 const misrouteDetails = outcome => ({ at: outcome.at, correct_route: clean(outcome.correct_route), lesson: clean(outcome.lesson) })
+const recallFeedback = value => Object.fromEntries(
+  ['result', 'correct_route', 'corrected_to', 'lesson']
+    .filter(key => typeof value?.[key] === 'string' && value[key].trim())
+    .map(key => [key, clean(value[key])]),
+)
 const terms = (value) => {
   const text = clean(value).toLowerCase()
   const chars = [...text.replace(/\s/g, '')]
@@ -151,7 +156,20 @@ export function triageBank(home, writable = () => {}, rt) {
           .filter(item => item.score > 0).sort((a, b) => b.score - a.score).slice(0, Math.max(1, Math.min(20, Number(args.limit) || 5)))
         for (const rule of state.rules) if (overlap(query, terms(rule.text)) > 0) rule.hits++
         const visible = customerSession
-          ? ranked.map(item => ({ summary: item.summary, ...(item.attachments_summary ? { attachments_summary: item.attachments_summary } : {}), routed_to: item.routed_to, reason: item.reason, score: item.score }))
+          ? ranked.map(item => {
+            const outcome = recallFeedback(item.outcome)
+            const misroute = recallFeedback(item.misroute)
+            return {
+              summary: item.summary,
+              ...(item.attachments_summary ? { attachments_summary: item.attachments_summary } : {}),
+              routed_to: item.routed_to,
+              reason: item.reason,
+              score: item.score,
+              ...(Object.keys(outcome).length ? { outcome } : {}),
+              ...(Object.keys(misroute).length ? { misroute } : {}),
+              ...(typeof item.corrected_to === 'string' && item.corrected_to.trim() ? { corrected_to: clean(item.corrected_to) } : {}),
+            }
+          })
           : ranked
         return { cases: visible, rules: customerSession ? state.rules.map(rule => ({ text: rule.text })) : state.rules }
       }

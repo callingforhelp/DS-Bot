@@ -42,17 +42,26 @@ test('customer recall and vote use only trusted same-thread case provenance', as
   assert.deepEqual(await s.call({ action: 'log', customer: 'spoofed-B', summary: `B_PRIVATE_${matching}`, routed_to: 'quote', reason: 'B-only detail' }, 'customer-B'), { logged: true })
   const legacy = await s.call({ action: 'log', customer: 'LEGACY_CUSTOMER', summary: `LEGACY_PRIVATE_${matching}`, routed_to: 'quote', reason: 'legacy detail' }, 'staff')
   const stored = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
-  assert.deepEqual(stored.find(item => item.summary.startsWith('A_PRIVATE')).customer_source, sourceA)
+  const caseA = stored.find(item => item.summary.startsWith('A_PRIVATE'))
+  assert.deepEqual(caseA.customer_source, sourceA)
   assert.deepEqual(stored.find(item => item.summary.startsWith('B_PRIVATE')).customer_source, sourceB)
   assert.equal(stored.find(item => item.id === legacy.id).customer_source, undefined)
 
+  await s.call({ action: 'outcome', id: caseA.id, result: 'misrouted', correct_route: 'drawing_review' }, 'staff')
+  const firstCorrection = await s.call({ action: 'recall', query: matching }, 'customer-A-old')
+  assert.deepEqual(firstCorrection.cases[0].outcome, { result: 'misrouted', correct_route: 'drawing_review' })
+  await s.call({ action: 'outcome', id: caseA.id, result: 'resolved' }, 'staff')
   const ownA = await s.call({ action: 'recall', query: matching }, 'customer-A-old')
   assert.deepEqual(ownA.cases.map(item => item.summary), [`A_PRIVATE_${matching}`])
+  assert.deepEqual(ownA.cases[0].outcome, { result: 'resolved' })
+  assert.deepEqual(ownA.cases[0].misroute, { correct_route: 'drawing_review' })
   assert.equal('id' in ownA.cases[0], false)
   assert.equal('customer' in ownA.cases[0], false)
   assert.equal('customer_source' in ownA.cases[0], false)
   const ownB = await s.call({ action: 'recall', query: matching }, 'customer-B')
   assert.deepEqual(ownB.cases.map(item => item.summary), [`B_PRIVATE_${matching}`])
+  assert.equal('outcome' in ownB.cases[0], false)
+  assert.equal('misroute' in ownB.cases[0], false)
   s.customer('customer-unattributed', undefined)
   assert.deepEqual((await s.call({ action: 'recall', query: matching }, 'customer-unattributed')).cases, [])
   assert.deepEqual((await s.call({ action: 'recall', query: matching }, 'staff')).cases.map(item => item.summary).sort(), [`A_PRIVATE_${matching}`, `B_PRIVATE_${matching}`, `LEGACY_PRIVATE_${matching}`])
@@ -62,10 +71,21 @@ test('customer recall and vote use only trusted same-thread case provenance', as
     { route: 'quote', confidence: 0.8, reason: 'matched' },
     { route: 'quote', confidence: 0.8, reason: 'matched' },
   ])
+  const promptStartA = s.calls.length
+  const resultA = await s.call({ action: 'vote', summary: matching, routes: ['quote', 'after_sales'] }, 'customer-A')
+  const promptA = JSON.parse(s.calls[promptStartA].messages[0].content[0].text)
+  assert.deepEqual(promptA.recalled.cases[0].misroute, { correct_route: 'drawing_review' })
+  assert.equal(resultA.case_id, undefined)
+
+  s.replies([
+    { route: 'quote', confidence: 0.8, reason: 'matched' },
+    { route: 'quote', confidence: 0.8, reason: 'matched' },
+  ])
+  const promptStartB = s.calls.length
   const result = await s.call({ action: 'vote', summary: matching, routes: ['quote', 'after_sales'] }, 'customer-B')
-  const prompt = JSON.stringify(s.calls)
-  assert.match(prompt, /B_PRIVATE_MATCHTOKEN/)
-  assert.doesNotMatch(prompt, /A_PRIVATE_MATCHTOKEN|LEGACY_PRIVATE_MATCHTOKEN|conn-A|chat-A|spoofed-A/)
+  const promptB = JSON.parse(s.calls[promptStartB].messages[0].content[0].text)
+  assert.match(JSON.stringify(promptB.recalled.cases), /B_PRIVATE_MATCHTOKEN/)
+  assert.doesNotMatch(JSON.stringify(promptB.recalled.cases), /A_PRIVATE_MATCHTOKEN|LEGACY_PRIVATE_MATCHTOKEN|drawing_review/)
   assert.equal(result.case_id, undefined)
   assert.doesNotMatch(JSON.stringify(result), /conn-B|chat-B|customer_source/)
   const afterVote = (await readFile(join(s.home, 'triage', 'cases.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
