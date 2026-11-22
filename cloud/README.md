@@ -15,6 +15,23 @@ node scripts/drill.mjs   # backup + restore into an empty database, digests comp
 npm run pg:stop
 ```
 
+## Backing up the Mac's DS Bot data
+
+`~/.ds-bot` on the Mac is the only copy of every conversation, Session log, Bot, room and ledger line; RDS holds only
+references back to it. The infra notes with the real AWS IDs and the full risk register are git-ignored on the same Mac.
+`scripts/backup-mac.mjs` copies both off the Mac, encrypted (RISKS.md R49, R50):
+
+```sh
+node scripts/backup-mac.mjs backup --to-dir "/Volumes/<drive>/ds-bot-backups" --keep 14   # and/or --r2 (backups/mac/ in R2_BUCKET)
+node scripts/backup-mac.mjs restore --from <file.dsbkp> --to ~/ds-bot-restore            # or --r2-key backups/mac/<file>
+```
+
+It includes `~/.ds-bot`, `~/.config/ds-bot-cloud` and `infra/*.local.md` (`--include-env` adds `cloud/.env`). The
+passphrase is `DSBOT_BACKUP_PASSPHRASE` (environment or `.env`); store a copy in a password manager. Restore only writes
+to an empty folder, never over `~/.ds-bot`, and checks every file against the manifest. Files written while the backup
+runs may be caught mid-write; run it when DS Bot is idle, or daily from `launchd` (a `StartCalendarInterval` job running
+the backup command above).
+
 ## DS Bot audit pipeline (implemented locally; not deployed)
 
 ```
@@ -70,7 +87,7 @@ and self-asserted `verified_outcome` refused at ingest; synthetic lineage replay
 ## Layout
 
 `migrations/` schema (+ down script, optional pgvector) · `src/` ingest, indexer, search, API, controller,
-worker, object store, authz, bridge adapter · `test/` · `scripts/` Postgres helper, benchmark, restore drill ·
+worker, object store, authz, bridge adapter · `test/` · `scripts/` Postgres helper, benchmark, restore drill, Mac backup ·
 `docs/openapi.yaml`, `docs/benchmark-report.md`, `docs/wp0-inventory.md` · `infra/` staging template · `env.example`.
 
 ## Remote results (19 Nov 2026, RDS + pgvector + real OpenAI embeddings, synthetic corpus)
