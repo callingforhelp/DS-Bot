@@ -7,6 +7,7 @@ const MAX_CASES = 2000
 const MAX_RULES = 200
 const MAX_BYTES = 16 * 1024 * 1024
 const clean = value => String(value ?? '').trim().slice(0, 4000)
+const misrouteDetails = outcome => ({ at: outcome.at, correct_route: clean(outcome.correct_route), lesson: clean(outcome.lesson) })
 const terms = (value) => {
   const text = clean(value).toLowerCase()
   const chars = [...text.replace(/\s/g, '')]
@@ -40,8 +41,7 @@ export function triageBank(home, writable = () => {}) {
   }
   const writeCases = async (cases) => {
     for (const entry of cases) {
-      if (entry.misroute?.at !== undefined) entry.misrouted_at = Math.max(entry.misrouted_at ?? 0, entry.misroute.at)
-      delete entry.misroute
+      if (entry.misroute !== undefined) entry.misroute = misrouteDetails(entry.misroute)
     }
     const lines = cases.map(item => JSON.stringify(item) + '\n')
     let bytes = lines.reduce((size, line) => size + Buffer.byteLength(line), 0)
@@ -80,9 +80,9 @@ export function triageBank(home, writable = () => {}) {
         const entry = cases.find(item => item.id === args.id)
         if (!entry) throw new Error('Triage case not found')
         if (!['correct', 'misrouted', 'resolved'].includes(args.result)) throw new Error('Invalid outcome')
-        if (entry.outcome?.result === 'misrouted') entry.misrouted_at = entry.outcome.at
+        if (entry.outcome?.result === 'misrouted') entry.misroute = misrouteDetails(entry.outcome)
         entry.outcome = { result: args.result, correct_route: clean(args.correct_route), lesson: clean(args.lesson), at: now }
-        if (args.result === 'misrouted') entry.misrouted_at = now
+        if (args.result === 'misrouted') { entry.misrouted_at = now; delete entry.misroute }
         if (args.result === 'misrouted' && clean(args.lesson)) addRule(args.lesson, entry.id)
         result = entry
       } else if (args.action === 'rules') {
@@ -91,7 +91,9 @@ export function triageBank(home, writable = () => {}) {
         else if (args.rule_action === 'list') result = state.rules
         else throw new Error('rule_action must be add, remove or list')
       } else if (args.action === 'review') {
-        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes: cases.filter(item => (item.misrouted_at ?? item.misroute?.at ?? (item.outcome?.result === 'misrouted' ? item.outcome.at : 0)) > state.reviewed), rules: state.rules }
+        const misroutes = cases.filter(item => (item.misrouted_at ?? item.misroute?.at ?? (item.outcome?.result === 'misrouted' ? item.outcome.at : 0)) > state.reviewed)
+          .map(item => ({ ...item, misroute: misrouteDetails(item.outcome?.result === 'misrouted' ? item.outcome : item.misroute ?? { at: item.misrouted_at }) }))
+        result = { since: state.reviewed, cases: cases.filter(item => item.created > state.reviewed), misroutes, rules: state.rules }
         state.reviewed = now
       } else throw new Error('Unknown triage action')
       if (['log', 'outcome'].includes(args.action)) await writeCases(cases)
