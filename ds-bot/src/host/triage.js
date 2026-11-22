@@ -103,6 +103,49 @@ const compactVotes = votes => {
   })
 }
 
+const percent = value => Number.isFinite(value) ? `${Math.round(value * 100)}%` : 'not available'
+
+function handoffDetail(entry) {
+  const handoff = entry.handoff ?? {}
+  const votes = entry.votes ?? []
+  const valid = votes.filter(vote => vote.valid)
+  const routes = new Set(valid.map(vote => vote.route))
+  const threshold = handoff.threshold
+  const confidence = handoff.confidence
+  const agreedRoute = routes.size === 1 ? [...routes][0] : undefined
+  const agreedCandidate = (handoff.candidates ?? []).find(candidate => candidate.route === agreedRoute)
+  const missingTarget = agreedRoute !== undefined && !(typeof agreedCandidate?.target === 'string' && agreedCandidate.target.trim() !== '')
+  const why = handoff.required_judges
+    ? `At least ${handoff.required_judges} distinct judges are required.`
+    : valid.length === 0
+      ? 'No valid judge vote was available.'
+      : routes.size > 1
+        ? 'The judges did not agree on one route.'
+        : Number.isFinite(confidence) && Number.isFinite(threshold) && confidence < threshold
+          ? 'Consensus confidence was below the required threshold.'
+          : missingTarget
+            ? `The judges agreed on ${agreedRoute}, but no destination is configured for this route.`
+          : 'The votes did not meet the routing agreement requirements.'
+  const voteLines = votes.map(vote => {
+    const route = vote.valid ? vote.route : 'No valid route'
+    const score = vote.valid ? percent(vote.confidence) : 'not available'
+    const reason = clean(vote.reason).slice(0, 220)
+    return `- ${clean(vote.judge)}: ${route} · ${score}${reason ? ` · ${reason}` : ''}`
+  })
+  const candidateLines = (handoff.candidates ?? []).map(candidate => {
+    const route = clean(candidate.route)
+    const target = typeof candidate.target === 'string' ? clean(candidate.target) : ''
+    return `- ${route} → ${target || 'Unconfigured'}`
+  })
+  return [
+    `Summary\n${entry.summary}`,
+    `Why handoff\n${why}\nConsensus confidence: ${percent(confidence)}; required threshold: ${percent(threshold)}.`,
+    `Votes\n${voteLines.join('\n') || '- No judge votes'}`,
+    `Candidate destinations\n${candidateLines.join('\n') || '- No registered candidate destinations'}`,
+    `Source\nCustomer conversation · Case ${String(entry.id ?? '').slice(0, 8)}\nConversation reference: ${typeof handoff.sessionId === 'string' ? handoff.sessionId : 'unavailable'}`,
+  ].join('\n\n')
+}
+
 async function judgeVotes(rt, config, args, context, recalled) {
   if (typeof args.summary !== 'string' || !clean(args.summary)) throw new Error('summary is required')
   if (!Array.isArray(args.routes) || args.routes.length < 2 || args.routes.some(route => typeof route !== 'string' || !route.trim() || route.length > 4000) || new Set(args.routes).size !== args.routes.length) throw new Error('routes must contain at least two distinct nonempty candidates')
@@ -292,7 +335,7 @@ export function triageBank(home, writable = () => {}, rt) {
             route: entry.type, runtime: entry.runtime, target: entry.target, permission: entry.permission,
             method: entry.runtime === 'ds-bot' && entry.target ? 'message_bot' : 'staff',
           }))
-          retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', ...(customerSource ? { customer_source: customerSource } : {}), ...(result.delivery ? { delivery: result.delivery } : {}), handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes, candidates, ...(result.required_judges ? { required_judges: result.required_judges } : {}) } }
+          retained = { id: randomUUID(), created: now, summary: clean(args.summary), votes: result.votes, decision: 'handoff', ...(customerSource ? { customer_source: customerSource } : {}), ...(result.delivery ? { delivery: result.delivery } : {}), handoff: { status: 'pending', botId: context.botId, sessionId: context.sessionId, routes, candidates, confidence: result.confidence, threshold: result.threshold, ...(result.required_judges ? { required_judges: result.required_judges } : {}) } }
           cases.push(retained)
           await writeCases(cases, retained, state.rules)
           hasPending = true
@@ -382,17 +425,11 @@ export function triageBank(home, writable = () => {}, rt) {
           .map(candidate => candidate.route)
         const votedRoutes = routes.filter(route => counts.has(route))
         const destinations = routes.map(route => candidates.find(candidate => candidate.route === route)).filter(Boolean)
-        const detail = {
-          source: { bot_id: entry.handoff.botId, customer_session_id: entry.handoff.sessionId },
-          case: { id: entry.id, summary: entry.summary, summary_untrusted: true },
-          candidate_destinations: destinations,
-          votes: entry.votes.map(vote => ({ judge: vote.judge, valid: vote.valid, ...(vote.route ? { route: vote.route } : {}), ...(vote.confidence !== undefined ? { confidence: vote.confidence } : {}), reason: String(vote.reason ?? '').slice(0, 500) })),
-          ...(entry.handoff.required_judges ? { required_judges: entry.handoff.required_judges } : {}),
-        }
+        const detail = handoffDetail({ ...entry, handoff: { ...entry.handoff, candidates: destinations } })
         rt.state.questions[sessionId] = {
           id: questionId,
           question: `Customer case ${entry.id.slice(0, 8)}: ${entry.summary.slice(0, 160)}`,
-          detail: JSON.stringify(detail),
+          detail,
           options: [...votedRoutes.map(label => ({ label })), { label: "I'll handle it myself" }],
           multiSelect: false, allowCustom: true, askedAt: Date.now(),
         }

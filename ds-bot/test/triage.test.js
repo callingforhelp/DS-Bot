@@ -224,6 +224,9 @@ test('registry voting delivers only configured DS Bot targets and hands off Devi
   assert.equal(result.decision, 'handoff')
   assert.equal(result.route, undefined)
   assert.equal(result.delivery.method, 'staff')
+  Object.assign(s.rt, { state: { questions: {} }, chatOf: () => 'main', isCustomerPart: () => false, save: async () => {} })
+  await s.bank.syncHandoffs()
+  assert.ok(s.rt.state.questions.main.detail.includes('The judges agreed on quote, but no destination is configured for this route.'))
   const prompt = JSON.parse(s.calls.at(-1).messages[0].content[0].text)
   assert.equal(prompt.types.length, 4)
   assert.ok(prompt.types[0].handles && prompt.types[0].examples.length === 2)
@@ -268,7 +271,7 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   await s.call({ action: 'types', type_action: 'edit', type: 'drawing_review', target: 'Drawing Bot' })
   await s.call({ action: 'types', type_action: 'edit', type: 'order_status', target: 'Orders Bot' })
   s.rt.state.questions.main = { id: 'staff-question', question: 'Do not replace me' }
-  const summary = Array(20).fill('Customer asked for a detailed quote.').join(' ')
+  const summary = `客户需要详细报价。 ${Array(20).fill('Customer asked for a detailed quote.').join(' ')}`
   s.replies([
     { route: 'quote', confidence: 0.8, reason: 'quote request' },
     { route: 'order_status', confidence: 0.8, reason: 'order inquiry' },
@@ -281,11 +284,22 @@ test('pending handoffs survive bank reload and remain visible after a review', a
   assert.equal(result.case_id, undefined)
   const pending = (await s.call({ action: 'review' }, 'staff')).pending_handoffs[0]
   assert.equal(s.rt.state.questions.main.id, `triage-${pending.id}`)
-  const detail = JSON.parse(s.rt.state.questions.main.detail)
-  assert.deepEqual(detail.source, { bot_id: 'bot', customer_session_id: 'customer' })
-  assert.equal(detail.case.summary, summary)
-  assert.equal(detail.case.summary_untrusted, true)
-  assert.deepEqual(detail.candidate_destinations.map(entry => [entry.route, entry.target]), [['quote', 'Quote Bot'], ['order_status', 'Orders Bot'], ['drawing_review', 'Drawing Bot']])
+  const detail = s.rt.state.questions.main.detail
+  assert.equal(detail.startsWith('Summary\n'), true)
+  assert.ok(detail.includes(summary))
+  assert.ok(detail.indexOf('Summary\n') < detail.indexOf('Why handoff\n'))
+  assert.ok(detail.includes('The judges did not agree on one route.'))
+  assert.ok(detail.includes('Consensus confidence: 80%; required threshold: 70%.'))
+  assert.ok(detail.includes('p/one: quote · 80% · quote request'))
+  assert.ok(detail.includes('p/two: order_status · 80% · order inquiry'))
+  assert.ok(detail.includes('quote → Quote Bot'))
+  assert.ok(detail.includes('order_status → Orders Bot'))
+  assert.ok(detail.includes('drawing_review → Drawing Bot'))
+  assert.ok(detail.includes('Source\nCustomer conversation'))
+  assert.ok(detail.includes('Conversation reference:'))
+  assert.ok(detail.includes(`Case ${pending.id.slice(0, 8)}`))
+  assert.doesNotMatch(detail, /customer_session_id|candidate_destinations|summary_untrusted|\"source\"/)
+  assert.equal(detail.trimStart().startsWith('{'), false)
   assert.deepEqual(s.rt.state.questions.main.options.map(option => option.label), ['quote', 'order_status', "I'll handle it myself"])
   assert.equal(s.rt.state.questions.main.allowCustom, true)
   assert.equal(s.rt.state.questions.customer, undefined)
@@ -462,7 +476,12 @@ test('repeated outcomes keep all unpublished lessons private until a linked rule
     assert.equal('lesson_history' in recalled.cases[0], false)
     assert.doesNotMatch(JSON.stringify(recalled), /PRIVATE_(FIRST_MISROUTE|SECOND_MISROUTE|RESOLVED_NOTE|CORRECT_NOTE)/)
     const stored = JSON.parse((await readFile(casesPath, 'utf8')).trim())
-    assert.equal(stored.lesson_history.length, 3)
+    const storedLessons = [stored.outcome, stored.misroute, ...(stored.lesson_history ?? [])]
+      .filter(note => note?.lesson)
+      .map(note => note.lesson)
+    assert.deepEqual(storedLessons.sort(), expected)
+    assert.equal(new Set(storedLessons).size, storedLessons.length)
+    assert.equal((stored.lesson_history ?? []).length, 2)
 
     t.mock.timers.setTime(1600)
     await s.call({ action: 'rules', rule_action: 'add', id, text: 'Sanitized drawing guidance.' }, 'staff')
@@ -487,14 +506,14 @@ test('misroute lessons are stored once when outcomes change and remain pending a
     await s.call({ action: 'outcome', id, result: 'resolved', correct_route: 'after_sales', lesson: 'PRIVATE_RESOLVED_NOTE' }, 'staff')
     let stored = JSON.parse((await readFile(casesPath, 'utf8')).trim())
     assert.equal(copies(stored), 1)
-    assert.equal(stored.lesson_history?.some(note => note.lesson === lesson), false)
+    assert.equal((stored.lesson_history ?? []).filter(note => note.lesson === lesson).length, 0)
     assert.equal(stored.misroute.lesson, lesson)
 
     t.mock.timers.setTime(1300)
     await s.call({ action: 'outcome', id, result: 'misrouted', correct_route: 'quote', lesson: 'PRIVATE_LATER_MISROUTE' }, 'staff')
     stored = JSON.parse((await readFile(casesPath, 'utf8')).trim())
     assert.equal(copies(stored), 1)
-    assert.equal(stored.lesson_history.filter(note => note.lesson === lesson).length, 1)
+    assert.equal((stored.lesson_history ?? []).filter(note => note.lesson === lesson).length, 1)
     assert.equal((await s.call({ action: 'review' }, 'staff')).pending_lessons.filter(note => note.id === id && note.lesson === lesson).length, 1)
 
     const reloaded = triageBank(s.home, () => {}, s.rt)

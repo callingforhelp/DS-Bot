@@ -125,10 +125,10 @@ try {
   message('customer-A', '', true)
   await until(async () => mediaReads > 0 && (await calls()).some(call => call.last?.includes('Test bracket')), 'STEP facts reach model')
   await settle()
-  const a = (await state()).bots[chief.id].openParts.find(part => part.customer?.chatKey === 'customer-A')
+  const a = (await state()).bots[chief.id].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-A')
   assert.ok(a)
   assert.equal((await state()).bots[chief.id].sessionId ?? chief.id, foreground)
-  assert.ok((await calls()).some(call => call.session === a.sessionId && call.last?.includes('MILLI.')))
+  assert.ok((await calls()).some(call => call.session === a.sessionId && call.last?.includes('SI_UNIT(.MILLI.,.METRE.)')))
   passed('A has a background thread and real STEP media facts reach the mock model')
   message('customer-B', '客户B：订单现在到哪一步 B_ONLY_CONTEXT_875')
   const beforeB = sent.length
@@ -136,7 +136,7 @@ try {
     await until(() => sent.some(value => value.touser === 'customer-B'), 'B reply', 20_000)
   } catch (error) {
     const current = (await state()).bots[chief.id]
-    const sessionId = current.openParts.find(part => part.customer?.chatKey === 'customer-B')?.sessionId
+    const sessionId = current.tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-B')?.sessionId
     const customerPage = await api('customer-page', { sessionId })
     const mainPage = await api('chat', { botId: chief.id })
     const currentView = await api('state')
@@ -149,7 +149,7 @@ try {
     throw error
   }
   await settle()
-  const b = (await state()).bots[chief.id].openParts.find(part => part.customer?.chatKey === 'customer-B')
+  const b = (await state()).bots[chief.id].tasks.find(task => task.origin === 'customer' && task.customer?.chatKey === 'customer-B')
   assert.ok(b && b.sessionId !== a.sessionId)
   assert.ok(sent.slice(beforeB).length > 0 && sent.slice(beforeB).every(value => value.touser === 'customer-B'))
   assert.ok((await calls()).some(call => call.session === b.sessionId && call.last?.includes('B_ONLY_CONTEXT_875')))
@@ -167,10 +167,11 @@ try {
   const handoff = (await state()).questions[foreground]
   assert.ok(handoff?.id.startsWith('triage-'))
   assert.equal((await state()).questions[a.sessionId], undefined)
-  const handoffDetail = JSON.parse(handoff.detail)
-  assert.equal(handoffDetail.source.customer_session_id, a.sessionId)
-  assert.equal(handoffDetail.case.summary, 'DISAGREE：客户需要确认责任归属')
-  assert.ok(handoffDetail.candidate_destinations.some(candidate => candidate.route === 'quote' && candidate.target === 'Quote'))
+  assert.match(handoff.detail, /^Summary\n/)
+  assert.ok(handoff.detail.includes('DISAGREE：客户需要确认责任归属'))
+  assert.ok(handoff.detail.includes('quote → Quote'))
+  assert.ok(handoff.detail.includes('Customer conversation'))
+  assert.doesNotMatch(handoff.detail, /customer_session_id|candidate_destinations|\{"case"/)
   assert.ok(replies.some(value => value.touser === 'customer-A' && /您好.*专人/.test(value.text?.content)))
   const quoteId = quote.id ?? Object.values((await state()).bots).find(bot => bot.name === 'Quote').id
   await staff(quoteId, { action: 'review' })

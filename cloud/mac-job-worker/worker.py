@@ -34,7 +34,6 @@ DEFAULT_ALLOWED_ROOTS = (
     "/Users/chief/devin-agent-work",
     "/Users/chief/ds-bot-dev",
     "/Users/chief/.gemini/antigravity/scratch",
-    "/Users/chief/.paradev/worktrees",
 )
 FORBIDDEN_HOME_SUBDIRS = {
     ".ssh",
@@ -44,7 +43,6 @@ FORBIDDEN_HOME_SUBDIRS = {
     "Library",
     ".Trash",
 }
-DEFAULT_SESSIONS_FILE = "/Users/chief/.mac-job-worker/state/paradev_sessions.json"
 
 
 def redact_secrets(text: str) -> str:
@@ -122,15 +120,39 @@ class BrokerClient:
                 return exc.code, {"ok": False, "error": raw}
 
 
+class HttpHealthProbe:
+    """HTTP GET readiness probe returning True iff status is 2xx."""
+
+    def __init__(self, url: str, timeout: float = 3.0) -> None:
+        self.url = url
+        self.timeout = timeout
+
+    def __call__(self) -> bool:
+        try:
+            req = urllib.request.Request(self.url, method="GET")
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return 200 <= int(getattr(resp, "status", 0)) < 300
+        except urllib.error.HTTPError as exc:
+            try:
+                exc.close()
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
+
 class SsmTunnelManager:
     def __init__(
         self,
-        broker: BrokerClient,
+        broker: Optional[BrokerClient],
         profile: str,
         region: str,
         instance_id: str,
         remote_port: int = 13090,
         local_port: int = 13090,
+        health_check: Optional[Callable[[], bool]] = None,
+        label: str = "broker",
     ) -> None:
         self.broker = broker
         self.profile = profile
@@ -138,12 +160,19 @@ class SsmTunnelManager:
         self.instance_id = instance_id
         self.remote_port = remote_port
         self.local_port = local_port
+        self.health_check = health_check
+        self.label = label
         self.proc: Optional[subprocess.Popen[str]] = None
         self._backoff_idx = 0
         self._backoffs = [2, 5, 10, 30]
 
+    def _log_prefix(self) -> str:
+        return "[worker]" if self.label == "broker" else f"[worker:{self.label}]"
+
     def is_healthy(self) -> bool:
-        return self.broker.healthz(timeout=3.0) is not None
+        if self.health_check is not None:
+            return bool(self.health_check())
+        return self.broker is not None and self.broker.healthz(timeout=3.0) is not None
 
     def stop(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -164,6 +193,7 @@ class SsmTunnelManager:
             return False
 
         self.stop()
+        prefix = self._log_prefix()
         while not stop_event.is_set():
             params = json.dumps(
                 {
@@ -187,7 +217,7 @@ class SsmTunnelManager:
                 params,
             ]
             sys.stderr.write(
-                f"[worker] starting SSM tunnel {self.local_port}->{self.remote_port}\n"
+                f"{prefix} starting SSM tunnel {self.local_port}->{self.remote_port}\n"
             )
             self.proc = subprocess.Popen(
                 cmd,
@@ -204,54 +234,45 @@ class SsmTunnelManager:
                     if self.proc.stdout:
                         out = self.proc.stdout.read()[:500]
                     sys.stderr.write(
-                        f"[worker] SSM process exited early ({self.proc.returncode}): {out}\n"
+                        f"{prefix} SSM process exited early ({self.proc.returncode}): {out}\n"
                     )
                     break
                 if self.is_healthy():
                     self._backoff_idx = 0
-                    sys.stderr.write("[worker] SSM tunnel healthy\n")
+                    sys.stderr.write(f"{prefix} SSM tunnel healthy\n")
                     return True
                 time.sleep(0.5)
 
             self.stop()
             wait_s = self._backoffs[min(self._backoff_idx, len(self._backoffs) - 1)]
             self._backoff_idx += 1
-            sys.stderr.write(f"[worker] retrying SSM tunnel in {wait_s}s\n")
+            sys.stderr.write(f"{prefix} retrying SSM tunnel in {wait_s}s\n")
             stop_event.wait(wait_s)
         return False
 
 
-def _find_paradev_project(
-    repo_hint: str, paradev_bin: str
-) -> Optional[dict[str, Any]]:
-    needle = repo_hint.strip().lower()
-    if not needle:
-        return None
-    short = needle.rstrip("/").removesuffix(".git").split("/")[-1]
-    proj_res = subprocess.run(
-        [paradev_bin, "projects", "list", "--local", "--json"],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    if proj_res.returncode != 0 or not proj_res.stdout.strip():
-        return None
-    try:
-        projects = json.loads(proj_res.stdout)
-    except Exception:
-        return None
-    for p in projects:
-        hay = " ".join(
-            str(p.get(k) or "") for k in ("id", "name", "repo", "path")
-        ).lower()
-        if needle in hay or (short and str(p.get("name") or "").lower() == short):
-            return p
-    return None
+def start_tunnel_watchdog(
+    tunnel: SsmTunnelManager,
+    stop_event: threading.Event,
+    interval_sec: float = 20.0,
+) -> threading.Thread:
+    """Keep a secondary SSM tunnel alive in a daemon thread."""
+
+    def _loop() -> None:
+        while not stop_event.is_set():
+            try:
+                tunnel.ensure_connected(stop_event)
+            except Exception as exc:
+                sys.stderr.write(f"{tunnel._log_prefix()} watchdog error: {exc}\n")
+            stop_event.wait(interval_sec)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
 
 
 def is_authorized_local_path(
-    path: str, paradev_bin: str = "", parent_dir: str = "/Users/chief"
+    path: str, parent_dir: str = "/Users/chief"
 ) -> bool:
     real = os.path.realpath(os.path.expanduser(path))
     real_parent = os.path.realpath(os.path.expanduser(parent_dir))
@@ -276,30 +297,6 @@ def is_authorized_local_path(
 
     if env_set:
         return False
-
-    if paradev_bin and os.path.exists(paradev_bin):
-        try:
-            proj_res = subprocess.run(
-                [paradev_bin, "projects", "list", "--local", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            if proj_res.returncode == 0 and proj_res.stdout.strip():
-                for p in json.loads(proj_res.stdout):
-                    proj_path = str(p.get("path") or "").strip()
-                    if not proj_path:
-                        continue
-                    proj_lower = os.path.realpath(
-                        os.path.expanduser(proj_path)
-                    ).lower()
-                    if real_lower == proj_lower or real_lower.startswith(
-                        proj_lower + os.sep
-                    ):
-                        return True
-        except Exception:
-            pass
 
     if real_lower.startswith(parent_prefix):
         top = real[len(real_parent) + 1 :].split(os.sep, 1)[0]
@@ -338,719 +335,6 @@ def _ensure_local_git_repo(dir_path: str, short_name: str) -> None:
     )
 
 
-def _remote_github_exists(clone_url: str) -> bool:
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    try:
-        res = subprocess.run(
-            ["git", "ls-remote", "--exit-code", clone_url, "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-            env=env,
-        )
-    except Exception:
-        return False
-    return res.returncode == 0
-
-
-def ensure_paradev_project(
-    repo_hint: str,
-    paradev_bin: str,
-    parent_dir: str = "/Users/chief",
-    local_only: bool = False,
-    cwd: Optional[str] = None,
-) -> tuple[Optional[dict[str, Any]], bool]:
-    """Check ParaDev projects first; if missing, import local repo or clone GitHub repo."""
-    if not (repo_hint or "").strip() and not (cwd or "").strip():
-        return None, False
-    raw = (repo_hint or cwd or "").strip()
-    short_name = raw.rstrip("/").removesuffix(".git").split("/")[-1]
-
-    existing = _find_paradev_project(raw, paradev_bin)
-    if existing is None and cwd:
-        existing = _find_paradev_project(cwd, paradev_bin)
-    if existing is not None:
-        if existing.get("path") and not is_authorized_local_path(
-            str(existing["path"]), paradev_bin, parent_dir=parent_dir
-        ):
-            raise RuntimeError(f"Unauthorized local path: {existing['path']}")
-        if cwd and cwd.strip() and not is_authorized_local_path(
-            os.path.expanduser(cwd.strip()), paradev_bin, parent_dir=parent_dir
-        ):
-            raise RuntimeError(
-                f"Unauthorized local path: {os.path.expanduser(cwd.strip())}"
-            )
-        return existing, True
-
-    if cwd and cwd.strip():
-        local_candidate = os.path.expanduser(cwd.strip())
-    elif raw.startswith(("/", "~")) or os.path.isdir(os.path.expanduser(raw)):
-        local_candidate = os.path.expanduser(raw)
-    else:
-        local_candidate = os.path.join(parent_dir, short_name)
-
-    if not is_authorized_local_path(local_candidate, paradev_bin, parent_dir=parent_dir):
-        raise RuntimeError(f"Unauthorized local path: {local_candidate}")
-
-    if os.path.isdir(local_candidate):
-        _ensure_local_git_repo(local_candidate, short_name)
-        cmd = [
-            paradev_bin,
-            "projects",
-            "create",
-            "--local",
-            "--name",
-            short_name,
-            "--import",
-            local_candidate,
-            "--json",
-        ]
-    else:
-        if raw.startswith(("http://", "https://", "git@", "ssh://")):
-            clone_url = raw
-        elif "/" in raw:
-            clone_url = f"https://github.com/{raw.strip('/')}.git"
-        else:
-            clone_url = f"https://github.com/callingforhelp/{short_name}.git"
-        if local_only or not _remote_github_exists(clone_url):
-            _ensure_local_git_repo(local_candidate, short_name)
-            cmd = [
-                paradev_bin,
-                "projects",
-                "create",
-                "--local",
-                "--name",
-                short_name,
-                "--import",
-                local_candidate,
-                "--json",
-            ]
-        else:
-            cmd = [
-                paradev_bin,
-                "projects",
-                "create",
-                "--local",
-                "--name",
-                short_name,
-                "--clone",
-                clone_url,
-                "--parent-dir",
-                parent_dir,
-                "--json",
-            ]
-
-    created = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=90,
-        check=False,
-    )
-    if created.returncode != 0:
-        raise RuntimeError(
-            f"paradev projects create failed ({created.returncode}): {created.stderr or created.stdout}"
-        )
-    adopted = _find_paradev_project(short_name, paradev_bin)
-    if adopted is None:
-        try:
-            adopted = json.loads(created.stdout)
-        except Exception:
-            adopted = {"name": short_name}
-    return adopted, False
-
-
-def default_paradev_register_runner(
-    job: dict[str, Any], paradev_bin: str
-) -> dict[str, Optional[str]]:
-    repo = str(job.get("repo") or job.get("cwd") or "").strip()
-    cwd = str(job.get("cwd") or "").strip() or None
-    local_only = bool(job.get("local_only"))
-    if not repo:
-        return {
-            "status": "failed",
-            "result_summary": "",
-            "pr_url": None,
-            "error": "repo is required for paradev_register",
-        }
-    proj, already = ensure_paradev_project(
-        repo, paradev_bin, local_only=local_only, cwd=cwd
-    )
-    return {
-        "status": "succeeded",
-        "result_summary": json.dumps(
-            {"already_registered": already, "project": proj}, ensure_ascii=False
-        ),
-        "pr_url": None,
-        "error": None,
-    }
-
-
-def paradev_session_key(
-    repo: Optional[str] = None,
-    cwd: Optional[str] = None,
-    workspace_id: Optional[str] = None,
-    branch: Optional[str] = None,
-) -> str:
-    return f"{(repo or cwd or workspace_id or 'default').strip()}:{(branch or 'default').strip()}"
-
-
-class ParadevSessionStore:
-    def __init__(self, path: str = DEFAULT_SESSIONS_FILE) -> None:
-        self.path = path
-
-    def _load(self) -> dict[str, Any]:
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-    def _save(self, data: dict[str, Any]) -> None:
-        parent = os.path.dirname(self.path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp = f"{self.path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-        os.replace(tmp, self.path)
-
-    def get(self, key: str) -> Optional[dict[str, Any]]:
-        entry = self._load().get(key)
-        return entry if isinstance(entry, dict) else None
-
-    def set(self, key: str, entry: dict[str, Any]) -> None:
-        data = self._load()
-        data[key] = entry
-        self._save(data)
-
-    def upsert(self, key: str, updates: dict[str, Any]) -> None:
-        data = self._load()
-        ws = updates.get("workspace_id")
-        if ws:
-            for k, existing in data.items():
-                if isinstance(existing, dict) and existing.get("workspace_id") == ws:
-                    key = k
-                    break
-        existing = data.get(key)
-        merged = dict(existing) if isinstance(existing, dict) else {}
-        existing_ws = merged.get("workspace_id")
-        if existing_ws and ws and str(existing_ws) != str(ws):
-            for stale in ("worker_terminal_id", "reviewer_terminal_id", "worktree_path"):
-                merged.pop(stale, None)
-        merged.update(updates)
-        data[key] = merged
-        self._save(data)
-
-    def find_by_workspace(self, ws_id: str) -> Optional[dict[str, Any]]:
-        for entry in self._load().values():
-            if isinstance(entry, dict) and str(entry.get("workspace_id") or "") == ws_id:
-                return entry
-        return None
-
-
-def _is_terminal_alive(paradev_bin: str, ws_id: str, term_id: str) -> bool:
-    try:
-        res = subprocess.run(
-            [
-                paradev_bin,
-                "terminals",
-                "list",
-                "--local",
-                "--workspace",
-                ws_id,
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if res.returncode != 0 or not res.stdout.strip():
-            return False
-        data = json.loads(res.stdout)
-    except Exception:
-        return False
-    for entry in data.get("sessions") or []:
-        if (
-            entry.get("terminalId") == term_id or entry.get("id") == term_id
-        ) and not entry.get("exited", False):
-            return True
-    return False
-
-
-def _get_workspace_info(
-    paradev_bin: str,
-    ws_id: Optional[str] = None,
-    project_id: Optional[str] = None,
-    branch: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
-    try:
-        res = subprocess.run(
-            [paradev_bin, "ws", "list", "--local", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        if res.returncode != 0 or not res.stdout.strip():
-            return None
-        workspaces = json.loads(res.stdout)
-    except Exception:
-        return None
-    if not isinstance(workspaces, list):
-        return None
-    if ws_id:
-        for w in workspaces:
-            if w.get("id") == ws_id and not w.get("archivedAt"):
-                return w
-        return None
-    if project_id:
-        for w in workspaces:
-            if w.get("archivedAt"):
-                continue
-            pid = w.get("projectId") or w.get("project_id")
-            if not pid:
-                proj = w.get("project")
-                if isinstance(proj, dict):
-                    pid = proj.get("id")
-                elif isinstance(proj, str):
-                    pid = proj
-            if str(pid or "") != str(project_id):
-                continue
-            if branch and w.get("branch") != branch:
-                continue
-            return w
-    return None
-
-
-def _read_agent_output(paradev_bin: str, ws_id: str, term_id: str) -> str:
-    read_res = subprocess.run(
-        [
-            paradev_bin,
-            "agents",
-            "read",
-            "--local",
-            "--workspace",
-            ws_id,
-            "--terminal",
-            term_id,
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    raw_text = read_res.stdout
-    if read_res.returncode == 0:
-        try:
-            parsed = json.loads(read_res.stdout)
-            if isinstance(parsed, dict) and "text" in parsed:
-                raw_text = str(parsed.get("text") or "")
-        except Exception:
-            pass
-    if read_res.returncode == 0 and raw_text.strip():
-        return raw_text
-    term_res = subprocess.run(
-        [
-            paradev_bin,
-            "terminals",
-            "read",
-            "--local",
-            "--workspace",
-            ws_id,
-            "--terminal",
-            term_id,
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if term_res.returncode != 0:
-        raise RuntimeError(
-            f"paradev terminals read failed ({term_res.returncode}): {term_res.stderr or term_res.stdout or read_res.stderr}"
-        )
-    raw_text = term_res.stdout
-    try:
-        parsed = json.loads(term_res.stdout)
-        if isinstance(parsed, dict) and "text" in parsed:
-            raw_text = str(parsed.get("text") or "")
-    except Exception:
-        pass
-    if not raw_text.strip():
-        raise RuntimeError(
-            f"paradev agents read and terminals read returned no transcript: {read_res.stderr or read_res.stdout or term_res.stdout}"
-        )
-    return raw_text
-
-
-def _agent_result(
-    raw_text: str,
-    ws_id: str,
-    term_id: str,
-    agent: str,
-    role: str = "worker",
-    worktree_path: Optional[str] = None,
-) -> dict[str, Optional[str]]:
-    if "\nAssistant:" in raw_text:
-        summary = raw_text.rsplit("\nAssistant:", 1)[1].strip()
-    elif raw_text.startswith("Assistant:"):
-        summary = raw_text[len("Assistant:") :].strip()
-    else:
-        summary = raw_text.strip()
-    summary += f"\n\n[paradev workspace_id={ws_id} terminal_id={term_id} role={role} agent={agent}]"
-    return {
-        "status": "succeeded",
-        "result_summary": redact_secrets(summary),
-        "pr_url": extract_pr_url(summary),
-        "error": None,
-        "workspace_id": ws_id,
-        "terminal_id": term_id,
-        "role": role,
-        "agent": agent,
-        "worktree_path": worktree_path,
-    }
-
-
-def _wait_agent_settled(
-    paradev_bin: str, ws_id: str, term_id: str, timeout_sec: int
-) -> None:
-    wait_res = subprocess.run(
-        [
-            paradev_bin,
-            "agents",
-            "wait",
-            "--local",
-            "--workspace",
-            ws_id,
-            "--terminal",
-            term_id,
-            "--until",
-            "settled",
-            "--timeout",
-            str(timeout_sec),
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec + 30,
-        check=False,
-    )
-    if wait_res.returncode != 0:
-        raise RuntimeError(
-            f"paradev agents wait failed ({wait_res.returncode}): {wait_res.stderr or wait_res.stdout}"
-        )
-
-
-def default_paradev_runner(
-    job: dict[str, Any],
-    paradev_bin: str,
-    dsh_bin: str = "/usr/local/bin/dsh",
-    headless_patch: str = "/Users/chief/.mac-job-worker/headless.patch.yml",
-    sessions_file: Optional[str] = None,
-) -> dict[str, Optional[str]]:
-    task = str(job["task"])
-    timeout_sec = int(job.get("timeout_sec") or 900)
-    repo_hint = str(job.get("repo") or "").strip()
-    branch = str(job.get("branch") or "").strip()
-    ws_id = str(job.get("workspace_id") or "").strip() or None
-    term_id = str(job.get("terminal_id") or "").strip() or None
-    agent = str(job.get("agent") or "codex").strip() or "codex"
-    cwd = str(job.get("cwd") or "").strip() or None
-    local_only = bool(job.get("local_only"))
-    role = str(job.get("role") or "worker").strip().lower() or "worker"
-
-    if cwd and not is_authorized_local_path(cwd, paradev_bin):
-        raise RuntimeError(f"Unauthorized local path: {cwd}")
-
-    strict_roots = "MAC_WORKER_ALLOWED_ROOTS" in os.environ
-
-    def _authorized_worktree(
-        workspace_id: str, workspace: Optional[dict[str, Any]]
-    ) -> Optional[str]:
-        info = workspace or {}
-        path = str(info.get("worktreePath") or info.get("worktree_path") or "").strip()
-        if not path and not strict_roots and agent == "dsbot":
-            path = str(info.get("path") or "").strip()
-        if path and not is_authorized_local_path(path, paradev_bin):
-            raise RuntimeError(f"Unauthorized local path: {path}")
-        if strict_roots and not (path and os.path.isdir(os.path.expanduser(path))):
-            raise RuntimeError(
-                f"Workspace worktree path could not be verified under strict roots: {workspace_id}"
-            )
-        return os.path.expanduser(path) if path else None
-
-    if agent == "dsbot":
-        worktree_path: Optional[str] = None
-        if ws_id:
-            if ws_id != "local":
-                worktree_path = _authorized_worktree(
-                    ws_id, _get_workspace_info(paradev_bin, ws_id=ws_id)
-                )
-        elif repo_hint or cwd:
-            proj, _ = ensure_paradev_project(
-                repo_hint or (cwd or ""),
-                paradev_bin,
-                local_only=local_only,
-                cwd=cwd,
-            )
-            if proj is not None:
-                ws = _get_workspace_info(
-                    paradev_bin, project_id=proj.get("id"), branch=branch or None
-                )
-                if ws:
-                    ws_id = ws.get("id") or ws_id
-                    worktree_path = _authorized_worktree(ws_id or "", ws)
-                else:
-                    worktree_path = proj.get("path") or cwd
-        if not worktree_path:
-            worktree_path = cwd or "/Users/chief/.gemini/antigravity/scratch"
-        res = default_dsbot_runner(
-            {**job, "cwd": worktree_path, "workspace_id": ws_id},
-            dsh_bin,
-            headless_patch,
-        )
-        summary = res.get("result_summary") or ""
-        summary += f"\n\n[paradev workspace_id={ws_id or 'local'} terminal_id=dsbot-headless role={role} agent=dsbot]"
-        res.update(
-            {
-                "result_summary": summary,
-                "workspace_id": ws_id,
-                "terminal_id": "dsbot-headless",
-                "role": role,
-                "agent": "dsbot",
-                "worktree_path": worktree_path,
-            }
-        )
-        return res
-
-    sessions_path = (
-        sessions_file
-        or os.environ.get("PARADEV_SESSIONS_FILE")
-        or os.path.join(
-            os.environ.get("WORKER_STATE_DIR", "/Users/chief/.mac-job-worker/state"),
-            "paradev_sessions.json",
-        )
-    ).strip()
-    store = ParadevSessionStore(sessions_path) if sessions_path else None
-    session_key = paradev_session_key(
-        repo=repo_hint, cwd=cwd, workspace_id=ws_id, branch=branch
-    )
-    saved_entry: Optional[dict[str, Any]] = None
-
-    if store is not None:
-        if not ws_id:
-            saved_entry = store.get(session_key)
-            saved_ws = str((saved_entry or {}).get("workspace_id") or "").strip()
-            if saved_ws and _get_workspace_info(paradev_bin, ws_id=saved_ws) is not None:
-                ws_id = saved_ws
-        if ws_id and not term_id:
-            if saved_entry is None or str(
-                saved_entry.get("workspace_id") or ""
-            ) != ws_id:
-                by_ws = store.find_by_workspace(ws_id)
-                if by_ws is not None:
-                    saved_entry = by_ws
-            if saved_entry is not None:
-                saved_term = str(
-                    saved_entry.get(f"{role}_terminal_id") or ""
-                ).strip()
-                if saved_term and _is_terminal_alive(paradev_bin, ws_id, saved_term):
-                    term_id = saved_term
-
-    if store is not None and saved_entry is None and ws_id:
-        saved_entry = store.find_by_workspace(ws_id)
-
-    def _persist_session(
-        ws: Optional[str], term: Optional[str], worktree: Optional[str] = None
-    ) -> None:
-        if store is None or not ws:
-            return
-        try:
-            entry = dict(saved_entry or {})
-            existing_ws = entry.get("workspace_id")
-            if existing_ws and str(existing_ws) != str(ws):
-                for stale in (
-                    "worker_terminal_id",
-                    "reviewer_terminal_id",
-                    "worktree_path",
-                ):
-                    entry.pop(stale, None)
-            entry["workspace_id"] = ws
-            entry["agent"] = agent
-            entry["updated_at"] = time.time()
-            if worktree:
-                entry["worktree_path"] = worktree
-            if term:
-                term_key = (
-                    "worker_terminal_id"
-                    if role == "worker"
-                    else "reviewer_terminal_id"
-                )
-                if term == "dsbot-headless":
-                    entry.setdefault(term_key, term)
-                else:
-                    entry[term_key] = term
-            store.upsert(session_key, entry)
-        except Exception:
-            pass
-
-    if ws_id and (strict_roots or ws_id != "local"):
-        _authorized_worktree(ws_id, _get_workspace_info(paradev_bin, ws_id=ws_id))
-
-    if ws_id and term_id:
-        send_res = subprocess.run(
-            [
-                paradev_bin,
-                "terminals",
-                "send",
-                "--local",
-                "--workspace",
-                ws_id,
-                "--terminal",
-                term_id,
-                "--text",
-                task,
-                "--wait",
-                "--until",
-                "settled",
-                "--timeout",
-                str(timeout_sec),
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec + 30,
-            check=False,
-        )
-        if send_res.returncode != 0:
-            raise RuntimeError(
-                f"paradev terminals send failed ({send_res.returncode}): {send_res.stderr or send_res.stdout}"
-            )
-        _persist_session(ws_id, term_id)
-        raw_text = _read_agent_output(paradev_bin, ws_id, term_id)
-        return _agent_result(raw_text, ws_id, term_id, agent, role=role)
-
-    if ws_id:
-        create_res = subprocess.run(
-            [
-                paradev_bin,
-                "agents",
-                "create",
-                "--local",
-                "--workspace",
-                ws_id,
-                "--agent",
-                agent,
-                "--prompt",
-                task,
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-            check=False,
-        )
-        if create_res.returncode != 0:
-            raise RuntimeError(
-                f"paradev agents create failed ({create_res.returncode}): {create_res.stderr or create_res.stdout}"
-            )
-        info = json.loads(create_res.stdout)
-        term_id = (
-            info.get("sessionId")
-            or info.get("terminalId")
-            or info.get("id")
-            or (info.get("agents") or [{}])[0].get("sessionId")
-        )
-        if not term_id:
-            raise RuntimeError(
-                f"paradev agents create returned no terminal id: {create_res.stdout}"
-            )
-        term_id = str(term_id)
-        _persist_session(ws_id, term_id)
-        _wait_agent_settled(paradev_bin, ws_id, term_id, timeout_sec)
-        raw_text = _read_agent_output(paradev_bin, ws_id, term_id)
-        return _agent_result(raw_text, ws_id, term_id, agent, role=role)
-
-    project_id = None
-    if repo_hint or cwd:
-        proj, _ = ensure_paradev_project(
-            repo_hint or (cwd or ""),
-            paradev_bin,
-            local_only=local_only,
-            cwd=cwd,
-        )
-        if proj is not None:
-            project_id = proj.get("id")
-
-    create_cmd = [
-        paradev_bin,
-        "ws",
-        "create",
-        "--local",
-        "--agent",
-        agent,
-        "--prompt",
-        task,
-        "--json",
-    ]
-    is_session = project_id is None
-    if is_session:
-        create_cmd.append("--session")
-    else:
-        ws_name = branch or (
-            f"{(proj.get('name') if proj else None) or 'workspace'}-{int(time.time())}"
-        )
-        create_cmd.extend(["--project", project_id, "--name", ws_name])
-        if branch:
-            create_cmd.extend(["--branch", branch])
-        else:
-            create_cmd.extend(["--checkout", "local"])
-
-    created = subprocess.run(
-        create_cmd,
-        capture_output=True,
-        text=True,
-        timeout=90,
-        check=False,
-    )
-    if created.returncode != 0:
-        raise RuntimeError(
-            f"paradev ws create failed ({created.returncode}): {created.stderr or created.stdout}"
-        )
-
-    info = json.loads(created.stdout)
-    ws_id = info["workspace"]["id"]
-    agents = info.get("agents") or []
-    if not agents or not agents[0].get("sessionId"):
-        raise RuntimeError(f"paradev ws create returned no agent terminal: {created.stdout}")
-    term_id = agents[0]["sessionId"]
-    worktree = (info.get("workspace") or {}).get("worktreePath")
-    _persist_session(ws_id, term_id, worktree=worktree)
-
-    try:
-        _wait_agent_settled(paradev_bin, ws_id, term_id, timeout_sec)
-        raw_text = _read_agent_output(paradev_bin, ws_id, term_id)
-        return _agent_result(
-            raw_text, ws_id, term_id, agent, role=role, worktree_path=worktree
-        )
-    finally:
-        if is_session:
-            subprocess.run(
-                [paradev_bin, "ws", "archive", "--local", ws_id, "--json"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-
-
 def _run_git(
     args: list[str], cwd: Optional[str] = None, timeout: int = 60
 ) -> subprocess.CompletedProcess[str]:
@@ -1070,7 +354,7 @@ def _current_git_branch(repo_path: str) -> str:
 
 
 def _resolve_mac_repo_path(
-    repo_hint: str, paradev_bin: str, parent_dir: str = "/Users/chief"
+    repo_hint: str, parent_dir: str = "/Users/chief"
 ) -> tuple[str, str]:
     raw = os.path.expanduser((repo_hint or "").strip())
     short_name = raw.rstrip("/").removesuffix(".git").split("/")[-1]
@@ -1088,17 +372,11 @@ def _resolve_mac_repo_path(
         if os.path.isdir(cand):
             return cand, short_name
 
-    if paradev_bin and os.path.exists(paradev_bin):
-        proj = _find_paradev_project(raw, paradev_bin)
-        if proj and proj.get("path") and os.path.isdir(str(proj["path"])):
-            return str(proj["path"]), short_name or str(proj.get("name") or short_name)
-
     return os.path.join(parent_dir, short_name), short_name
 
 
 def default_git_sync_runner(
     job: dict[str, Any],
-    paradev_bin: str,
     parent_dir: str = "/Users/chief",
     gh_bin: str = "gh",
 ) -> dict[str, Optional[str]]:
@@ -1128,9 +406,9 @@ def default_git_sync_runner(
             "error": "repo is required for git_sync",
         }
 
-    repo_path, short_name = _resolve_mac_repo_path(repo_hint, paradev_bin, parent_dir=parent_dir)
+    repo_path, short_name = _resolve_mac_repo_path(repo_hint, parent_dir=parent_dir)
 
-    if not is_authorized_local_path(repo_path, paradev_bin, parent_dir=parent_dir):
+    if not is_authorized_local_path(repo_path, parent_dir=parent_dir):
         return {
             "status": "failed",
             "result_summary": "",
@@ -1158,10 +436,6 @@ def default_git_sync_runner(
     if action == "pull":
         if not os.path.exists(os.path.join(repo_path, ".git")):
             clone_src = remote_hint
-            if not clone_src and paradev_bin and os.path.exists(paradev_bin):
-                proj, _ = ensure_paradev_project(repo_hint, paradev_bin, parent_dir=parent_dir)
-                if proj and proj.get("path") and os.path.isdir(str(proj["path"])):
-                    repo_path = str(proj["path"])
             if not os.path.exists(os.path.join(repo_path, ".git")):
                 if not clone_src:
                     return {
@@ -1486,7 +760,12 @@ def _mcp_call_tool(
 
 
 def run_dsbot_via_local_mcp(
-    job: dict[str, Any], mcp_url: str, mcp_token: str
+    job: dict[str, Any],
+    mcp_url: str,
+    mcp_token: str,
+    *,
+    empty_done_grace_sec: float = 45.0,
+    poll_sleep_sec: float = 1.0,
 ) -> dict[str, Optional[str]]:
     task = str(job["task"])
     timeout_sec = max(1, int(job.get("timeout_sec") or 900))
@@ -1551,6 +830,7 @@ def run_dsbot_via_local_mcp(
     cur_after = after
     collected: list[dict[str, Any]] = []
     waiting_for_target: list[dict[str, Any]] = []
+    empty_grace_deadline = min(deadline, time.monotonic() + max(0.0, empty_done_grace_sec))
 
     def _matching_waiting() -> list[dict[str, Any]]:
         w_res = _mcp_call_tool(mcp_url, mcp_token, "list_waiting", {}, timeout=15.0)
@@ -1588,6 +868,20 @@ def run_dsbot_via_local_mcp(
                     for m in (chat_res.get("messages") or [])
                     if m.get("kind") != "user" and int(m.get("time") or 0) >= after
                 )
+            if collected:
+                break
+            try:
+                matched = _matching_waiting()
+            except Exception:
+                matched = []
+            if matched:
+                waiting_for_target = matched
+                break
+            if time.monotonic() < empty_grace_deadline:
+                time.sleep(
+                    min(poll_sleep_sec, max(0.0, empty_grace_deadline - time.monotonic()))
+                )
+                continue
             break
         try:
             matched = _matching_waiting()
@@ -1694,10 +988,6 @@ def default_dsbot_runner(
         os.makedirs(run_cwd, exist_ok=True)
     env = os.environ.copy()
     env.setdefault("STUDIO_POOL_API_KEY", "local-loopback-placeholder")
-    env["PARADEV_WORKSPACE_ID"] = str(job.get("workspace_id") or "")
-    env["PATH"] = os.pathsep.join(
-        ["/Users/chief/.paradev/bin", env.get("PATH", "")]
-    )
     res = subprocess.run(
         [dsh_bin, "--profile", "headless", "--patch", headless_patch, task],
         capture_output=True,
@@ -1762,11 +1052,7 @@ class MacJobWorker:
         broker: BrokerClient,
         worker_id: str,
         state_dir: str,
-        paradev_runner: Callable[[dict[str, Any]], dict[str, Optional[str]]],
         dsbot_runner: Callable[[dict[str, Any]], dict[str, Optional[str]]],
-        paradev_register_runner: Optional[
-            Callable[[dict[str, Any]], dict[str, Optional[str]]]
-        ] = None,
         git_sync_runner: Optional[
             Callable[[dict[str, Any]], dict[str, Optional[str]]]
         ] = None,
@@ -1777,9 +1063,7 @@ class MacJobWorker:
         self.worker_id = worker_id
         self.state_dir = state_dir
         os.makedirs(self.state_dir, exist_ok=True)
-        self.paradev_runner = paradev_runner
         self.dsbot_runner = dsbot_runner
-        self.paradev_register_runner = paradev_register_runner
         self.git_sync_runner = git_sync_runner
         self.hostname = hostname or socket.gethostname()
         self.heartbeat_interval = heartbeat_interval
@@ -1827,7 +1111,7 @@ class MacJobWorker:
             {
                 "worker_id": self.worker_id,
                 "hostname": self.hostname,
-                "capabilities": ["paradev", "dsbot", "git_sync"],
+                "capabilities": ["dsbot", "git_sync"],
             },
         )
         if code != 200 or not data.get("ok"):
@@ -1873,19 +1157,7 @@ class MacJobWorker:
         hb_thread.start()
 
         try:
-            if target == "paradev":
-                res = self.paradev_runner(job)
-            elif target == "paradev_register":
-                if self.paradev_register_runner is None:
-                    res = {
-                        "status": "failed",
-                        "result_summary": "",
-                        "pr_url": None,
-                        "error": "paradev_register_runner not configured",
-                    }
-                else:
-                    res = self.paradev_register_runner(job)
-            elif target == "dsbot":
+            if target == "dsbot":
                 res = self.dsbot_runner(job)
             elif target == "git_sync":
                 if self.git_sync_runner is None:
@@ -1902,7 +1174,7 @@ class MacJobWorker:
                     "status": "failed",
                     "result_summary": "",
                     "pr_url": None,
-                    "error": f"Unsupported target: {target}",
+                    "error": f"Unsupported target: {target} (ParaDev removed; use dsbot or git_sync)",
                 }
         except Exception as exc:
             res = {
@@ -1996,7 +1268,7 @@ class MacJobWorker:
             {
                 "worker_id": self.worker_id,
                 "hostname": self.hostname,
-                "capabilities": ["paradev", "dsbot", "git_sync"],
+                "capabilities": ["dsbot", "git_sync"],
             },
         )
         if code != 200 or not data.get("ok"):
@@ -2028,7 +1300,6 @@ def main() -> None:
     profile = os.environ.get("AWS_PROFILE", "flinter")
     region = os.environ.get("AWS_REGION", "us-east-2")
     instance_id = os.environ.get("EC2_INSTANCE_ID", "i-0c1117f3148176425")
-    paradev_bin = os.environ.get("PARADEV_BIN", "/Users/chief/.paradev/bin/paradev")
     dsh_bin = os.environ.get("DSH_BIN", "/usr/local/bin/dsh")
     headless_patch = os.environ.get(
         "HEADLESS_PATCH", "/Users/chief/.mac-job-worker/headless.patch.yml"
@@ -2044,27 +1315,50 @@ def main() -> None:
         region=region,
         instance_id=instance_id,
     )
+    handoff_tunnel: Optional[SsmTunnelManager] = None
+    handoff_enabled = (
+        os.environ.get("CLOUD_HANDOFF_TUNNEL_ENABLED", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    if handoff_enabled:
+        handoff_local_port = int(os.environ.get("CLOUD_HANDOFF_LOCAL_PORT", "8080"))
+        handoff_remote_port = int(os.environ.get("CLOUD_HANDOFF_REMOTE_PORT", "8080"))
+        handoff_health_url = os.environ.get(
+            "CLOUD_HANDOFF_HEALTH_URL", f"http://127.0.0.1:{handoff_local_port}/ready"
+        )
+        handoff_tunnel = SsmTunnelManager(
+            broker=None,
+            health_check=HttpHealthProbe(handoff_health_url),
+            profile=profile,
+            region=region,
+            instance_id=instance_id,
+            remote_port=handoff_remote_port,
+            local_port=handoff_local_port,
+            label="cloud-handoff",
+        )
+
     worker = MacJobWorker(
         broker=broker,
         worker_id=worker_id,
         state_dir=state_dir,
-        paradev_runner=lambda job: default_paradev_runner(
-            job, paradev_bin, dsh_bin=dsh_bin, headless_patch=headless_patch
-        ),
         dsbot_runner=lambda job: default_dsbot_runner(job, dsh_bin, headless_patch),
-        paradev_register_runner=lambda job: default_paradev_register_runner(
-            job, paradev_bin
-        ),
-        git_sync_runner=lambda job: default_git_sync_runner(job, paradev_bin),
+        git_sync_runner=lambda job: default_git_sync_runner(job),
         heartbeat_interval=heartbeat_interval,
     )
 
     stop_event = threading.Event()
+    if handoff_tunnel is not None:
+        handoff_probe_sec = float(os.environ.get("CLOUD_HANDOFF_PROBE_SEC", "20"))
+        start_tunnel_watchdog(
+            handoff_tunnel, stop_event, interval_sec=handoff_probe_sec
+        )
 
     def handle_sig(signum: int, _frame: Any) -> None:
         sys.stderr.write(f"[worker] received signal {signum}, shutting down\n")
         stop_event.set()
         tunnel.stop()
+        if handoff_tunnel is not None:
+            handoff_tunnel.stop()
 
     signal.signal(signal.SIGTERM, handle_sig)
     signal.signal(signal.SIGINT, handle_sig)
@@ -2103,6 +1397,8 @@ def main() -> None:
         stop_event.wait(poll_interval)
 
     tunnel.stop()
+    if handoff_tunnel is not None:
+        handoff_tunnel.stop()
 
 
 if __name__ == "__main__":

@@ -308,7 +308,71 @@ test('turn/end state machine ignores disposed, switched/blocked, HANDOFF_ACK, ru
   assert.match(env.deliveries.find(d => d.role === 'task-report').text, /Final verified answer\./)
 })
 
-test('nested task_* tools, interactive cards (ask_user/show_view/request_secret), and switchPart are blocked for tasks', async (t) => {
+test('customer tasks stay private and retained, and ordinary task APIs cannot access them or unrelated tasks', async (t) => {
+  const settled = Array.from({ length: 60 }, (_, index) => ({
+    id: `old-${index}`,
+    title: `Settled ${index}`,
+    status: 'completed',
+    sessionId: `old-session-${index}`,
+    startedAt: index + 1,
+  }))
+  const customerTasks = ['customer-a', 'customer-b'].map((sessionId, index) => ({
+    id: `customer_${sessionId}`,
+    title: 'Customer conversation',
+    origin: 'customer',
+    customer: { connId: 'wecom', chatKey: sessionId },
+    status: 'running',
+    sessionId,
+    startedAt: index + 100,
+  }))
+  const team = makeTeam({ bots: { a: { ...makeTeam().bots.a, tasks: [...settled, ...customerTasks] } } })
+  const env = await startEnv({ team })
+  t.after(env.stop)
+  const dmA = env.agentMap.get('dm-a')
+  await env.tool('task_start').execute({ title: 'Unrelated private work', brief: 'Do not expose this' }, execOf(dmA))
+  const ordinaryTask = env.rt.botOf('a').tasks.find(task => task.title === 'Unrelated private work')
+  const storedCustomerTasks = customerTasks.map(task => env.rt.botOf('a').tasks.find(item => item.id === task.id))
+
+  for (const [index, task] of storedCustomerTasks.entries()) {
+    const sessionId = task.sessionId
+    await env.emit(sessionId, 'turn/start', { turn: index + 1 })
+    if (index === 0) await env.emit(sessionId, 'assistant/message', { turn: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'private customer reply' }] } })
+    await env.emit(sessionId, 'turn/end', { turn: index + 1, reason: index === 0 ? { kind: 'completed' } : { kind: 'error', error: { message: 'private customer failure' } } })
+    await waitFor(() => task.status === 'waiting_customer')
+  }
+
+  const bot = env.rt.botOf('a')
+  assert.ok(ownChatSessions(bot).includes('customer-a'))
+  assert.ok(ownChatSessions(bot).includes('customer-b'))
+  const customerAgent = env.agentMap.get('customer-a')
+  let removedCustomerInput = false
+  customerAgent.inbox.remove = () => { removedCustomerInput = true; return true }
+  const deliveriesBeforeCustomerInput = env.deliveries.length
+  for (const listener of env.ctx.listeners.get('agent/inbox/inserted') ?? []) {
+    await listener({ agent: customerAgent, message: { id: 'customer-input', source: { kind: 'user' }, content: [{ type: 'text', text: 'customer-only input' }] } })
+  }
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(removedCustomerInput, false)
+  assert.equal(env.deliveries.length, deliveriesBeforeCustomerInput)
+  assert.equal(env.deliveries.filter(delivery => delivery.role === 'task-report').length, 0)
+  assert.equal(bot.tasks.filter(task => task.origin === 'customer').length, 2)
+  assert.equal(bot.tasks.filter(task => task.status === 'completed' && task.title.startsWith('Settled ')).length, 60)
+  await assert.rejects(env.rt.stopTask('a', storedCustomerTasks[0].id), { code: 'bot/not-found' })
+  assert.equal(storedCustomerTasks[0].status, 'waiting_customer')
+  await assert.rejects(env.rt.deliverToTask(storedCustomerTasks[0].id, { text: 'steer customer task' }), /Unknown task|cannot receive messages/)
+  await assert.rejects(env.rt.taskPage('a', storedCustomerTasks[0].id), { code: 'bot/not-found' })
+
+  const blockedStart = await env.tool('task_start').execute({ title: 'Nested', brief: 'Should not start' }, execOf(customerAgent))
+  assert.match(blockedStart, /Customer conversations cannot start or control background tasks/)
+  for (const name of ['task_send', 'task_stop', 'task_list', 'task_read']) {
+    const result = await env.tool(name).execute({ task: ordinaryTask.id, text: 'Should not be accessible' }, execOf(customerAgent))
+    assert.doesNotMatch(result, /Unrelated private work|Do not expose this/)
+  }
+  assert.equal(ordinaryTask.status, 'running')
+  assert.equal(env.deliveries.filter(delivery => delivery.role === 'task-report').length, 0)
+})
+
+test('nested task_* tools and interactive cards (ask_user/show_view/request_secret) are blocked for tasks, and tasks stay read-only', async (t) => {
   const env = await startEnv()
   t.after(env.stop)
   const dmA = env.agentMap.get('dm-a')
@@ -327,8 +391,8 @@ test('nested task_* tools, interactive cards (ask_user/show_view/request_secret)
   const secRes = await env.tool('request_secret').execute({ name: 'MY_API_KEY', purpose: 'call api' }, execOf(taskAgent))
   assert.match(secRes, /Background tasks cannot show secret cards/)
 
-  // Clicking/opening a task via switchPart or bot-open-part must fail instead of swapping bot.sessionId.
-  await assert.rejects(env.rt.switchPart('a', task.sessionId), /read-only/i)
+  // Session switching is removed, so tasks can never swap bot.sessionId.
+  assert.equal(env.rt.switchPart, undefined)
   const openRes = await env.callApi('bot-open-part', { botId: 'a', sessionId: task.sessionId })
   assert.equal(openRes.ok, false)
   assert.equal(env.rt.botOf('a').sessionId, 'dm-a', 'bot.sessionId must remain unchanged')
@@ -648,9 +712,7 @@ test('partsOfThread, settled task pastOwners routing, post_to_group(report_back)
   const task = botA.tasks[0]
   const taskAgent = env.agentMap.get(task.sessionId)
 
-  // 1. partsOfThread handles task threads cleanly even when openParts is empty or populated.
-  assert.deepEqual(env.rt.partsOfThread('a', task.sessionId).map(p => p.sessionId), [task.sessionId])
-  botA.openParts = [{ sessionId: 'open-1', segments: [] }]
+  // 1. partsOfThread isolates a task thread cleanly from foreground segments.
   assert.deepEqual(env.rt.partsOfThread('a', task.sessionId).map(p => p.sessionId), [task.sessionId])
 
   // 2. setPermission propagates to active background task sessions too.

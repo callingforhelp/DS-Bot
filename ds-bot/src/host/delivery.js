@@ -120,7 +120,7 @@ export function install(rt) {
   const wasFailureRequestDelivered = (fromId, toId, requestId, targetSessionId, parentWork) =>
     deliveredFailuresOf(fromId, toId, requestId, targetSessionId, parentWork).length > 0
 
-  async function authorizeDelivery(args) {
+  async function authorizeDelivery(args, { reuseRouting = false } = {}) {
     const { fromId, toId, role, text, roomId, fromRoomId, askedBy, exchangeId, routing, parent, event: suppliedEvent, resumed, retried, deferred } = args
     const sender = routing?.sender ?? fromId ?? askedBy ?? args.resultFrom
     if (sender === undefined || args.abandoned === true || args.passive === true) return args
@@ -131,15 +131,16 @@ export function install(rt) {
       return { ...args, passive: true }
     }
     const continuation = resumed || retried || deferred
+    const reuse = args.resent === true || reuseRouting === true
     let decision = routing && rt.botResponse.permitted(routing, recipient)
-    if (decision?.allow !== false && (routing === undefined || (continuation && !args.resent))) {
+    if (decision?.allow !== false && (routing === undefined || (continuation && !reuse))) {
       const event = suppliedEvent ?? (continuation ? `${resumed ? 'resume' : retried ? 'retry' : 'deferred'}:${exchangeId}` : `delivery:${exchangeId}`)
       decision = await rt.botResponse.reserve({ sender, recipient, room, result, continuation, text, event, parent: routing ?? parent ?? args.taskContext, category: routing?.category, roomMember: routing?.roomMember ?? role === 'room',
         reviewFix: (role === 'request' || role === 'room' || result) && reviewFixOf(text), kind: role })
     }
     const admitted = decision.routing ?? routing
     if (decision.allow) {
-      const dispatched = args.resent && decision.routing === undefined
+      const dispatched = reuse && decision.routing === undefined
         ? rt.botResponse.waiting(admitted) : await rt.botResponse.claim(admitted)
       if (dispatched) return { ...args, routing: admitted }
       decision = { allow: false, reason: 'duplicate-event' }
