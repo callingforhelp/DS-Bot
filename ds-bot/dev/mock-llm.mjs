@@ -174,8 +174,13 @@ function decide(body) {
     if (system.includes('# Customer service') && !result && currentUser === '型号甲') {
       return [tool('triage_cases', { action: 'vote', summary: 'E2E_SPECIALIST_ANSWER：客户选择型号甲', routes: ['quote', 'order_status'] })]
     }
+    const specialistAnswer = '已确认型号甲，会按该型号继续跟进。'
+    if (system.includes('# Customer service') && !result && textOf(last?.content).includes('[Reply from Customer support]')
+      && textOf(last?.content).includes(specialistAnswer)) {
+      return [text(`专员回复：${specialistAnswer}`)]
+    }
     if (system.includes('# Customer service') && !result && textOf(last?.content).includes('E2E_SPECIALIST_ANSWER')) {
-      return [text('已确认型号甲，会按该型号继续跟进。')]
+      return [text(specialistAnswer)]
     }
     const questionCard = /^E2E_ASK_CARD_([AB])$/.exec(currentUser ?? '')
     if (system.includes('# Customer service') && !result && questionCard) {
