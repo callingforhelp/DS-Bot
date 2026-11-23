@@ -90,6 +90,8 @@ and self-asserted `verified_outcome` refused at ingest; synthetic lineage replay
 worker, object store, authz, bridge adapter · `test/` · `scripts/` Postgres helper, benchmark, restore drill, Mac backup ·
 `docs/openapi.yaml`, `docs/benchmark-report.md`, `docs/wp0-inventory.md` · `infra/` staging template · `env.example`.
 
+See the [RAG interview guide](docs/rag-interview-guide-levels.md) for rehearsal questions on retrieval, ranking, and evaluation.
+
 ## Remote results (19 Nov 2026, RDS + pgvector + real OpenAI embeddings, synthetic corpus)
 
 See `docs/benchmark-report-remote.md`. On 25 documents and 11 queries, hybrid and vector search reached Recall@5 1.00
