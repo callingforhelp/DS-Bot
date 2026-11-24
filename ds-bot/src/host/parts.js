@@ -1802,6 +1802,82 @@ export function install(rt) {
     }
   }
 
+  // Daily batch sweep: checks idle Bot/Room parts with Kev-4B and rotates finished tasks
+  // without touching active turns, waiting cards, or ongoing work.
+  const DAILY_SWEEP_MS = 24 * 60 * 60 * 1000
+  const SWEEP_IDLE_MS = 30 * 60 * 1000
+  const SWEEP_MIN_MESSAGES = 4
+  const SWEEP_MIN_TOKENS = 2_000
+
+  async function sweepIdleParts({
+    minMessages = SWEEP_MIN_MESSAGES,
+    minTokens = SWEEP_MIN_TOKENS,
+    idleMs = SWEEP_IDLE_MS,
+    now = Date.now(),
+    dryRun = false,
+  } = {}) {
+    const kevUrl = rt.config?.kevUrl ?? process.env.DSBOT_KEV_URL ?? (process.env.NODE_TEST_CONTEXT ? undefined : DEFAULT_KEV_URL)
+    if (typeof rt.kevSteward !== 'function' && (!kevUrl || kevUrl === 'off' || kevUrl === 'none')) return []
+    const results = []
+    for (const agent of ctx.get('agents')?.values?.() ?? []) {
+      const place = placeOf(agent.id)
+      if (place === undefined) continue
+      if (switches.has(agent.id) || checking.has(agent.id)) continue
+      if (rt.live?.get(agent.id)?.turn !== undefined) continue
+      const placeKey = place.botId ?? place.roomId
+      if (placeKey !== undefined && rt.waitingView?.()[placeKey] !== undefined) continue
+      if (state.questions?.[agent.id] !== undefined || state.views?.[agent.id] !== undefined) continue
+      const tokens = tokensOf(agent.session)
+      if (tokens !== undefined && tokens < minTokens) continue
+      const events = agent.session?.snapshotEvents?.() ?? []
+      const lastEvent = events.at(-1)
+      const lastTime = Number(lastEvent?.timestamp ?? lastEvent?.time ?? 0)
+      if (Number.isFinite(lastTime) && lastTime > 0 && now - lastTime < idleMs) continue
+
+      const group = place.roomId !== undefined
+      const lines = []
+      for await (const line of partLines(agent.id, AbortSignal.timeout(HANDOFF_READ_MS), { group, pages: 2 })) {
+        lines.push({ who: line.who, text: line.who === 'you' || line.who === 'user' ? line.text.replace(/^(?:You|User): /, '') : line.text })
+        if (lines.length >= STEWARD_LINES) break
+      }
+      if (lines.length < minMessages) continue
+
+      checking.add(agent.id)
+      try {
+        const local = localPart(agent.session)
+        const checkpoints = local ? rt.localAgentContext?.(agent.id)?.compactions ?? 0 : checkpointCount(agent.session.deriveMessages())
+        const kevResult = typeof rt.kevSteward === 'function'
+          ? await rt.kevSteward({ lines, midTurn: false, checkpoints, group, signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS) }).catch(() => undefined)
+          : await askKevSteward({
+              lines,
+              midTurn: false,
+              checkpoints,
+              group,
+              url: kevUrl,
+              model: rt.config?.kevModel ?? process.env.DSBOT_KEV_MODEL,
+              apiKey: rt.config?.kevApiKey ?? process.env.KEV_API_KEY,
+              signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS),
+            })
+        if (kevResult?.action !== 'switch') continue
+        if (!dryRun && !switches.has(agent.id) && await canMakeRoom(agent)) {
+          startSwitch(agent, { hard: false })
+        }
+        results.push({ id: agent.id, action: 'switch', pSwitch: kevResult.pSwitch, dryRun })
+      } finally {
+        checking.delete(agent.id)
+      }
+    }
+    return results
+  }
+
+  if (!process.env.NODE_TEST_CONTEXT && process.env.DSBOT_KEV_SWEEP !== 'off') {
+    const sweepTimer = setInterval(() => {
+      void sweepIdleParts().catch(error => rt.warn('ds-bot: daily kev idle sweep failed: %s', error))
+    }, DAILY_SWEEP_MS)
+    sweepTimer.unref?.()
+    ctx.on('dispose', () => clearInterval(sweepTimer))
+  }
+
   // The newest turn/end among the Session's last events in memory.
   function lastTurnEnd(agent) {
     const latest = agent.session.seq - 1
@@ -2351,5 +2427,5 @@ export function install(rt) {
     }
   }
 
-  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, agentPage, taskPage, displayItems, applySteps, followFolder, followEngine, heldBack, openTaskPart, forkForegroundPart, isSwitchingPart: id => switches.has(id), sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, agentPage, taskPage, displayItems, applySteps, followFolder, followEngine, heldBack, openTaskPart, forkForegroundPart, sweepIdleParts, isSwitchingPart: id => switches.has(id), sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }
