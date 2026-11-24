@@ -544,6 +544,18 @@ export function install(rt) {
     return { saved: true, count: rt.state.voiceHistory[targetId].length, runtimeLocation }
   }
 
+  function recordDiag(body = {}) {
+    const text = String(body?.text ?? '').trim()
+    if (!text) return { logged: false }
+    rt.noteFailure?.({
+      level: body?.level === 'error' ? 'error' : 'info',
+      source: 'voice-live',
+      sessionId: typeof body?.sessionId === 'string' ? body.sessionId : undefined,
+      text: text.slice(0, 800),
+    })
+    return { logged: true }
+  }
+
   async function voiceEndpoint(endpoint, body = {}) {
     switch (endpoint) {
       case 'voice-status':
@@ -554,6 +566,8 @@ export function install(rt) {
         return closeSession(body)
       case 'voice-transcript-append':
         return appendTranscript(body)
+      case 'voice-diag':
+        return recordDiag(body)
       default:
         throw invalid(`Unknown voice endpoint ${endpoint}`, 'bot/not-found')
     }
