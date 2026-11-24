@@ -90,6 +90,7 @@
   },
   "bin": {
     "ds-bot": "./bin/ds-bot-doctor.mjs",
-    "ds-bot-mcp": "./bin/ds-bot-mcp.mjs"
+    "ds-bot-mcp": "./bin/ds-bot-mcp.mjs",
+    "dsbot-mem": "./bin/dsbot-mem.mjs"
   }
 }

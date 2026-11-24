@@ -42,6 +42,8 @@ if (startPage !== undefined) {
     dataLocation: () => ipcRenderer.invoke('ds-bot:data-location'),
     moveData: (workspace) => ipcRenderer.invoke('ds-bot:move-data', typeof workspace === 'string' ? workspace : undefined),
     teamWorkspaceChanged: (path) => { ipcRenderer.send('ds-bot:team-workspace', String(path)) },
+    cliShimStatus: () => ipcRenderer.invoke('ds-bot:cli-shim-status'),
+    installCliShim: () => ipcRenderer.invoke('ds-bot:cli-shim-install'),
     // The Bot browsers, in the shape of DSH Desktop's browser bridge so that ds-bot drives both
     // alike; `forget` clears a key's storage, which here outlives the app.
     browser: browserBridge(),

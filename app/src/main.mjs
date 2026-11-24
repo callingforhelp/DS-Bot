@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { canonicalExecPath } from './canonical-path.mjs'
+import { cliShimStatus, installCliShim } from './cli-shim.mjs'
 import { disk } from './copy-tree.mjs'
 import { configureIdentity } from './legacy.mjs'
 import { hostPort } from './host-port.mjs'
@@ -53,6 +54,7 @@ const IPC = {
   appUpdateChanged: 'ds-bot:app-update-changed',
   idleSeconds: 'ds-bot:idle-seconds', computer: 'ds-bot:computer', computerAction: 'ds-bot:computer-action', computerCursor: 'ds-bot:computer-cursor',
   notify: 'ds-bot:notify', notifyStatus: 'ds-bot:notify-status', badge: 'ds-bot:badge', openSession: 'ds-bot:open-session',
+  cliShimStatus: 'ds-bot:cli-shim-status', cliShimInstall: 'ds-bot:cli-shim-install',
 }
 // A cookie export larger than this is not a cookie export.
 const IMPORT_FILE_MAX = 32 * 1024 * 1024
@@ -582,9 +584,28 @@ const hostOutput = (stream, chunk) => {
   rawOutput[stream](chunk)
 }
 
+function ensureDefaultMcpPort(dataDir) {
+  if (!dataDir) return
+  try {
+    const botDir = join(dataDir, 'bot')
+    mkdirSync(botDir, { recursive: true })
+    const mcpPath = join(botDir, 'mcp.json')
+    if (existsSync(mcpPath)) {
+      const conf = JSON.parse(readFileSync(mcpPath, 'utf8'))
+      if (!conf.port) {
+        conf.port = 8798
+        writeFileSync(mcpPath, `${JSON.stringify(conf, null, 2)}\n`)
+      }
+    } else {
+      writeFileSync(mcpPath, `${JSON.stringify({ port: 8798, clients: [] }, null, 2)}\n`)
+    }
+  } catch { /* best effort */ }
+}
+
 function newHost() {
   // A Host of an attempt that a retry has replaced no longer stands for the start.
   const mine = attempt
+  ensureDefaultMcpPort(places?.dataDir)
   return new HostProcess({
     entry: join(here, 'host.mjs'),
     cwd: profileDir(),
@@ -825,6 +846,8 @@ function handleIpc() {
     assertWindow(event)
     return fixed ? false : moveData(typeof workspace === 'string' && isAbsolute(workspace) ? workspace : places.workspace)
   })
+  ipcMain.handle(IPC.cliShimStatus, (event) => (fromWindow(event) ? cliShimStatus({ app }) : { installed: false }))
+  ipcMain.handle(IPC.cliShimInstall, (event) => (fromWindow(event) ? installCliShim({ app }) : { installed: false }))
   // ds-bot's Bot browsers: one webview per lease, in the storage of the Bot's key.
   ipcMain.handle(IPC.browserAcquire, (event, key) => {
     assertWindow(event)

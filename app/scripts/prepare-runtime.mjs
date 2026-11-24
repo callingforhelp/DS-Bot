@@ -309,6 +309,36 @@ export async function preparePrimaryRuntime(options) {
   }
   const assets = options.skillSource ?? join(dirname(fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-skill-office/package.json'))), 'assets')
   await prepareOfficeSkillAssets(assets, join(paths.runtime, 'office-skills'))
+  prepareCliWrapper(paths.runtime)
+}
+
+export function prepareCliWrapper(runtimeRoot) {
+  const binDir = join(runtimeRoot, 'bin')
+  mkdirSync(binDir, { recursive: true })
+  const sh = `#!/bin/sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+RES="$(cd "$DIR/.." && pwd)"
+NODE="$RES/primary-runtime/dependencies/node/bin/node"
+if [ ! -x "$NODE" ]; then
+  NODE="node"
+fi
+TARGET="$RES/app.asar.unpacked/node_modules/ds-bot/bin/dsbot-mem.mjs"
+if [ ! -f "$TARGET" ]; then
+  TARGET="$RES/node_modules/ds-bot/bin/dsbot-mem.mjs"
+fi
+exec "$NODE" "$TARGET" "$@"
+`
+  const cmd = `@echo off
+set "DIR=%~dp0"
+set "RES=%DIR%.."
+set "NODE=%RES%\\primary-runtime\\dependencies\\node\\node.exe"
+if not exist "%NODE%" set "NODE=node"
+set "TARGET=%RES%\\app.asar.unpacked\\node_modules\\ds-bot\\bin\\dsbot-mem.mjs"
+if not exist "%TARGET%" set "TARGET=%RES%\\node_modules\\ds-bot\\bin\\dsbot-mem.mjs"
+"%NODE%" "%TARGET%" %*
+`
+  writeFileSync(join(binDir, 'dsbot-mem'), sh, { mode: 0o755 })
+  writeFileSync(join(binDir, 'dsbot-mem.cmd'), cmd)
 }
 
 /**
