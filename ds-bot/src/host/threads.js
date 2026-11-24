@@ -11,6 +11,10 @@ export const ACTIVE_TASK_STATUSES = new Set(['running', 'waiting_work', 'waiting
 
 export const isActiveTask = task => task !== undefined && ACTIVE_TASK_STATUSES.has(task.status)
 
+export const isCustomerTask = task => task?.origin === 'customer'
+
+export const isLiveTask = task => isActiveTask(task) || isCustomerTask(task)
+
 export const activeTasksOf = bot => (bot?.tasks ?? []).filter(isActiveTask)
 
 export const taskOfSession = (bot, sessionId) => (bot === undefined || sessionId === undefined
@@ -57,7 +61,7 @@ export function threadCurrentOfPart(bot, sessionId) {
   if (thread === undefined) return undefined
   if (thread.thread === 'current') return currentSession(bot)
   const task = bot.tasks[thread.index]
-  return isActiveTask(task) ? task.sessionId : undefined
+  return isLiveTask(task) ? task.sessionId : undefined
 }
 
 // A fresh part replaces a thread's current one; the part it replaces joins that thread's
@@ -107,9 +111,8 @@ export function sameConversation(state, botId, sessionA, sessionB) {
   return threadA.thread === threadB.thread && threadA.index === threadB.index
 }
 
-// Every live thread's current session (foreground and active tasks only). Settled tasks
-// are excluded so folder/engine/model sweeps do not wake them.
+// Every live thread's current session. Settled tasks are excluded from sweeps.
 export const ownChatSessions = bot => [
   currentSession(bot),
-  ...activeTasksOf(bot).map(task => task.sessionId),
+  ...(bot?.tasks ?? []).filter(isLiveTask).map(task => task.sessionId),
 ].filter((id, index, list) => id !== undefined && list.indexOf(id) === index)

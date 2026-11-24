@@ -110,6 +110,52 @@ test('a team saved with parallel parts keeps them as earlier parts and archives 
   assert.deepEqual(kept.segments.map(segment => segment.sessionId), ['w1', 'w4', 'w3'])
 })
 
+test('legacy customer openParts migrate before generic folding and remain staff read-only', async (t) => {
+  const legacy = structuredClone(LEGACY)
+  legacy.bots.w1.openParts[0].customer = { connId: 'kf', chatKey: 'customer' }
+  const { home, registry, call, ctx, rt } = await team(t, [], legacy, ['m1', 'w1', 'w2', 'w3', 'w4'])
+  await call('state')
+  const bot = rt.botOf('w1')
+  const task = bot.tasks.find(item => item.origin === 'customer')
+  assert.equal(task.status, 'waiting_customer')
+  assert.deepEqual(task.customer, { connId: 'kf', chatKey: 'customer' })
+  assert.equal(task.sessionId, 'w3')
+  assert.deepEqual(task.segments.map(segment => segment.sessionId), ['w4'])
+  assert.equal(Object.hasOwn(bot, 'openParts'), false)
+  assert.deepEqual(bot.segments.map(segment => segment.sessionId), ['w1'])
+  assert.equal(rt.chatOwners.get('w3'), 'w1')
+  assert.equal(rt.taskOwners.get('w4')?.taskId, task.id)
+  assert.deepEqual(rt.customerIdentityOf('w4'), { connId: 'kf', chatKey: 'customer' })
+  assert.equal([...registry.archivedSessionIds].includes('w3'), false)
+  assert.equal([...registry.archivedSessionIds].includes('w4'), false)
+  assert.equal((saved(home).retiredParts ?? []).some(item => item.sessionId === 'w3' || item.sessionId === 'w4'), false)
+
+  ctx.sessionController = { page: async ({ address, beforeSeq }) => {
+    const latest = address.sessionId === 'w3' && beforeSeq === undefined
+    return {
+      records: [{ event: { type: 'user/message', seq: latest ? 2 : 1, time: 1, data: { content: [{ type: 'text', text: latest ? 'latest' : address.sessionId }], source: { kind: 'user' } } } }],
+      hasMore: latest,
+    }
+  } }
+  const before = JSON.stringify(bot)
+  rt.save = async () => { throw new Error('customer paging must not save') }
+  const firstPage = await call('customer-page', { sessionId: 'w3' })
+  assert.equal(firstPage.ok, true, JSON.stringify(firstPage))
+  assert.deepEqual(firstPage.value.items.filter(item => item.kind === 'user').map(item => item.text), ['latest'])
+  let cursor = firstPage.value.cursor
+  const messages = ['latest']
+  while (cursor) {
+    const page = await rt.customerPage('w3', cursor)
+    messages.push(...page.items.filter(item => item.kind === 'user').map(item => item.text))
+    cursor = page.cursor
+  }
+  assert.deepEqual(messages, ['latest', 'w3', 'w4'])
+  assert.deepEqual(await rt.customerPage('w2'), { items: [], cursor: null, btw: [], startedAt: null })
+  assert.equal(JSON.stringify(bot), before)
+  ctx.sessionController.page = async () => { throw new Error('history unavailable') }
+  await assert.rejects(rt.customerPage('w3'), /history unavailable/)
+})
+
 // The retired part's reminders go to the Bot's chat before its Session is archived:
 // archiving stops the Session, and DSH drops what is scheduled on it.
 test('a retired parallel part hands its scheduled tasks to the Bot chat before it is archived', async (t) => {

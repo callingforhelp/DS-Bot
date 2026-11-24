@@ -168,9 +168,11 @@ export function install(rt) {
     const from = rt.botOf(sourceId)
     const to = rt.botOf(toId)
     if (to === undefined) throw new Error(`Unknown Bot ${toId}`)
-    const fromName = senderName ?? from?.name ?? 'You'
+    const targetSessionId = sessionId ?? rt.chatOf(toId)
+    const customerDelivery = rt.isCustomerPart?.(fromPart) === true || rt.isCustomerPart?.(targetSessionId) === true
+    const fromName = customerDelivery ? 'Customer support' : senderName ?? from?.name ?? 'You'
     const room = rt.roomOf(roomId)
-    const asker = work === undefined ? undefined : rt.botOf(state.works?.[work]?.from)?.name
+    const asker = customerDelivery || work === undefined ? undefined : rt.botOf(state.works?.[work]?.from)?.name
     // Session events reject `undefined` members, so optional fields are omitted instead.
     const source = {
       kind: SOURCE_KIND,
@@ -196,7 +198,6 @@ export function install(rt) {
       ...(fromRoomId ? { senderRoomId: fromRoomId } : {}),
       ...(abandoned ? { abandoned: true } : {}),
     }
-    const targetSessionId = sessionId ?? rt.chatOf(toId)
     // On disk before it goes out: a message the book could not keep is not sent, so none is
     // delivered with no record of it. A resend keeps the record it has; only a merged request
     // replaces it with its added text.

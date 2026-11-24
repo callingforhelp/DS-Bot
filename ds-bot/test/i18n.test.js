@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { DICTIONARY, LANGUAGES, dateLocale, hostText, installLocale, language, t } from '../src/client/i18n.js'
+import { imPlatform } from '../src/shared/im-platforms.js'
+import { imText, imTexts } from '../src/host/im/texts.js'
 import { DSH_JA, HOST_ERRORS_JA } from '../src/client/locales/ja.js'
 import { DSH_KO, HOST_ERRORS_KO } from '../src/client/locales/ko.js'
 import { DSH_ES, HOST_ERRORS_ES } from '../src/client/locales/es.js'
@@ -55,6 +57,16 @@ function fakeLocale(initial = 'zh') {
   }
 }
 
+test('WeCom customer service settings have Chinese platform and field labels', () => {
+  const mock = fakeLocale('zh')
+  const off = installLocale(mock)
+  try {
+    const platform = imPlatform('wecom_kf')
+    assert.equal(t(platform.name), '企业微信客服')
+    assert.deepEqual(platform.fields.map(field => t(field.label)), ['企业 ID', '密钥', '客服账号 ID（可选）'])
+  } finally { off() }
+})
+
 test('every literal the client translates has an entry in all supported locales', () => {
   const dir = new URL('../src/client/', import.meta.url)
   const missing = []
@@ -80,6 +92,25 @@ test('every DICTIONARY.zh key exists in all other supported locales', () => {
     }
   }
   assert.deepEqual(missing, [])
+})
+
+test('every IM text and call-site key exists in every supported IM locale', () => {
+  const tables = imTexts({ target: 'Target', name: 'Name', bot: 'Bot' })
+  const locales = ['en', 'zh', 'zh-TW', 'ja', 'ko', 'es', 'fr', 'de']
+  assert.deepEqual(Object.keys(tables), locales)
+  const source = readFileSync(new URL('../src/host/im/index.js', import.meta.url), 'utf8')
+  const used = [...source.matchAll(/\btext\(\s*(['"])(.*?)\1/g)].map(match => match[2])
+  assert.ok(used.includes('unavailable'))
+  const keys = [...new Set([...Object.keys(tables.en), ...used])].sort()
+  for (const locale of locales) {
+    assert.deepEqual(Object.keys(tables[locale]).sort(), keys, locale)
+    for (const key of keys) assert.ok(tables[locale][key]?.trim(), `${locale}: ${key}`)
+    assert.notEqual(imText(locale, 'unavailable'), 'unavailable')
+    assert.ok(tables[locale].connected.includes('Target'))
+  }
+  assert.equal(imText('unknown', 'unavailable'), tables.en.unavailable)
+  assert.equal(imText('en', 'unknown'), 'unknown')
+  assert.equal(imText('en', ''), '')
 })
 
 test('copy follows the DSH language across all locales and stays English without a locale service', () => {

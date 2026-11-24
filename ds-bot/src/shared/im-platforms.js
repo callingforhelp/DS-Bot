@@ -5,6 +5,18 @@
 // `login: 'qr'`: the connection starts by scanning a code instead of filling fields.
 export const IM_PLATFORMS = [
   {
+    id: 'wecom_kf',
+    name: 'WeCom Customer Service',
+    fields: [
+      { key: 'corpId', label: 'Corporation ID' },
+      { key: 'secret', label: 'Secret', secret: true },
+      { key: 'openKfId', label: 'Customer service account ID (optional)', optional: true },
+    ],
+    public: true,
+    buttons: false,
+    groups: false,
+  },
+  {
     id: 'telegram',
     name: 'Telegram',
     fields: [{ key: 'token', label: 'Bot token', secret: true }],

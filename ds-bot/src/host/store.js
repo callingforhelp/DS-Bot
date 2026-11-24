@@ -8,7 +8,7 @@ import { LEGACY_THEMES, MAX_EXCHANGES, ROOM_MODES, SECTION_COLORS, SECTION_NAME_
 import { replaceFile } from './files.js'
 import { homeLock } from './home-lock.js'
 import { currentColor, headOf, normalize, unquote } from './text.js'
-import { isActiveTask } from './threads.js'
+import { isCustomerTask, isLiveTask } from './threads.js'
 import { AMBIGUOUS_OLD_ROUTES, legacyRoute } from './local-agents/engines.js'
 import { cleanResponsibility } from '../shared/responsibilities.js'
 import { compactRouting, normalizeResponsePolicies } from './bot-response-policy.js'
@@ -203,6 +203,41 @@ export function install(rt) {
         const memberSid = sessionIdOf(sid)
         if (memberSid !== undefined) liveTeamSessions.add(memberSid)
       }
+    }
+    for (const [id, bot] of Object.entries(state.bots)) {
+      if (!Array.isArray(bot?.openParts)) continue
+      const tasks = Array.isArray(bot.tasks) ? bot.tasks : []
+      const remaining = []
+      for (const part of bot.openParts) {
+        if (part?.customer === undefined) {
+          remaining.push(part)
+          continue
+        }
+        const segments = Array.isArray(part.segments) ? part.segments.filter(segment => sessionIdOf(segment?.sessionId) !== undefined) : []
+        const sessionId = sessionIdOf(part.sessionId) ?? segments.at(-1)?.sessionId
+        if (sessionId === undefined) continue
+        const customer = {
+          ...(typeof part.customer.connId === 'string' && part.customer.connId !== '' ? { connId: part.customer.connId } : {}),
+          ...(typeof part.customer.chatKey === 'string' && part.customer.chatKey !== '' ? { chatKey: part.customer.chatKey } : {}),
+        }
+        const existing = tasks.find(task => task?.origin === 'customer' && task.customer?.connId === customer.connId && task.customer?.chatKey === customer.chatKey)
+        if (existing !== undefined) continue
+        const botId = sessionIdOf(bot.id) ?? id
+        const taskId = `customer_${sessionId}`
+        tasks.push({
+          id: tasks.some(task => task?.id === taskId) ? `${taskId}_${botId}` : taskId,
+          title: 'Customer conversation',
+          origin: 'customer',
+          customer,
+          status: 'waiting_customer',
+          sessionId,
+          segments: segments.filter(segment => segment.sessionId !== sessionId),
+          startedAt: Number.isFinite(part.startedAt) ? part.startedAt : Date.now(),
+          updatedAt: Number.isFinite(part.startedAt) ? part.startedAt : Date.now(),
+        })
+      }
+      bot.tasks = tasks
+      bot.openParts = remaining
     }
     let foldedOpenParts = false
     for (const [id, bot] of Object.entries(state.bots)) {
@@ -744,11 +779,17 @@ export function install(rt) {
         const taskSid = sessionIdOf(task?.sessionId)
         const roomMeta = typeof task?.roomId === 'string' && task.roomId !== '' ? { roomId: task.roomId } : {}
         if (taskSid !== undefined) {
-          if (isActiveTask(task)) {
+          if (isLiveTask(task)) {
             chatOwners.set(taskSid, botId)
             taskOwners.set(taskSid, { botId, taskId: task.id, ...roomMeta })
           } else {
             pastOwners.set(taskSid, { botId, ...roomMeta })
+          }
+        }
+        if (isCustomerTask(task)) {
+          for (const segment of task.segments ?? []) {
+            const segmentSid = sessionIdOf(segment?.sessionId)
+            if (segmentSid !== undefined) taskOwners.set(segmentSid, { botId, taskId: task.id })
           }
         }
         indexPast(task?.segments, { botId, ...roomMeta })

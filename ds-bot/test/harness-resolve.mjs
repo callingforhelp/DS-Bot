@@ -4,12 +4,16 @@
 // folder above ds-bot, else the same search from ds-bot's place in the main worktree (a git
 // worktree has no checkout of its own).
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const plugin = resolve(import.meta.dirname, '..')
+// Startup seeding must never read a developer's real credential file during tests.
+process.env.DSBOT_ENV_FILE = join(tmpdir(), `ds-bot-test-env-${randomUUID()}`, '.env')
 const above = (start) => {
   for (let dir = start; ; dir = dirname(dir)) {
     if (existsSync(join(dir, 'deepseek-harness'))) return join(dir, 'deepseek-harness')

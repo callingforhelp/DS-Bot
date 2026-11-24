@@ -62,6 +62,7 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'on session/event',
     'on agent/created',
     'effect ds-bot: built-in pack roles',
+    'effect ds-bot: triage handoffs',
     'on tools/execute',
     'effect ds-bot: scoped team tools',
     'on tools/change',

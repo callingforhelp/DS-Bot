@@ -5,7 +5,7 @@ import { PUBLISH_ISSUE } from './issue-report.js'
 import { install as installBtw } from './btw.js'
 import { install as installSide } from './side.js'
 import { handoffReply, questionReply, viewReply } from './parts.js'
-import { threadCurrentOfPart, threadOfPart } from './threads.js'
+import { isCustomerTask, threadCurrentOfPart, threadOfPart } from './threads.js'
 import { validateViewAnswer } from 'deep-view/core'
 import { BACKGROUND_AFTER_MAX_SEC, COLORS, EXTRA_COLORS, ROUTE } from './constants.js'
 
@@ -74,9 +74,17 @@ export function install(rt) {
     bots: Object.values(state.bots).map(({ segments, kickoff, tasks: _rawTasks, ...bot }) => {
       const tail = rt.chatTail(rt.chatOf(bot.id))
       const botTasks = rt.taskViewOf?.(state.bots[bot.id]) ?? []
+      const customerSessions = (state.bots[bot.id].tasks ?? []).filter(task => task?.origin === 'customer').map(task => ({
+        sessionId: task.sessionId,
+        reference: rt.customerReferenceOf?.(task.sessionId) ?? task.id.slice(-8).toUpperCase(),
+        parts: (task.segments ?? []).map(segment => segment.sessionId),
+        startedAt: task.startedAt,
+        updatedAt: task.updatedAt ?? task.startedAt,
+      }))
       return {
         ...bot, sessionId: rt.chatOf(bot.id), parts: (segments ?? []).map(segment => segment.sessionId),
         ...(botTasks.length > 0 ? { tasks: botTasks } : {}),
+        ...(customerSessions.length > 0 ? { customerSessions } : {}),
         ...(kickoff ? { waiting: true } : {}),
         // `engine` is the Bot's local-agent route, present only on abots.
         ...(rt.localAgentBadge?.(bot.model ?? bot.appliedModel) !== undefined ? { engine: rt.localAgentBadge(bot.model ?? bot.appliedModel) } : {}),
@@ -336,6 +344,9 @@ export function install(rt) {
         case 'earlier':
           await rt.load()
           return ok(await rt.earlierPage(String(body.sessionId ?? ''), body.cursor ?? undefined))
+        case 'customer-page':
+          await rt.load()
+          return ok(await rt.customerPage(String(body.sessionId ?? ''), body.cursor ?? undefined))
         case 'chat':
           await rt.load()
           return ok(await rt.chatPage(String(body.botId ?? ''), body.cursor ?? undefined, body.steps === true))
@@ -925,11 +936,18 @@ export function install(rt) {
         const room = rt.roomOf(taskOwner.roomId)
         return room === undefined ? undefined : rt.sessionOfRoom(room)
       }
+      const bot = rt.botOf(taskOwner.botId)
+      const task = bot?.tasks?.find(item => item.id === taskOwner.taskId)
+      if (isCustomerTask(task)) return threadCurrentOfPart(bot, ref)
       return rt.chatOf(taskOwner.botId)
     }
     if (past !== undefined && past.roomId === undefined) {
       const bot = rt.botOf(past.botId)
-      if (threadOfPart(bot, ref)?.thread === 'task') return rt.chatOf(past.botId)
+      const thread = threadOfPart(bot, ref)
+      if (thread?.thread === 'task') {
+        if (isCustomerTask(bot?.tasks?.[thread.index])) return threadCurrentOfPart(bot, ref)
+        return rt.chatOf(past.botId)
+      }
       return threadCurrentOfPart(bot, ref) ?? rt.chatOf(past.botId)
     }
     return undefined

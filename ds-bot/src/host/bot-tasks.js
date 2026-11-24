@@ -14,7 +14,7 @@ import { HANDOFF_ACK, HISTORY_TIMEOUT_MS, SOURCE_KIND, STEER_CUT } from './const
 import { within } from './folders.js'
 import { absoluteLinks } from './links.js'
 import { textOf } from './text.js'
-import { activeTasksOf, isActiveTask, threadCurrentOfPart, threadOfPart } from './threads.js'
+import { activeTasksOf, isActiveTask, isCustomerTask, isLiveTask, threadCurrentOfPart, threadOfPart } from './threads.js'
 import { output } from './tools.js'
 import { answerSender, cutOffText, turnFailure } from './turns.js'
 
@@ -91,12 +91,12 @@ export function install(rt) {
   const findTask = (bot, ref, roomId) => {
     const key = oneLine(ref, TITLE_MAX)
     if (key === '') return undefined
-    const list = roomId === null ? tasksOf(bot) : scopedTasksOf(bot, roomId)
+    const list = (roomId === null ? tasksOf(bot) : scopedTasksOf(bot, roomId)).filter(task => !isCustomerTask(task))
     return list.find(task => task?.id === key) ?? list.filter(task => task?.title === key).at(-1)
   }
   const findTaskGlobal = (taskId) => {
     for (const bot of Object.values(state.bots)) {
-      const task = tasksOf(bot).find(item => item?.id === taskId)
+      const task = tasksOf(bot).find(item => item?.id === taskId && !isCustomerTask(item))
       if (task !== undefined) return { bot, task }
     }
     return undefined
@@ -136,7 +136,7 @@ export function install(rt) {
 
   const pruneSettledTasks = (bot) => {
     const list = tasksOf(bot)
-    const settled = list.filter(task => !isActiveTask(task))
+    const settled = list.filter(task => !isActiveTask(task) && !isCustomerTask(task))
     if (settled.length <= MAX_SETTLED_TASKS) return
     const dropCount = settled.length - MAX_SETTLED_TASKS
     const toDrop = new Set(settled.slice(0, dropCount).map(task => task.id))
@@ -207,7 +207,7 @@ export function install(rt) {
     return task.status
   }
 
-  const taskViewOf = (bot) => tasksOf(bot).map(task => ({
+  const taskViewOf = (bot) => tasksOf(bot).filter(task => !isCustomerTask(task)).map(task => ({
     id: task.id,
     title: task.title,
     status: statusOf(task),
@@ -228,6 +228,19 @@ export function install(rt) {
   // closes any parent handoff sub-work, notifies the foreground chat via `rt.deliver`
   // (restoring IM origin if captured), and fires `onTaskEvent`.
   async function settleTask(bot, task, outcome, { text = '', error, notifyForeground = true } = {}) {
+    if (isCustomerTask(task)) {
+      if (settling.has(task.id)) return
+      settling.add(task.id)
+      try {
+        task.status = 'waiting_customer'
+        task.updatedAt = Date.now()
+        await rt.save()
+        emitTaskEvent('task.waiting_customer', bot, task)
+      } finally {
+        settling.delete(task.id)
+      }
+      return
+    }
     if (settling.has(task.id) || !isActiveTask(task)) return
     settling.add(task.id)
     try {
@@ -354,6 +367,9 @@ export function install(rt) {
 
   // Starts a background task for a Bot from either its foreground own chat or a group member Session.
   async function startTask(fromSessionId, { title, brief, workdir }, exec) {
+    if (rt.isCustomerPart?.(fromSessionId)) {
+      throw Object.assign(new Error('Customer conversations cannot start or control background tasks.'), { code: 'bot/invalid' })
+    }
     if (rt.taskOwners?.has(fromSessionId)) {
       throw Object.assign(new Error('Background tasks cannot start nested background tasks. Finish this task and report back to your chat instead.'), { code: 'bot/invalid' })
     }
@@ -467,7 +483,7 @@ export function install(rt) {
   }
 
   async function stopTask(bot, task, reason = 'stopped', { notifyForeground = false } = {}) {
-    if (bot === undefined || task === undefined) return false
+    if (bot === undefined || task === undefined || isCustomerTask(task)) return false
     const wasActive = isActiveTask(task)
     const sessionId = task.sessionId
     try {
@@ -489,15 +505,45 @@ export function install(rt) {
     return wasActive
   }
 
+  function stopCustomerTask(task, reason = 'stopped') {
+    if (!isCustomerTask(task) || !isLiveTask(task)) return false
+    const sessionId = task.sessionId
+    const changed = isActiveTask(task)
+    if (changed) {
+      task.status = 'waiting_customer'
+      task.updatedAt = Date.now()
+    }
+    rt.cancelApprovals?.(sessionId)
+    const jobs = ctx.get?.('jobs')
+    for (const job of rt.runningJobs?.(sessionId) ?? []) {
+      try { jobs?.kill(job.id, sessionId, reason) } catch { /* already ended */ }
+    }
+    const agent = ctx.get('agents')?.get(sessionId)
+    agent?.inbox?.clear()
+    agent?.cancel({ kind: 'hook', reason: 'ds-bot: customer work stopped' })
+    return changed
+  }
+
   async function stopAllTasksOfBot(bot, reason = 'stopped') {
     const rooms = new Set()
-    for (const task of activeTasksOf(bot)) {
-      if (task.roomId !== undefined) rooms.add(task.roomId)
-      await stopTask(bot, task, reason, { notifyForeground: false })
-    }
-    for (const roomId of rooms) {
-      await rt.reconcileStoppedRoomTask?.(roomId, bot.id)
-        .catch(error => rt.warn('ds-bot: reconciling stopped group task for %s in %s failed: %s', bot.name, roomId, error))
+    let customerTasksChanged = false
+    try {
+      for (const task of bot.tasks ?? []) {
+        if (isCustomerTask(task) && isLiveTask(task)) {
+          if (isActiveTask(task)) customerTasksChanged = true
+          stopCustomerTask(task, reason)
+        }
+      }
+      for (const task of activeTasksOf(bot).filter(item => !isCustomerTask(item))) {
+        if (task.roomId !== undefined) rooms.add(task.roomId)
+        await stopTask(bot, task, reason, { notifyForeground: false })
+      }
+      for (const roomId of rooms) {
+        await rt.reconcileStoppedRoomTask?.(roomId, bot.id)
+          .catch(error => rt.warn('ds-bot: reconciling stopped group task for %s in %s failed: %s', bot.name, roomId, error))
+      }
+    } finally {
+      if (customerTasksChanged) await rt.save()
     }
   }
 
@@ -1117,6 +1163,7 @@ export function install(rt) {
     const id = agent?.id ?? agent?.session?.id
     if (replacedIds.delete(msg?.id)) return
     if (id === undefined || msg?.source?.kind !== 'user' || skipInterceptIds.has(msg.id)) return
+    if (rt.isCustomerPart?.(id)) return
     const target = agent.inbox?.locate?.(msg.id)?.target
       ?? (agent.inbox?.nextStep?.some(item => item?.id === msg.id) ? 'next-step' : 'next-turn')
     const clearSteeredAt = () => {
@@ -1263,7 +1310,7 @@ export function install(rt) {
 
   const callerScopeOf = (exec) => {
     const id = exec.agent?.id
-    if (id === undefined || rt.taskOwners?.has(id)) return undefined
+    if (id === undefined || rt.isCustomerPart?.(id) || rt.taskOwners?.has(id)) return undefined
     const groupOwner = rt.groupOwners.get(id)
     if (groupOwner !== undefined) {
       const bot = rt.botOf(groupOwner.botId)
@@ -1273,9 +1320,12 @@ export function install(rt) {
     const bot = botId === undefined ? undefined : rt.botOf(botId)
     return bot === undefined ? undefined : { bot, roomId: undefined }
   }
-  const rejectIfTask = (exec) => (rt.taskOwners?.has(exec.agent?.id)
-    ? 'Background tasks cannot manage other background tasks. Finish your work and report back to your chat.'
-    : undefined)
+  const rejectIfTask = (exec) => {
+    const id = exec.agent?.id
+    if (rt.isCustomerPart?.(id)) return 'Customer conversations cannot start or control background tasks.'
+    if (rt.taskOwners?.has(id)) return 'Background tasks cannot manage other background tasks. Finish your work and report back to your chat.'
+    return undefined
+  }
 
   const hasRoomTasks = (roomId, botId) => activeTasksOf(rt.botOf(botId)).some(task => task.roomId === roomId)
   const activeRoomTasks = () => {
@@ -1379,7 +1429,7 @@ export function install(rt) {
       const blocked = rejectIfTask(exec)
       if (blocked !== undefined) return blocked
       const scope = callerScopeOf(exec)
-      const list = scope === undefined ? [] : scopedTasksOf(scope.bot, scope.roomId)
+      const list = scope === undefined ? [] : scopedTasksOf(scope.bot, scope.roomId).filter(task => !isCustomerTask(task))
       if (list.length === 0) return 'No background tasks.'
       return list.map(task => `${task.id} · ${task.title} · ${statusOf(task)} · started ${new Date(task.startedAt).toISOString()}`).join('\n')
     },
@@ -1429,6 +1479,7 @@ export function install(rt) {
       return stopped
     },
     stopAllTasksOfBot,
+    stopCustomerTask,
     hasRoomTasks,
     activeRoomTasks,
     stopMemberRoomTasks,

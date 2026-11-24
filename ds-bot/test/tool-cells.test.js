@@ -9,7 +9,7 @@ import { build } from 'esbuild'
 const { outputFiles } = await build({
   stdin: {
     contents: [
-      "export { ToolCell, TriggerCell, callTree, CellEmpty, Bubbles } from './src/client/cells.js'",
+      "export { ToolCell, TriggerCell, callTree, CellEmpty, Bubbles, EarlierParts, ChatRows } from './src/client/cells.js'",
       "export { stackReplies } from './src/shared/group-replies.js'",
       "export { QuestionDock, SettledQuestion } from './src/client/questions.js'",
       "export { SecretDock } from './src/client/secret-card.js'",
@@ -22,6 +22,7 @@ const { outputFiles } = await build({
   external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
 })
 let effects = []
+let nextState
 const sets = []
 const Fragment = Symbol('Fragment')
 const h = (type, props, ...children) => ({ type, props: { ...props, children } })
@@ -32,7 +33,11 @@ const react = {
   createElement: h, Fragment,
   useEffect: (effect) => { effects.push(effect) },
   useLayoutEffect: (effect) => { effects.push(effect) },
-  useState: initial => [typeof initial === 'function' ? initial() : initial, value => sets.push(value)],
+  useState: initial => {
+    const value = nextState ?? (typeof initial === 'function' ? initial() : initial)
+    nextState = undefined
+    return [value, value => sets.push(value)]
+  },
   useMemo: make => make(), useRef: current => ({ current }), useId: () => 'card-id',
   useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
 }
@@ -70,7 +75,7 @@ runInNewContext(outputFiles[0].text, {
     throw new Error(`Unexpected platform module ${name}`)
   },
 })
-const { ToolCell, TriggerCell, callTree, stackReplies, CellEmpty, Bubbles, QuestionDock, SettledQuestion, SecretDock, countCards, ViewMenuList, WidgetView, WidgetDock, SettledView, AnsweredView, ClosedView } = module.exports
+const { ToolCell, TriggerCell, callTree, stackReplies, CellEmpty, Bubbles, EarlierParts, ChatRows, QuestionDock, SettledQuestion, SecretDock, countCards, ViewMenuList, WidgetView, WidgetDock, SettledView, AnsweredView, ClosedView } = module.exports
 
 // Runs the effects collected since the last render; returns the cleanups.
 const mount = () => {
@@ -114,6 +119,75 @@ const call = (name, callId, { args = {}, content = '', subCalls = [], running = 
   ? { phase: 'start', name, callId, argsRaw: JSON.stringify(args), subCalls, turn: 0 }
   : { kind: 'tool-result', name, callId, call: { name, argsRaw: JSON.stringify(args) }, content: text$(content), isError, ...(error === undefined ? {} : { error }), subCalls })
 const program = (subCalls, over = {}) => call('run_code', 'program', { subCalls, ...over })
+
+test('customer transcripts prepend pages, handle empty reads and retry errors without live card actions', async () => {
+  for (const mode of ['messages', 'empty', 'error']) {
+    effects = []
+    sets.length = 0
+    let state
+    const asked = []
+    let fail = mode === 'error'
+    const roster = team({ views: { chief: { id: 'pending', callId: 'v-call', title: 'Card', view: { type: 'metric', label: 'Done', value: '3' } } } })
+    const actions = {
+      earlier: () => assert.fail('customer transcripts must use their own endpoint'),
+      answer: () => assert.fail('customer cards cannot be answered by staff'),
+      customerPage: async (id, cursor) => {
+        asked.push([id, cursor])
+        if (fail) throw new Error('history unavailable')
+        return {
+          items: mode === 'empty' ? [] : cursor
+            ? [{ kind: 'user', text: 'older', time: 1 }]
+            : [{ kind: 'user', text: 'newest', time: 2 }, { kind: 'view', callId: 'v-call', title: 'Card', view: { type: 'metric', label: 'Done', value: '3' } }],
+          cursor: mode === 'empty' || cursor ? null : { part: 0 },
+        }
+      },
+    }
+    const render = () => {
+      nextState = state
+      return EarlierParts({ sessionId: 'chief', roster, actions, customer: true })
+    }
+    const settle = async () => {
+      await Promise.resolve()
+      for (const update of sets.splice(0)) state = typeof update === 'function' ? update(state) : update
+    }
+    render()
+    const unmount = mount()
+    await settle()
+    if (mode === 'error') {
+      const retry = find(expand(render()), node => node.type === 'button' && /Retry/.test(text(node)))
+      assert.ok(retry)
+      fail = false
+      retry.props.onClick()
+      await settle()
+    }
+    const page = render()
+    assert.equal(page.props['aria-label'], 'Customer conversation')
+    assert.equal(page.props['aria-busy'], false)
+    const rows = find(page, node => node.type === ChatRows)
+    assert.deepEqual(Object.keys(rows.props.roster.views), [])
+    assert.equal(rows.props.useUi, undefined)
+    const shown = expand(page)
+    assert.equal(find(shown, node => node.type === 'textarea' || node.type === 'form'), undefined)
+    assert.equal(find(shown, node => /bt-view-pending|bt-q-actions/.test(node.props.className ?? '')), undefined)
+    if (mode === 'empty') {
+      assert.equal(rows.props.items.length, 0)
+      assert.equal(find(shown, node => node.type === 'button'), undefined)
+    } else {
+      const earlier = find(shown, node => node.type === 'button' && text(node) === 'Load earlier')
+      assert.ok(earlier)
+      earlier.props.onClick()
+      await settle()
+      const items = find(render(), node => node.type === ChatRows).props.items
+      assert.deepEqual(Array.from(items.filter(item => item.kind === 'user'), item => item.text), ['older', 'newest'])
+      assert.equal(asked.at(-1)[1].part, 0)
+    }
+    assert.equal(asked[0][0], 'chief')
+    assert.equal(asked[0][1], undefined)
+    unmount()
+  }
+  effects = []
+  sets.length = 0
+})
 
 test('a member\'s messages in a row stack under its name, and an event line starts a new block', () => {
   const replies = [

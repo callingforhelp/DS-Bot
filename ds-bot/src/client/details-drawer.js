@@ -19,6 +19,7 @@ import { TaskBoard } from './task-board.js'
 import { DetailsTaskList, isActiveTask, tasksForChat } from './bot-tasks.js'
 import { BotConnectors } from './connectors.js'
 import { ComputerView } from './computer.js'
+import { EarlierParts } from './cells.js'
 import { useEscape } from './overlay-hooks.js'
 import { t } from './i18n.js'
 
@@ -231,6 +232,30 @@ function GroupOverview({ room, roster, actions, usage, useWork, useComputer, ope
   ]
 }
 
+function CustomerSessions({ bot, roster, actions }) {
+  const [customer, setCustomer] = useState(null)
+  const body = useRef(null)
+  useMorph(body, customer)
+  const sessions = bot.customerSessions ?? []
+  if (sessions.length === 0) return null
+  if (customer !== null) return h('div', { ref: body, className: 'bt-drawer-model' },
+    h('button', { type: 'button', className: 'bt-soft', onClick: () => setCustomer(null) }, h(ChevronLeftIcon), t('Back to details')),
+    h('div', { className: 'bt-section-title' }, t('Customer conversation')),
+    h('div', { className: 'bt-muted' }, t('Read only')),
+    h(EarlierParts, { key: customer, sessionId: customer, roster, actions, customer: true }))
+  return h('div', { ref: body, className: 'bt-drawer-model' },
+    h('div', { className: 'bt-agent-sessions-head' },
+      h('div', { className: 'bt-section-title' }, t('Customer conversations'))),
+    h('div', { className: 'bt-agent-sessions' }, sessions.map(entry => {
+      const when = Number.isFinite(entry.updatedAt) ? new Date(entry.updatedAt).toLocaleString() : ''
+      return h('button', {
+        key: entry.sessionId, type: 'button', className: 'bt-agent-session',
+        title: t('Customer conversation'), onClick: () => setCustomer(entry.sessionId),
+      },
+        h('span', { className: 'bt-agent-session-name' }, `${t('Customer conversation')} · #${entry.reference ?? ''}`),
+        h('span', { className: 'bt-agent-session-meta' }, when))
+    })))
+}
 export function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, roster, actions, useSessions, useSessionStatus, useActivity, useWork, useBrowserTabs, useBrowserPages, useComputer }) {
   const owner = roster.byId[sessionId]
   const part = owner ? currentPart(owner) : sessionId
@@ -366,6 +391,7 @@ export function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, ro
           h(ModelMenu, { bot, roster, actions, run, wide: true, inline: true }),
           modelOf(bot, roster) ? null : h('div', { className: 'bt-note' }, t('Pick a model and {name} can start.', { name: bot.name })),
         ),
+        h(CustomerSessions, { key: 'customers', bot, actions, roster }),
         h(PermissionRow, { key: 'permission', bot, roster, actions, run }),
         h(BotConnectors, { key: 'connectors', bot, roster, actions, run }),
         h('div', { key: 'folder', className: 'bt-drawer-model' },

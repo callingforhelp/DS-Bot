@@ -308,6 +308,204 @@ test('turn/end state machine ignores disposed, switched/blocked, HANDOFF_ACK, ru
   assert.match(env.deliveries.find(d => d.role === 'task-report').text, /Final verified answer\./)
 })
 
+test('customer tasks stay private and retained, and ordinary task APIs cannot access them or unrelated tasks', async (t) => {
+  const settled = Array.from({ length: 60 }, (_, index) => ({
+    id: `old-${index}`,
+    title: `Settled ${index}`,
+    status: 'completed',
+    sessionId: `old-session-${index}`,
+    startedAt: index + 1,
+  }))
+  const customerTasks = ['customer-a', 'customer-b'].map((sessionId, index) => ({
+    id: `customer_${sessionId}`,
+    title: 'Customer conversation',
+    origin: 'customer',
+    customer: { connId: 'wecom', chatKey: sessionId },
+    status: 'running',
+    sessionId,
+    startedAt: index + 100,
+  }))
+  const team = makeTeam({ bots: { a: { ...makeTeam().bots.a, tasks: [...settled, ...customerTasks] } } })
+  const env = await startEnv({ team })
+  t.after(env.stop)
+  const dmA = env.agentMap.get('dm-a')
+  await env.tool('task_start').execute({ title: 'Unrelated private work', brief: 'Do not expose this' }, execOf(dmA))
+  const ordinaryTask = env.rt.botOf('a').tasks.find(task => task.title === 'Unrelated private work')
+  const storedCustomerTasks = customerTasks.map(task => env.rt.botOf('a').tasks.find(item => item.id === task.id))
+
+  for (const [index, task] of storedCustomerTasks.entries()) {
+    const sessionId = task.sessionId
+    await env.emit(sessionId, 'turn/start', { turn: index + 1 })
+    if (index === 0) await env.emit(sessionId, 'assistant/message', { turn: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'private customer reply' }] } })
+    await env.emit(sessionId, 'turn/end', { turn: index + 1, reason: index === 0 ? { kind: 'completed' } : { kind: 'error', error: { message: 'private customer failure' } } })
+    await waitFor(() => task.status === 'waiting_customer')
+  }
+
+  const bot = env.rt.botOf('a')
+  assert.ok(ownChatSessions(bot).includes('customer-a'))
+  assert.ok(ownChatSessions(bot).includes('customer-b'))
+  const customerAgent = env.agentMap.get('customer-a')
+  let removedCustomerInput = false
+  customerAgent.inbox.remove = () => { removedCustomerInput = true; return true }
+  const deliveriesBeforeCustomerInput = env.deliveries.length
+  for (const listener of env.ctx.listeners.get('agent/inbox/inserted') ?? []) {
+    await listener({ agent: customerAgent, message: { id: 'customer-input', source: { kind: 'user' }, content: [{ type: 'text', text: 'customer-only input' }] } })
+  }
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(removedCustomerInput, false)
+  assert.equal(env.deliveries.length, deliveriesBeforeCustomerInput)
+  assert.equal(env.deliveries.filter(delivery => delivery.role === 'task-report').length, 0)
+  assert.equal(bot.tasks.filter(task => task.origin === 'customer').length, 2)
+  assert.equal(bot.tasks.filter(task => task.status === 'completed' && task.title.startsWith('Settled ')).length, 60)
+  await assert.rejects(env.rt.stopTask('a', storedCustomerTasks[0].id), { code: 'bot/not-found' })
+  assert.equal(storedCustomerTasks[0].status, 'waiting_customer')
+  await assert.rejects(env.rt.deliverToTask(storedCustomerTasks[0].id, { text: 'steer customer task' }), /Unknown task|cannot receive messages/)
+  await assert.rejects(env.rt.taskPage('a', storedCustomerTasks[0].id), { code: 'bot/not-found' })
+
+  const blockedStart = await env.tool('task_start').execute({ title: 'Nested', brief: 'Should not start' }, execOf(customerAgent))
+  assert.match(blockedStart, /Customer conversations cannot start or control background tasks/)
+  for (const name of ['task_send', 'task_stop', 'task_list', 'task_read']) {
+    const result = await env.tool(name).execute({ task: ordinaryTask.id, text: 'Should not be accessible' }, execOf(customerAgent))
+    assert.doesNotMatch(result, /Unrelated private work|Do not expose this/)
+  }
+  for (const name of ['list_bots', 'read', 'shell', 'create_bot', 'late_registered_tool']) {
+    const denials = env.ctx.guards.map(guard => guard({ agent: customerAgent, name, arguments: {} })).filter(Boolean)
+    assert.ok(denials.some(message => /not available in customer conversations/.test(message)), `${name} must be denied by the host guard`)
+  }
+  assert.equal(env.ctx.guards.map(guard => guard({ agent: customerAgent, name: 'ask_user', arguments: {} })).filter(Boolean).length, 0)
+  assert.equal(ordinaryTask.status, 'running')
+  assert.equal(env.deliveries.filter(delivery => delivery.role === 'task-report').length, 0)
+})
+
+test('Main Bot emergency stop cancels customer work without settling or reporting it', async (t) => {
+  const customerTask = {
+    id: 'customer_kf01', title: 'Customer conversation', origin: 'customer',
+    customer: { connId: 'wecom', chatKey: 'customer-a' }, status: 'running', sessionId: 'customer-a', startedAt: 1,
+  }
+  const team = makeTeam({ bots: { a: { ...makeTeam().bots.a, tasks: [customerTask] } } })
+  const env = await startEnv({ team })
+  t.after(env.stop)
+  const task = env.rt.botOf('a').tasks[0]
+  const agent = await env.rt.resolveAgent(task.sessionId)
+  agent.inbox.nextTurn.push({ id: 'queued-turn' })
+  agent.inbox.nextStep.push({ id: 'queued-step' })
+  let cleared = 0
+  agent.inbox.clear = () => { cleared++; agent.inbox.nextStep.splice(0); agent.inbox.nextTurn.splice(0) }
+  await env.rt.stopAllTasksOfBot(env.rt.botOf('a'), 'emergency stop')
+  assert.equal(task.status, 'waiting_customer')
+  assert.deepEqual(task.customer, { connId: 'wecom', chatKey: 'customer-a' })
+  assert.equal(cleared, 1)
+  assert.deepEqual(agent.inbox.nextTurn, [])
+  assert.deepEqual(agent.inbox.nextStep, [])
+  assert.ok(agent.cancelled.length > 0)
+  assert.equal(env.deliveries.some(delivery => delivery.role === 'task-report' && delivery.taskId === task.id), false)
+})
+
+test('emergency stop cancels customer resources before batched persistence and keeps idle customer state', async (t) => {
+  const idleCustomers = Array.from({ length: 24 }, (_, index) => ({
+    id: `customer_idle_${index}`, title: `Customer ${index}`, origin: 'customer',
+    customer: { connId: 'wecom', chatKey: `customer-${index}` }, status: 'waiting_customer',
+    sessionId: `customer-idle-${index}`, startedAt: index + 1, updatedAt: index + 100,
+    segments: [{ sessionId: `customer-idle-old-${index}`, endedAt: index + 1 }],
+  }))
+  const activeCustomer = {
+    id: 'customer_active', title: 'Active customer', origin: 'customer',
+    customer: { connId: 'wecom', chatKey: 'customer-active' }, status: 'waiting_approval',
+    sessionId: 'customer-active', startedAt: 100, updatedAt: 200,
+    segments: [{ sessionId: 'customer-active-old', endedAt: 100 }],
+  }
+  const team = makeTeam({ bots: { a: { ...makeTeam().bots.a, tasks: [...idleCustomers, activeCustomer] } } })
+  const env = await startEnv({ team })
+  t.after(env.stop)
+  const bot = env.rt.botOf('a')
+  const customers = bot.tasks.filter(task => task.origin === 'customer')
+  const idleTasks = customers.slice(0, idleCustomers.length)
+  const activeTask = customers.at(-1)
+  const idleSnapshot = idleTasks.map(task => ({
+    status: task.status,
+    updatedAt: task.updatedAt,
+    customer: { ...task.customer },
+    segments: task.segments.map(segment => ({ ...segment })),
+  }))
+
+  await env.tool('task_start').execute({ title: 'Ordinary active task', brief: 'Stop this too' }, execOf(env.agentMap.get('dm-a')))
+  const ordinaryTask = bot.tasks.find(task => task.title === 'Ordinary active task')
+  activeTask.status = 'waiting_approval'
+  activeTask.updatedAt = 200
+  ordinaryTask.status = 'running'
+  const approvalsCancelled = []
+  const inboxesCleared = []
+  const agentsCancelled = []
+  const sessions = [...customers, ordinaryTask]
+  const agents = new Map()
+  env.rt.cancelApprovals = sessionId => approvalsCancelled.push(sessionId)
+  env.rt.runningJobs = sessionId => [{ id: `job-${sessionId}` }]
+  for (const task of sessions) {
+    const agent = await env.rt.resolveAgent(task.sessionId)
+    agents.set(task.sessionId, agent)
+    agent.inbox.nextTurn.push({ id: `turn-${task.sessionId}` })
+    agent.inbox.nextStep.push({ id: `step-${task.sessionId}` })
+    agent.inbox.clear = () => {
+      inboxesCleared.push(task.sessionId)
+      agent.inbox.nextTurn.splice(0)
+      agent.inbox.nextStep.splice(0)
+    }
+    const cancel = agent.cancel.bind(agent)
+    agent.cancel = cause => {
+      agentsCancelled.push(task.sessionId)
+      cancel(cause)
+    }
+  }
+
+  const customerResourcesCancelled = () => customers.every(task => approvalsCancelled.includes(task.sessionId)
+    && env.killedJobs.some(job => job.owner === task.sessionId)
+    && inboxesCleared.includes(task.sessionId)
+    && agentsCancelled.includes(task.sessionId))
+  let saveCalls = 0
+  let firstSaveSnapshot
+  const firstSaveStarted = Promise.withResolvers()
+  const firstSaveGate = Promise.withResolvers()
+  env.rt.save = async () => {
+    saveCalls++
+    if (saveCalls === 1) {
+      firstSaveSnapshot = {
+        customerResourcesCancelled: customerResourcesCancelled(),
+        activeCustomerStatus: activeTask.status,
+        idle: idleTasks.map(task => ({ status: task.status, updatedAt: task.updatedAt })),
+      }
+      firstSaveStarted.resolve()
+      await firstSaveGate.promise
+      throw new Error('disk failure')
+    }
+  }
+
+  const stopping = env.rt.stopAllTasksOfBot(bot, 'emergency stop').then(
+    () => ({}),
+    error => ({ error }),
+  )
+  await firstSaveStarted.promise
+  firstSaveGate.resolve()
+  const result = await stopping
+
+  assert.equal(result.error?.message, 'disk failure')
+  assert.equal(saveCalls, 2)
+  assert.equal(firstSaveSnapshot.customerResourcesCancelled, true)
+  assert.equal(firstSaveSnapshot.activeCustomerStatus, 'waiting_customer')
+  assert.deepEqual(firstSaveSnapshot.idle, idleSnapshot.map(({ status, updatedAt }) => ({ status, updatedAt })))
+  assert.deepEqual(idleTasks.map(task => ({ status: task.status, updatedAt: task.updatedAt, customer: task.customer, segments: task.segments })), idleSnapshot)
+  assert.equal(activeTask.status, 'waiting_customer')
+  assert.deepEqual(activeTask.customer, { connId: 'wecom', chatKey: 'customer-active' })
+  assert.deepEqual(activeTask.segments, [{ sessionId: 'customer-active-old', endedAt: 100 }])
+  assert.equal(bot.tasks.filter(task => task.origin === 'customer').length, idleCustomers.length + 1)
+  assert.equal(ordinaryTask.status, 'stopped')
+  assert.ok(agents.get(ordinaryTask.sessionId).cancelled.length > 0)
+  for (const task of customers) {
+    assert.deepEqual(agents.get(task.sessionId).inbox.nextTurn, [])
+    assert.deepEqual(agents.get(task.sessionId).inbox.nextStep, [])
+  }
+  assert.equal(env.deliveries.some(delivery => delivery.role === 'task-report' && customers.some(task => task.id === delivery.taskId)), false)
+})
+
 test('nested task_* tools and interactive cards (ask_user/show_view/request_secret) are blocked for tasks, and tasks stay read-only', async (t) => {
   const env = await startEnv()
   t.after(env.stop)

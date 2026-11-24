@@ -170,6 +170,7 @@ export function answerSender(rt, id, source, text, long, options = {}) {
   const body = marker === '' ? (long?.text ?? text) : `${marker}${long?.text ?? text}`
   const length = long === undefined ? undefined : late === undefined ? long.length : (long.length ?? text.length) + marker.length
   const exchangeId = source.exchangeId === undefined ? randomUUID() : `reply:${source.exchangeId}`
+  const customerRecipient = rt.isCustomerPart?.(targetSessionId) === true
   void rt.deliver({
     fromId,
     fromName: name,
@@ -191,7 +192,9 @@ export function answerSender(rt, id, source, text, long, options = {}) {
     // answer names it.
     rt.forgetDelivery?.(exchangeId)
     rt.answerMissed?.(source.exchangeId)
-    const said = `${name} could not send its reply to you (${failureLine(turnFailure(error))}); what it had answered:\n`
+    const said = customerRecipient
+      ? 'Customer support could not send this reply. Please try again later. The reply was:\n'
+      : `${name} could not send its reply to you (${failureLine(turnFailure(error))}); what it had answered:\n`
     void rt.deliver({
       fromId,
       fromName: name,
@@ -1516,7 +1519,11 @@ export function install(rt) {
           if (!expectsReply(source) || answersUser(source)) return
           if (failure !== undefined) {
             // The sender was told a reply comes later; without this it would wait forever.
-            tellSender(id, source, `${name} could not answer your message: its model call failed (${failureLine(failure)}). Tell the user if it matters; do not retry right away.`, undefined, { failure, dedupKey: turnDedupKey })
+            const customerRecipient = [source.senderSessionId, source.senderPart].some(sessionId => rt.isCustomerPart?.(sessionId) === true)
+            const notice = customerRecipient
+              ? 'Customer support could not complete this reply. Please try again later.'
+              : `${name} could not answer your message: its model call failed (${failureLine(failure)}). Tell the user if it matters; do not retry right away.`
+            tellSender(id, source, notice, undefined, { failure, dedupKey: turnDedupKey })
           } else if (reply !== '' || reason?.kind === 'aborted') {
             // A turn stopped before it could answer still owes the sender a line,
             // or it would wait forever for a reply that never comes.

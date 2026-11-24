@@ -70,7 +70,7 @@ const JITTER = Number(process.env.MOCK_JITTER_MS ?? 0)
 const SUMMARY_DELAY = Number(process.env.MOCK_SUMMARY_DELAY_MS ?? DELAY)
 // How much of each call's last message the log keeps; raise it to read whole prompts.
 const LOG_CHARS = Number(process.env.MOCK_LOG_CHARS ?? 160)
-const WATCH = process.env.MOCK_WATCH ?? ''
+const WATCH = (process.env.MOCK_WATCH ?? '').split(',').map(value => value.trim()).filter(Boolean)
 const REJECT_IMAGES = process.env.MOCK_REJECT_IMAGES === '1'
 // MOCK_LOG_TOOLS=1 records the request's tool names, to compare two Sessions' tool views.
 const LOG_TOOLS = process.env.MOCK_LOG_TOOLS === '1'
@@ -78,6 +78,13 @@ let seq = 0
 
 const textOf = content => typeof content === 'string' ? content
   : Array.isArray(content) ? content.map(block => (block.type === 'text' ? block.text : '')).join('\n') : ''
+const auditTextOf = content => typeof content === 'string' ? content
+  : Array.isArray(content) ? content.map(block => {
+    if (block.type === 'text') return block.text
+    if (block.type === 'tool_use') return `${block.name} ${JSON.stringify(block.input)}`
+    if (block.type === 'tool_result') return auditTextOf(block.content)
+    return ''
+  }).filter(Boolean).join('\n') : ''
 const systemText = system => typeof system === 'string' ? system
   : Array.isArray(system) ? system.map(block => block.text ?? '').join('\n') : ''
 
@@ -124,6 +131,96 @@ function decide(body) {
   }).filter(message => message.role !== 'user' || message.content.length > 0)
   const last = messages.at(-1)
   const blocks = Array.isArray(last?.content) ? last.content : []
+  if (process.env.MOCK_TRIAGE_E2E === '1') {
+    if (system.includes('You are a customer-service routing judge.')) {
+      const evidence = JSON.parse(textOf(last.content))
+      const index = evidence.summary.includes('DISAGREE') && body.model.includes('flash') ? 1 : 0
+      return [text(JSON.stringify({ route: evidence.routes[index], confidence: 0.95, reason: 'scripted triage judge' }))]
+    }
+    const result = blocks.find(block => block.type === 'tool_result')
+    const call = [...messages].reverse().find(message => message.role === 'assistant' && message.content?.some?.(block => block.type === 'tool_use'))
+    const used = call?.content.find(block => block.type === 'tool_use' && block.id === result?.tool_use_id)
+    if (result && used?.name === 'triage_cases') {
+      const raw = typeof result.content === 'string' ? result.content : textOf(result.content)
+      let value
+      try { value = JSON.parse(raw) } catch { return [text(`分诊工具拒绝：${raw}`)] }
+      if (value.decision === 'handoff') return [text(value.holding_reply)]
+      if (value.decision === 'route') return [text('已安排报价专员跟进。'), tool('message_bot', {
+        to: value.delivery.target,
+        message: used.input.summary?.includes('E2E_SPECIALIST_ANSWER')
+          ? 'E2E_SPECIALIST_ANSWER：客户选择型号甲，请按型号甲继续处理。'
+          : used.input.summary?.includes('E2E_SPECIALIST_ASK_USER') ? 'E2E_SPECIALIST_ASK_USER：客户需要确认产品型号。' : 'E2E_ROUTED_CASE：客户需要报价，请审核。',
+      })]
+      let summary = '分诊已完成。'
+      try {
+        const value = JSON.parse(raw)
+        summary = value.decision === 'route'
+          ? `已找到合适的处理类型：${value.route}。`
+          : '暂时无法自动确定处理类型，已交由客服专员跟进。'
+      } catch {}
+      return [text(summary)]
+    }
+    if (system.includes('# Customer service') && textOf(last?.content).includes('Customer support request')
+      && textOf(last?.content).includes('E2E_SPECIALIST_ASK_USER')) {
+      return [tool('ask_user', { question: '请确认产品型号？', options: [{ label: '型号甲' }, { label: '型号乙' }] })]
+    }
+    if (result && used?.name === 'ask_user' && textOf(result.content).includes('live customer IM origin')) {
+      return [text('请客户确认产品型号：型号甲还是型号乙？')]
+    }
+    const prompt = textOf(last?.content)
+    const latest = [...prompt.matchAll(/(?:^|\n)User: ([^\n]*)/g)].at(-1)
+    const replied = latest !== undefined && /\n(?:Chief|Quote): /.test(prompt.slice(latest.index + latest[0].length))
+    const currentUser = latest === undefined ? textBlocks(last?.content).at(-1)?.trim() : replied ? '' : latest[1].trim()
+    if (system.includes('# Customer service') && !result && currentUser === '型号甲') {
+      return [tool('triage_cases', { action: 'vote', summary: 'E2E_SPECIALIST_ANSWER：客户选择型号甲', routes: ['quote', 'order_status'] })]
+    }
+    const specialistAnswer = '已确认型号甲，会按该型号继续跟进。'
+    if (system.includes('# Customer service') && !result && textOf(last?.content).includes('[Reply from Customer support]')
+      && textOf(last?.content).includes(specialistAnswer)) {
+      return [text(`专员回复：${specialistAnswer}`)]
+    }
+    if (system.includes('# Customer service') && !result && textOf(last?.content).includes('E2E_SPECIALIST_ANSWER')) {
+      return [text(specialistAnswer)]
+    }
+    const questionCard = /^E2E_ASK_CARD_([AB])$/.exec(currentUser ?? '')
+    if (system.includes('# Customer service') && !result && questionCard) {
+      const customer = questionCard[1]
+      return [tool('ask_user', {
+        question: '请确认下一步服务安排',
+        options: [`E2E_${customer}_OPTION_ONE`, `E2E_${customer}_OPTION_TWO`, `E2E_${customer}_OPTION_THREE`],
+        multiSelect: true,
+      })]
+    }
+    if (system.includes('# Customer service') && messages.some(message => message.role === 'user'
+      && textOf(message.content).includes('"kind":"answer_to_pending_question"')
+      && textOf(message.content).includes('E2E_B_OPTION_ONE'))) return [text('E2E_B_OPTION_ONE_ACK')]
+    if (system.includes('# Customer service') && currentUser === '99') return [text('E2E_FREE_TEXT_99_ACK')]
+    const requestsRoster = messages.some(message => message.role === 'user' && textOf(message.content).includes('MOCK_ROSTER_GUARD'))
+    const rosterAttempted = messages.some(message => message.role === 'assistant' && message.content?.some?.(block => block.type === 'tool_use' && block.name === 'list_bots'))
+    if (system.includes('# Customer service') && requestsRoster && !rosterAttempted) {
+      return [tool('list_bots', {})]
+    }
+    const latestContent = textOf(last?.content)
+    const stepSummary = system.includes('# Customer service')
+      ? /STEP summary \(triage-part\.step\):[\s\S]*?Cylindrical surfaces are only a hole\/boss hint, not a hole count\./.exec(latestContent)?.[0]
+      : undefined
+    if (stepSummary) return [text(`您好，已收到 STEP 图纸摘要，我会按这些信息核对：\n${stepSummary}`)]
+    const routedCase = JSON.stringify(messages).includes('E2E_ROUTED_CASE')
+      || JSON.stringify(messages).includes('E2E_SPECIALIST_ASK_USER') || JSON.stringify(messages).includes('E2E_SPECIALIST_ANSWER')
+    if (system.includes('# Customer service') && routedCase && latestContent.startsWith('[Reply from Customer support]\n')) {
+      return [text(latestContent.slice('[Reply from Customer support]\n'.length))]
+    }
+    if (!result && textOf(last?.content).includes('Customer support request')) {
+      return [text('报价专员已核对您的需求，会继续跟进。')]
+    }
+    const command = /^分诊测试 (\{[^\n]+\})$/.exec(currentUser ?? '')
+    if (command && used?.name !== 'triage_cases') return [tool('triage_cases', JSON.parse(command[1]))]
+    if (!result) {
+      if (textOf(last?.content).includes('B_ONLY_CONTEXT_875')) return [text('客户B专属回复：订单进度正在核对。')]
+      const messagesText = textOf(last?.content)
+      if (messagesText.includes('E2E_ROUTED_CASE') && messagesText.includes('[Reply from Quote]')) return [text('报价专员已接手。')]
+    }
+  }
   // A side-chat question (side.js). The first line is the marker; the reply is
   // fixed and calls nothing. Its count of earlier answers proves follow-ups
   // carry the chat's finished pairs.
@@ -253,7 +350,9 @@ function decide(body) {
         try { picked = JSON.parse(resultText).answers?.[0]?.selected?.[0] ?? '' } catch {}
         return [text(picked ? `好，就从「${picked}」开始。` : '好的。'), text('我先把要点理一下，稍后给你一个方案。')]
       }
-      case 'list_bots': return [text(`现在的班底：\n${resultText}`)]
+      case 'list_bots': return [text(system.includes('# Customer service')
+        ? '您好，我无法提供团队内部信息。请告诉我您遇到的问题，我会为您安排合适的同事跟进。'
+        : `团队成员信息：\n${resultText}`)]
       case 'cua': return [text(`cua 结果：${resultText.slice(0, 400)}`)]
       case 'create_group':
       case 'update_group':
@@ -610,7 +709,12 @@ function decide(body) {
   if (card && tools.has('ask_user')) {
     return [text(filler(Number(card[1] ?? 4) * 1000, '卡片前')), tool('ask_user', { question: '接下来先做哪个？', options: ['写正文', '改标题', '先停'] })]
   }
-  if (/团队|班底|team/i.test(userText) && tools.has('list_bots')) return [tool('list_bots', {})]
+  if (/团队|班底|team/i.test(userText)) {
+    if (!tools.has('list_bots')) return [text(system.includes('# Customer service')
+      ? '您好，我无法提供团队内部信息。请告诉我您遇到的问题，我会为您安排合适的同事跟进。'
+      : '目前无法读取团队名单，请告诉我您需要什么帮助。')]
+    return [tool('list_bots', {})]
+  }
   if (/想想|思考|think/i.test(userText)) {
     return [think('用户想让我认真想一下。先拆成三件事：目标、约束、下一步。'), text('想了一下，建议分三步走：先定目标，再看约束，最后定下一步。')]
   }
@@ -774,8 +878,19 @@ const server = createServer((req, res) => {
     const cached = Math.floor(tokens * 0.9)
     // Hashes of the system prompt and tools show whether two Sessions share a cacheable prefix.
     const digest = value => createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex').slice(0, 12)
-    const watch = WATCH ? { watchHit: JSON.stringify([body.system, body.tools, body.messages]).includes(WATCH) } : {}
-    appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), id, tokens, images, session: req.headers['x-deepseek-harness-session-id'] ?? null, ...watch, ...LOG_TOOLS ? { toolNames: (body.tools ?? []).map(entry => entry.name ?? entry.type) } : {}, ...search ? { nativeSearch: { model: body.model, tools: body.tools, auth: [req.headers['x-api-key'] ? 'x-api-key' : '', req.headers.authorization ? 'bearer' : ''].filter(Boolean) } } : {}, system: digest(body.system), tools: digest(body.tools), messages: body.messages?.length ?? 0, first: textOf(body.messages?.[0]?.content).slice(0, 60), last: textOf(body.messages?.at(-1)?.content).slice(0, LOG_CHARS), out: out.map(block => (block.type === 'text' && block.text.length > 200 ? { ...block, text: `${block.text.slice(0, 200)}…(${block.text.length})` } : block)) }) + '\n')
+    const watch = WATCH.length > 0 ? { watchHit: WATCH.some(value => JSON.stringify([body.system, body.tools, body.messages]).includes(value)) } : {}
+    const assembledSystem = systemText(body.system) + '\n' + (body.messages ?? []).filter(message => message.role === 'system').map(message => textOf(message.content)).join('\n')
+    const promptAudit = { customerPrompt: assembledSystem.includes('# Customer service'), staffIdentity: assembledSystem.includes('# Your identity'), teamRules: assembledSystem.includes('How your Bot team works'), memorySection: assembledSystem.includes('# Your memory') }
+    const customerRequest = promptAudit.customerPrompt ? {
+      system: assembledSystem,
+      messages: (body.messages ?? []).map(message => ({ role: message.role, text: auditTextOf(message.content) })),
+      tools: (body.tools ?? []).map(({ name, description, input_schema }) => ({ name, description, input_schema })),
+    } : undefined
+    const triageToolIds = new Set((body.messages ?? []).flatMap(message => message.role === 'assistant' && Array.isArray(message.content)
+      ? message.content.filter(block => block.type === 'tool_use' && block.name === 'triage_cases').map(block => block.id) : []))
+    const triageToolResults = (body.messages ?? []).flatMap(message => Array.isArray(message.content)
+      ? message.content.filter(block => block.type === 'tool_result' && triageToolIds.has(block.tool_use_id)).map(block => auditTextOf(block.content)) : [])
+    appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), id, tokens, images, session: req.headers['x-deepseek-harness-session-id'] ?? null, ...watch, ...LOG_TOOLS ? { toolNames: (body.tools ?? []).map(entry => entry.name ?? entry.type) } : {}, ...promptAudit, ...customerRequest ? { customerRequest } : {}, ...triageToolResults.length ? { triageToolResults } : {}, ...search ? { nativeSearch: { model: body.model, tools: body.tools, auth: [req.headers['x-api-key'] ? 'x-api-key' : '', req.headers.authorization ? 'bearer' : ''].filter(Boolean) } } : {}, system: digest(body.system), tools: digest(body.tools), messages: body.messages?.length ?? 0, first: textOf(body.messages?.[0]?.content).slice(0, 60), last: textOf(body.messages?.at(-1)?.content).slice(0, LOG_CHARS), out: out.map(block => (block.type === 'text' && block.text.length > 200 ? { ...block, text: `${block.text.slice(0, 200)}…(${block.text.length})` } : block)) }) + '\n')
     if (search) {
       setTimeout(() => {
         res.writeHead(200, { 'content-type': 'application/json' })

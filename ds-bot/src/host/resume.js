@@ -443,7 +443,9 @@ export function install(rt) {
     const back = rt.roomOf(asker.senderRoomId)?.sessions?.[sender]
     // The answer would have gone to the part of the asking Bot's chat the request came
     // from, which is not its foreground chat when that part is a background one.
-    const where = back ?? (asker.senderPart === undefined ? undefined : threadCurrentOfPart(rt.botOf(sender), asker.senderPart)) ?? rt.chatOf(sender)
+    const senderPart = asker.senderPart
+    const where = back ?? (senderPart === undefined ? undefined : threadCurrentOfPart(rt.botOf(sender), senderPart))
+      ?? (rt.isCustomerPart?.(senderPart ?? sender) === true ? undefined : rt.chatOf(sender))
     return { sender, back, where }
   }
 

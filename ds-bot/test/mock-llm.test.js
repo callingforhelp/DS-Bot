@@ -9,11 +9,11 @@ import { fileURLToPath } from 'node:url'
 const MOCK = fileURLToPath(new URL('../dev/mock-llm.mjs', import.meta.url))
 
 // One Anthropic-shaped request, its SSE reply folded into { text, tools }.
-async function call(url, messages, names = ['list_bots']) {
+async function call(url, messages, names = ['list_bots'], model = 'mock', system) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'mock', stream: true, tools: names.map(name => ({ name })), messages }),
+    body: JSON.stringify({ model, ...(system === undefined ? {} : { system }), stream: true, tools: names.map(name => ({ name })), messages }),
   })
   assert.equal(res.status, 200)
   const events = (await res.text()).split('\n\n')
@@ -21,7 +21,7 @@ async function call(url, messages, names = ['list_bots']) {
   let text = ''
   const tools = []
   for (const event of events) {
-    if (event.type === 'content_block_start' && event.content_block.type === 'tool_use') tools.push({ id: event.content_block.id, name: event.content_block.name })
+    if (event.type === 'content_block_start' && event.content_block.type === 'tool_use') tools.push({ id: event.content_block.id, name: event.content_block.name, input: event.content_block.input })
     if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') text += event.delta.text
   }
   return { text, tools }
@@ -35,10 +35,10 @@ function fold(messages, out) {
   )
 }
 
-async function startMock(t) {
+async function startMock(t, extraEnv = {}) {
   const home = mkdtempSync(join(tmpdir(), 'dsb-mock-'))
   const mock = spawn(process.execPath, [MOCK], {
-    env: { ...process.env, MOCK_PORT: '0', MOCK_LOG: join(home, 'mock.jsonl'), MOCK_DELAY_MS: '5', MOCK_JITTER_MS: '0' },
+    env: { ...process.env, MOCK_PORT: '0', MOCK_LOG: join(home, 'mock.jsonl'), MOCK_DELAY_MS: '5', MOCK_JITTER_MS: '0', ...extraEnv },
   })
   t.after(() => { mock.kill(); rmSync(home, { recursive: true, force: true, maxRetries: 5 }) })
   // MOCK_PORT=0 lets the kernel pick a free port; the mock prints the real one.
@@ -91,4 +91,26 @@ test('a Bot message hands work on with 转告 and takes its time with 慢慢做'
   assert.equal(slow.text, '给 Writer 的回复：做完了，用了 1 秒。')
   const back = await call(url, [{ role: 'user', content: '[Reply from Coder · for the work Chief asked you for; your answer goes to Chief once everything you handed on is back]\n做完了' }], tools)
   assert.deepEqual([back.text, back.tools], ['Coder 交回了，我把结果交给 Chief。', []])
+})
+
+test('mock triage E2E judges agree or disagree and recognize a command after a stale tool result', async (t) => {
+  const url = await startMock(t, { MOCK_TRIAGE_E2E: '1' })
+  const prompt = JSON.stringify({ summary: 'DISAGREE：订单需要确认', routes: ['quote', 'order_status'] })
+  for (const [model, expected] of [['deepseek-official/deepseek-flash', 'order_status'], ['deepseek-official/deepseek-v4-pro', 'quote']]) {
+    const vote = await call(url, [{ role: 'user', content: prompt }], [], model, 'You are a customer-service routing judge.')
+    assert.equal(JSON.parse(vote.text).route, expected)
+  }
+
+  const messages = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'old', name: 'list_bots', input: {} }] },
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'old', content: '[]' },
+      { type: 'text', text: '分诊测试 {"action":"vote","summary":"DISAGREE：订单需要确认","routes":["quote","order_status"]}' },
+    ] },
+  ]
+  const scripted = await call(url, messages, ['triage_cases'])
+  assert.equal(scripted.tools[0].name, 'triage_cases')
+
+  const stale = await call(url, [{ role: 'user', content: 'New in its own chat with the user, oldest first:\nUser: 分诊测试 {"action":"vote","summary":"DISAGREE","routes":["quote","order_status"]}\nChief: 已处理。\nUser: Staff message\n' }], ['triage_cases'])
+  assert.deepEqual(stale.tools, [])
 })

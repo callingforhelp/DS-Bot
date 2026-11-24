@@ -11,6 +11,10 @@ import { imPlatform, IM_PLATFORMS } from '../../shared/im-platforms.js'
 import { SOURCE_KIND } from '../constants.js'
 import { extractLocalMarkdownImages, prepareOutboundReply } from './outbound-images.js'
 import { adapters } from './platforms/index.js'
+import { summarizeStep } from './step.js'
+import { imText } from './texts.js'
+import { CustomerFailures } from './customer-failures.js'
+import { readWecomEnv } from './env.js'
 import { imViewChoices } from './view-choices.js'
 import { imViewFormText, isLegacyImViewFormAnswer, parseImViewForm } from './view-form.js'
 
@@ -42,6 +46,7 @@ const SENT_ID_LEN = 100
 const SENT_STORE_LIMIT = 200_000
 
 const secretField = key => key.replace(/[A-Z]/g, char => `_${char}`).toUpperCase()
+const stoppedInbound = () => Object.assign(new Error('IM connection stopped before message admission'), { retryInbound: true })
 
 export function install(rt) {
   const { ctx, state } = rt
@@ -57,204 +62,7 @@ export function install(rt) {
     if (label.startsWith('German')) return 'de'
     return 'en'
   }
-  const text = (key, values = {}) => {
-    const lang = langKey()
-    const table = {
-      en: {
-        requested: 'A connection request was sent to DS Bot; allow it in Settings → IM on the computer.',
-        unbound: 'This IM bot is not bound to a Bot yet; pick one in DS Bot Settings → IM.',
-        unboundGroup: 'This group is not bound yet; pick a group or a Bot for it in DS Bot Settings → IM.',
-        readonly: 'This DS Bot window is read-only because the team is open somewhere else. Nothing was sent to the Bot; close the other window and send again.',
-        uncertain: 'This message was received earlier, but DS Bot could not confirm that it finished. Check this chat on the computer; send it again only if the reply is missing.',
-        connected: `Connected — you can talk to ${values.target} now.`,
-        stopped: 'Stopped.',
-        idle: 'Nothing is running.',
-        stale: 'This card was already answered.',
-        noFile: 'This file cannot be sent here; send it on the computer.',
-        greeting: `Hello, I am ${values.name}.`,
-        question: `${values.bot} asks: `,
-        approval: `${values.bot} asks for approval: `,
-        secretAsk: `${values.bot} needs the key ${values.name} — fill it on the computer or the phone app.`,
-        viewShow: `${values.bot} shared a card — answer it on the computer or the phone app.`,
-        answered: 'answered',
-        numbers: 'reply with the number',
-        numbersMulti: 'reply with the numbers, separated by spaces',
-        quoteEarlier: 'Replying to an earlier message:',
-        quoteMissing: 'Replying to an earlier message (its text is not available).',
-        allow: 'Allow once',
-        reject: 'Reject',
-      },
-      zh: {
-        requested: '已向 DS Bot 发出连接请求，请在电脑上的 DS Bot 设置 → IM 里允许。',
-        unbound: '这个 IM 机器人还没绑定 Bot，请在 DS Bot 设置 → IM 里选一个。',
-        unboundGroup: '这个群还没绑定，请在 DS Bot 设置 → IM 里给它选一个群或 Bot。',
-        readonly: '这个 DS Bot 窗口处于只读状态，因为团队正在别处打开。消息没有发给 Bot，请关掉另一个窗口后重发。',
-        uncertain: '这条消息之前已经收到，但 DS Bot 无法确认它是否完成。请先在电脑上查看这个对话；只有回复确实缺失时再发一次。',
-        connected: `已连接，现在可以和 ${values.target} 说话了。`,
-        stopped: '已停下。',
-        idle: '现在没有在做的活。',
-        stale: '这张卡已经答过了。',
-        noFile: '这个文件发不过去，请在电脑上发。',
-        greeting: `你好，我是 ${values.name}。`,
-        question: `${values.bot} 问你：`,
-        approval: `${values.bot} 请你审批：`,
-        secretAsk: `${values.bot} 要密钥 ${values.name}，请在电脑或手机 App 上填。`,
-        viewShow: `${values.bot} 发了一个卡片，请在电脑或手机 App 上回复。`,
-        answered: '已答',
-        numbers: '回复编号',
-        numbersMulti: '回复编号，多选用空格隔开',
-        quoteEarlier: '引用了一条更早的消息：',
-        quoteMissing: '引用了一条更早的消息（内容不可见）。',
-        allow: '允许一次',
-        reject: '拒绝',
-      },
-      'zh-TW': {
-        requested: '已向 DS Bot 發出連線請求，請在電腦上的 DS Bot 設定 → IM 裡允許。',
-        unbound: '這個 IM 機器人還沒綁定 Bot，請在 DS Bot 設定 → IM 裡選一個。',
-        unboundGroup: '這個群還沒綁定，請在 DS Bot 設定 → IM 裡給它選一個群或 Bot。',
-        readonly: '這個 DS Bot 視窗處於唯讀狀態，因為團隊正在別處開啟。訊息沒有送給 Bot，請關掉另一個視窗後重送。',
-        uncertain: '這則訊息之前已經收到，但 DS Bot 無法確認它是否完成。請先在電腦上查看這個對話；只有回覆確實缺少時再送一次。',
-        connected: `已連線，現在可以和 ${values.target} 說話了。`,
-        stopped: '已停下。',
-        idle: '現在沒有在做的活。',
-        stale: '這張卡已經答過了。',
-        noFile: '這個檔案傳不過去，請在電腦上傳。',
-        greeting: `你好，我是 ${values.name}。`,
-        question: `${values.bot} 問你：`,
-        approval: `${values.bot} 請你審批：`,
-        secretAsk: `${values.bot} 要金鑰 ${values.name}，請在電腦或手機 App 上填。`,
-        viewShow: `${values.bot} 發了一個卡片，請在電腦或手機 App 上回覆。`,
-        answered: '已答',
-        numbers: '回覆編號',
-        numbersMulti: '回覆編號，多選用空格隔開',
-        quoteEarlier: '引用了更早的一則訊息：',
-        quoteMissing: '引用了更早的一則訊息（內容不可見）。',
-        allow: '允許一次',
-        reject: '拒絕',
-      },
-      ja: {
-        requested: 'DS Bot に接続リクエストを送信しました。PC の DS Bot 設定 → IM で許可してください。',
-        unbound: 'この IM ボットはまだ Bot に紐付けられていません。DS Bot 設定 → IM で選択してください。',
-        unboundGroup: 'このグループはまだ紐付けられていません。DS Bot 設定 → IM でグループまたは Bot を選択してください。',
-        readonly: 'この DS Bot ウィンドウは読み取り専用です（チームが別の場所で開かれています）。Bot には送信されていません。もう一方のウィンドウを閉じて、もう一度送ってください。',
-        uncertain: 'このメッセージは以前に受信しましたが、完了したかどうかを確認できません。コンピューターでこの会話を確認し、返信が本当にない場合だけもう一度送ってください。',
-        connected: `接続しました。${values.target} と話せます。`,
-        stopped: '停止しました。',
-        idle: '実行中のタスクはありません。',
-        stale: 'このカードは回答済みです。',
-        noFile: 'このファイルはここでは送信できません。PC から送信してください。',
-        greeting: `こんにちは、${values.name} です。`,
-        question: `${values.bot} からの質問：`,
-        approval: `${values.bot} からの承認リクエスト：`,
-        secretAsk: `${values.bot} がシークレット ${values.name} を必要としています。PC またはスマホアプリで入力してください。`,
-        viewShow: `${values.bot} がカードを共有しました。PC またはスマホアプリで回答してください。`,
-        answered: '回答済み',
-        numbers: '番号を返信',
-        numbersMulti: '番号をスペース区切りで返信',
-        quoteEarlier: '以前のメッセージへの返信です：',
-        quoteMissing: '以前のメッセージへの返信です（本文は取得できませんでした）。',
-        allow: '1回許可',
-        reject: '拒否',
-      },
-      ko: {
-        requested: 'DS Bot에 연결 요청을 보냈습니다. 컴퓨터의 DS Bot 설정 → IM에서 허용해 주세요.',
-        unbound: '이 IM 봇은 아직 Bot에 연결되지 않았습니다. DS Bot 설정 → IM에서 선택해 주세요.',
-        unboundGroup: '이 그룹은 아직 연결되지 않았습니다. DS Bot 설정 → IM에서 그룹이나 Bot을 선택해 주세요.',
-        readonly: '이 DS Bot 창은 읽기 전용입니다(팀이 다른 곳에서 열려 있음). Bot에 전송되지 않았습니다. 다른 창을 닫고 다시 보내 주세요.',
-        uncertain: '이 메시지는 전에 접수되었지만 완료되었는지 확인할 수 없습니다. 컴퓨터에서 이 대화를 확인하고, 답장이 정말 없을 때만 다시 보내 주세요.',
-        connected: `연결되었습니다. 이제 ${values.target}와(과) 대화할 수 있습니다.`,
-        stopped: '중지되었습니다.',
-        idle: '진행 중인 작업이 없습니다.',
-        stale: '이미 응답한 카드입니다.',
-        noFile: '이 파일은 여기서 보낼 수 없습니다. 컴퓨터에서 보내 주세요.',
-        greeting: `안녕하세요, ${values.name}입니다.`,
-        question: `${values.bot}의 질문: `,
-        approval: `${values.bot}의 승인 요청: `,
-        secretAsk: `${values.bot}에서 시크릿 ${values.name}이(가) 필요합니다. 컴퓨터나 휴대폰 앱에서 입력해 주세요.`,
-        viewShow: `${values.bot}에서 카드를 보냈습니다. 컴퓨터나 휴대폰 앱에서 응답해 주세요.`,
-        answered: '응답함',
-        numbers: '번호로 답장',
-        numbersMulti: '공백으로 구분하여 번호로 답장',
-        quoteEarlier: '이전 메시지에 대한 답장입니다: ',
-        quoteMissing: '이전 메시지에 대한 답장입니다(본문을 가져올 수 없습니다).',
-        allow: '한 번 허용',
-        reject: '거부',
-      },
-      es: {
-        requested: 'Se envió una solicitud de conexión a DS Bot; permítela en Ajustes → IM en el ordenador.',
-        unbound: 'Este bot de IM aún no está vinculado a un Bot; elige uno en Ajustes de DS Bot → IM.',
-        unboundGroup: 'Este grupo aún no está vinculado; elige un grupo o un Bot en Ajustes de DS Bot → IM.',
-        readonly: 'Esta ventana de DS Bot es de solo lectura porque el equipo está abierto en otro sitio. No se envió nada al Bot; cierra la otra ventana y vuelve a enviar.',
-        uncertain: 'Este mensaje se recibió antes, pero DS Bot no pudo confirmar que terminara. Revisa esta conversación en el ordenador; vuelve a enviarlo solo si falta la respuesta.',
-        connected: `Conectado — ya puedes hablar con ${values.target}.`,
-        stopped: 'Detenido.',
-        idle: 'No hay nada en curso.',
-        stale: 'Esta tarjeta ya fue respondida.',
-        noFile: 'Este archivo no se puede enviar por aquí; envíalo desde el ordenador.',
-        greeting: `Hola, soy ${values.name}.`,
-        question: `${values.bot} pregunta: `,
-        approval: `${values.bot} pide aprobación: `,
-        secretAsk: `${values.bot} necesita la clave ${values.name} — rellénala en el ordenador o en la app móvil.`,
-        viewShow: `${values.bot} compartió una tarjeta — respóndela en el ordenador o en la app móvil.`,
-        answered: 'respondido',
-        numbers: 'responde con el número',
-        numbersMulti: 'responde con los números separados por espacios',
-        quoteEarlier: 'Respondiendo a un mensaje anterior: ',
-        quoteMissing: 'Respondiendo a un mensaje anterior (su texto no está disponible).',
-        allow: 'Permitir una vez',
-        reject: 'Rechazar',
-      },
-      fr: {
-        requested: 'Une demande de connexion a été envoyée à DS Bot ; autorisez-la dans Paramètres → IM sur l’ordinateur.',
-        unbound: 'Ce bot IM n’est pas encore lié à un Bot ; choisissez-en un dans Paramètres DS Bot → IM.',
-        unboundGroup: 'Ce groupe n’est pas encore lié ; choisissez un groupe ou un Bot dans Paramètres DS Bot → IM.',
-        readonly: 'Cette fenêtre DS Bot est en lecture seule car l’équipe est ouverte ailleurs. Rien n’a été envoyé au Bot ; fermez l’autre fenêtre et renvoyez.',
-        uncertain: 'Ce message a déjà été reçu, mais DS Bot n’a pas pu confirmer qu’il a abouti. Vérifiez cette conversation sur l’ordinateur ; ne le renvoyez que si la réponse manque.',
-        connected: `Connecté — vous pouvez maintenant parler à ${values.target}.`,
-        stopped: 'Arrêté.',
-        idle: 'Rien n’est en cours.',
-        stale: 'Cette carte a déjà reçu une réponse.',
-        noFile: 'Ce fichier ne peut pas être envoyé ici ; envoyez-le depuis l’ordinateur.',
-        greeting: `Bonjour, je suis ${values.name}.`,
-        question: `${values.bot} demande : `,
-        approval: `${values.bot} demande une approbation : `,
-        secretAsk: `${values.bot} a besoin de la clé ${values.name} — renseignez-la sur l’ordinateur ou l’application mobile.`,
-        viewShow: `${values.bot} a partagé une carte — répondez-y sur l’ordinateur ou l’application mobile.`,
-        answered: 'répondu',
-        numbers: 'répondez avec le numéro',
-        numbersMulti: 'répondez avec les numéros séparés par des espaces',
-        quoteEarlier: 'Réponse à un message précédent : ',
-        quoteMissing: 'Réponse à un message précédent (son texte n’est pas disponible).',
-        allow: 'Autoriser une fois',
-        reject: 'Refuser',
-      },
-      de: {
-        requested: 'Eine Verbindungsanfrage wurde an DS Bot gesendet; erlaube sie am Computer unter Einstellungen → IM.',
-        unbound: 'Dieser IM-Bot ist noch keinem Bot zugewiesen; wähle einen in den DS Bot-Einstellungen → IM.',
-        unboundGroup: 'Diese Gruppe ist noch nicht zugewiesen; wähle eine Gruppe oder einen Bot in den DS Bot-Einstellungen → IM.',
-        readonly: 'Dieses DS Bot-Fenster ist schreibgeschützt, weil das Team anderswo geöffnet ist. Es wurde nichts an den Bot gesendet; schließe das andere Fenster und sende erneut.',
-        uncertain: 'Diese Nachricht kam früher an, aber DS Bot konnte nicht bestätigen, dass sie abgeschlossen wurde. Prüfe diesen Chat am Computer; sende sie nur erneut, wenn die Antwort fehlt.',
-        connected: `Verbunden — du kannst jetzt mit ${values.target} sprechen.`,
-        stopped: 'Gestoppt.',
-        idle: 'Aktuell läuft nichts.',
-        stale: 'Diese Karte wurde bereits beantwortet.',
-        noFile: 'Diese Datei kann hier nicht gesendet werden; sende sie am Computer.',
-        greeting: `Hallo, ich bin ${values.name}.`,
-        question: `${values.bot} fragt: `,
-        approval: `${values.bot} bittet um Freigabe: `,
-        secretAsk: `${values.bot} benötigt den Schlüssel ${values.name} — gib ihn am Computer oder in der Smartphone-App ein.`,
-        viewShow: `${values.bot} hat eine Karte geteilt — beantworte sie am Computer oder in der Smartphone-App.`,
-        answered: 'beantwortet',
-        numbers: 'mit der Nummer antworten',
-        numbersMulti: 'mit durch Leerzeichen getrennten Nummern antworten',
-        quoteEarlier: 'Antwort auf eine frühere Nachricht: ',
-        quoteMissing: 'Antwort auf eine frühere Nachricht (ihr Text ist nicht verfügbar).',
-        allow: 'Einmal erlauben',
-        reject: 'Ablehnen',
-      },
-    }
-    return (table[lang] ?? table.en)[key] ?? key
-  }
+  const text = (key, values = {}) => imText(langKey(), key, values)
 
   // ---------------------------------------------------------------- runtime file
   const runtimes = new Map() // id → { data: {runtime, cards, sent}, timer }
@@ -358,7 +166,7 @@ export function install(rt) {
       held.text = body ?? held.text
       held.delivered = true
     } else {
-      entries.push({ chatKey, messageId, text: body })
+      entries.push({ chatKey, messageId, text: body, delivered: true })
     }
     data.cards[cardKey] = entries
     scheduleWrite(id)
@@ -599,12 +407,10 @@ export function install(rt) {
   // turn starts — the Web UI, a peer Bot's message, a scheduled task, work picked up
   // after a restart — has no IM origin, and its replies, views and cards stay in the app.
   // Nothing is persisted: after a restart there is no origin, so nothing goes out. A
-  // Bot's origin lives until its turn ends, a conflicting IM source joins it, or a
-  // background result with no known owner enters it. A group's own Session ends its
-  // relay turn at once while its members keep working, so its origin lives until a
-  // new round starts in the group or the user is unpaired. A request lives until its
-  // message is admitted, however long it waits in the queue behind a busy Bot.
-  const paired = (conn, senderId) => (conn.paired ?? []).some(entry => entry.id === senderId)
+  // A Bot's origin lasts through its turn; a task result or conflicting source can end it.
+  // Public customer task origins remain session-scoped between turns so an approved
+  // specialist reply can return to the same customer.
+  const paired = (conn, senderId) => imPlatform(conn.platform)?.public === true || (conn.paired ?? []).some(entry => entry.id === senderId)
   // Session id → the chat its running turn came from.
   const origins = new Map()
   const mixed = new Set()
@@ -622,6 +428,7 @@ export function install(rt) {
   // Turns that may be a member's late result waking a group up again: wait for the first
   // message of the turn before dropping the chat's origin (see the turn/start handler).
   const pendingReset = new Set()
+  const turnContext = new Set(['agent-instructions', 'runtime-context', 'skill-catalog', 'time-context'])
   // Request id of an IM message → the chat it came from, until that message shows up.
   const requests = new Map()
   const consumedRequests = new Set()
@@ -730,6 +537,7 @@ export function install(rt) {
     return { conn, chatKey: entry.chatKey, chat, senderId: entry.senderId, binding: entry.binding }
   }
   rt.roomHasImOrigin = roomId => originOf(rt.roomOf(roomId)?.sessionId ?? roomId) !== undefined
+  rt.hasDirectImOrigin = sessionId => originOf(sessionId)?.chat.kind === 'direct'
   const cardOrigin = (sessionId, card) => {
     const owner = rt.groupOwners.get(sessionId)
     if (owner === undefined) {
@@ -768,10 +576,15 @@ export function install(rt) {
   }
   // The Session a Bot writes into now, for a card that carries no Session of its own.
   const chatOfBot = botId => rt.botOf(botId) === undefined ? undefined : rt.chatOf(botId)
+  const customerSession = (conn, chatKey, botId) => (rt.botOf(botId)?.tasks ?? [])
+    .find(task => task.origin === 'customer' && task.customer?.connId === conn.id && task.customer?.chatKey === chatKey)?.sessionId
+  const targetSession = (conn, chatKey, target) => target?.roomId !== undefined
+    ? (rt.roomOf(target.roomId)?.sessionId ?? target.roomId)
+    : imPlatform(conn.platform)?.public === true ? customerSession(conn, chatKey, target?.botId) : chatOfBot(target?.botId)
   // A card answered here continues that turn: its replies belong to this chat too.
   const claimChat = (conn, chat, senderId) => {
     const target = conn.chats?.[chat.key]?.target ?? (chat.kind === 'direct' ? { botId: conn.botId } : undefined)
-    const sessionId = target?.roomId !== undefined ? (rt.roomOf(target.roomId)?.sessionId ?? target.roomId) : chatOfBot(target?.botId)
+    const sessionId = targetSession(conn, chat.key, target)
     claimOrigin(sessionId, conn.id, chat.key, senderId)
   }
 
@@ -1047,11 +860,12 @@ export function install(rt) {
 
   // One card this chat was sent and has not answered yet. A button names its own
   // card, so it must never fall through to a newer card of the same kind.
-  const openCard = (conn, chatKey, cardKey) => {
+  const wasDelivered = entry => entry.delivered !== false
+  const openCard = (conn, chatKey, cardKey, allowPending = false) => {
     const binding = bindingOf(conn, chatKey)
     if (binding === undefined) return undefined
     const entries = runtimes.get(conn.id)?.data?.cards[cardKey]
-    const entry = entries?.find(item => item.chatKey === chatKey && item.answer === undefined
+    const entry = entries?.find(item => item.chatKey === chatKey && item.answer === undefined && (allowPending || wasDelivered(item))
       && (item.binding ?? legacyCardBinding(cardKey)) === binding)
     return entry === undefined ? undefined : { cardKey, entry }
   }
@@ -1111,6 +925,7 @@ export function install(rt) {
     return 'answered'
   }
   const answerViewCode = async (conn, chat, body, senderId) => {
+    if (imPlatform(conn.platform)?.public === true) return false
     if (!/^[!/]card\b/i.test(body)) {
       const legacy = /^(V([1-9]\d*))(?=\s|$)/i.exec(body)
       if (legacy === null || !isLegacyImViewFormAnswer(body.slice(legacy[0].length))) return false
@@ -1165,6 +980,8 @@ export function install(rt) {
     const held = openCard(conn, chat.key, cardKey)
     if (held === undefined) return false
     const found = questionById(held.cardKey.slice(2))
+    if (found !== undefined && imPlatform(conn.platform)?.public === true
+      && found.sessionId !== customerSession(conn, chat.key, resolveTarget(conn, conn.chats?.[chat.key])?.botId)) return false
     if (found === undefined) {
       await sendCardReply(conn, chat, text('stale'))
       return 'stale'
@@ -1222,7 +1039,7 @@ export function install(rt) {
     return undefined
   }
 
-  const onMessage = (conn) => async (msg) => {
+  const receiveMessage = (conn) => async (msg, customerSessionId, alreadyAdmitted = false) => {
     if (msg.sender.bot === true) return
     if (!paired(conn, msg.sender.id)) {
       if (msg.chat.kind === 'group' && !msg.mentioned) return
@@ -1243,12 +1060,12 @@ export function install(rt) {
     const target = resolveTarget(conn, chat)
     const cardBody = raw.trimStart()
     if (/^(?:[!/]card\b|V[1-9]\d*(?=\s|$))/i.test(cardBody) && await answerViewCode(conn, msg.chat, cardBody, msg.sender.id)) return
-    if (/^\/start(?:@\S+)?\s*$/.test(body)) {
+    if (imPlatform(conn.platform)?.public !== true && /^\/start(?:@\S+)?\s*$/.test(body)) {
       const name = target === undefined ? undefined : targetName(conn, target)
       await sendText(conn, msg.chat, name === undefined ? text(msg.chat.kind === 'group' ? 'unboundGroup' : 'unbound') : text('greeting', { name }))
       return
     }
-    if (/^\/stop(?:@\S+)?\s*$/.test(body)) {
+    if (imPlatform(conn.platform)?.public !== true && /^\/stop(?:@\S+)?\s*$/.test(body)) {
       if (target === undefined) {
         await sendText(conn, msg.chat, text(msg.chat.kind === 'group' ? 'unboundGroup' : 'unbound'))
         return
@@ -1298,12 +1115,14 @@ export function install(rt) {
       await sendText(conn, msg.chat, text('readonly'))
       return
     }
-    const sessionId = target.botId ?? target.roomId
+    const customer = imPlatform(conn.platform)?.public === true
+    if (customer && (msg.chat.kind !== 'direct' || target.botId === undefined)) throw new Error('Public customer chats require a direct conversation bound to a Bot')
+    const sessionId = customer ? customerSessionId ?? await rt.customerPart(target.botId, conn.id, msg.chat.key) : target.botId ?? target.roomId
     // The receipt has to sit on the Session that takes the message. A group's own
     // Session moves on to a fresh part (`room.sessionId`) while `room.id` stays the
     // first one, so uploading under the id leaves the receipt on a Session the
     // message never reaches and DSH drops the file (#1121).
-    const uploadTo = target.botId !== undefined
+    const uploadTo = customer ? sessionId : target.botId !== undefined
       ? rt.chatOf(target.botId)
       : rt.sessionOfRoom(rt.roomOf(target.roomId))
     const content = []
@@ -1315,6 +1134,8 @@ export function install(rt) {
     for (const image of msg.images ?? []) content.push({ type: 'image', mediaType: image.mediaType, data: image.data })
     const env = await envFor(conn)
     for (const file of msg.files ?? []) {
+      const summary = summarizeStep(file.name, file.data)
+      if (summary) content.push({ type: 'text', text: summary })
       try {
         const receiptId = await env.uploadFile(uploadTo, file)
         content.push({ type: 'file', receiptId })
@@ -1331,19 +1152,69 @@ export function install(rt) {
       await rt.sendUser({ sessionId, content, requestId })
       return 'accepted'
     }
-    if (typeof msg.messageId === 'string' && msg.messageId !== '') {
+    if (typeof msg.messageId === 'string' && msg.messageId !== '' && !alreadyAdmitted) {
       const event = rt.requestIdentity({ caller: `im:${conn.id}`, context: msg.chat.key, name: msg.messageId, payload: msg.sender.id })
-      // The lock can move between the check above and the admission; no receipt was
-      // written in that case, so the user can send the platform event again later.
       const admitted = await rt.admitRequest(event, send)
       if (admitted?.status === 'readonly') await sendText(conn, msg.chat, text('readonly'))
-      // A receipt from an earlier run left the outcome unknown: the message may have
-      // run, so sending it again could repeat the work. Tell the user where to look.
       else if (admitted?.status === 'uncertain') await sendText(conn, msg.chat, text('uncertain'))
     } else await send()
   }
+  const customerFailures = new CustomerFailures()
+  const onMessage = (conn, runner) => async (msg) => {
+    if (msg.sender.bot === true) return
+    if (!paired(conn, msg.sender.id)) {
+      if (msg.chat.kind === 'group' && !msg.mentioned) return
+      if (!requested(conn, msg)) return
+      await rt.save()
+      await sendText(conn, msg.chat, text('requested'))
+      return
+    }
+    conn.chats ??= {}
+    if (msg.chat.kind === 'group' && !msg.mentioned) return
+    if (conn.chats[msg.chat.key] === undefined) {
+      conn.chats[msg.chat.key] = { kind: msg.chat.kind, title: msg.chat.title, at: Date.now() }
+      await rt.save()
+    }
+    if (rt.readOnly() !== undefined) {
+      await sendText(conn, msg.chat, text('readonly'))
+      return
+    }
+    let customerSessionId
+    if (imPlatform(conn.platform)?.public === true && msg.chat.kind === 'direct') {
+      if (runner.stopped === true) throw stoppedInbound()
+      const target = resolveTarget(conn, conn.chats[msg.chat.key])
+      if (target?.botId !== undefined) {
+        const key = typeof msg.messageId === 'string' && msg.messageId !== ''
+          ? JSON.stringify([conn.id, msg.chat.key, msg.sender.id, msg.messageId]) : undefined
+        if (customerFailures.exhausted(conn.id, key)) return
+        try {
+          customerSessionId = await rt.customerPart(target.botId, conn.id, msg.chat.key)
+          if (runner.stopped === true) throw stoppedInbound()
+          customerFailures.success(conn.id, key)
+        } catch (error) {
+          if (runner.stopped === true) throw stoppedInbound()
+          if (customerFailures.fail(conn.id, key, error?.permanent === true)) {
+            throw Object.assign(new Error('Customer conversation could not be opened', { cause: error }), { retryInbound: true })
+          }
+          rt.warn('ds-bot: customer conversation failed: %s', reasonOf(error))
+          await sendText(conn, msg.chat, text('unavailable'))
+          return
+        }
+      }
+    }
+    if (imPlatform(conn.platform)?.public === true && typeof msg.messageId === 'string' && msg.messageId !== '') {
+      const event = rt.requestIdentity({ caller: `im:${conn.id}`, context: msg.chat.key, name: msg.messageId, payload: msg.sender.id })
+      const admitted = await rt.admitRequest(event, async () => {
+        await receiveMessage(conn)(msg, customerSessionId, true)
+        return 'accepted'
+      })
+      if (admitted?.status === 'readonly') await sendText(conn, msg.chat, text('readonly'))
+      else if (admitted?.status === 'uncertain') await sendText(conn, msg.chat, text('uncertain'))
+    } else await receiveMessage(conn)(msg, customerSessionId)
+  }
 
   const onAction = (conn) => async (action) => {
+    if (imPlatform(conn.platform)?.public === true) return
     if (!paired(conn, action.sender.id)) return
     const data = String(action.data ?? '')
     const chat = { key: action.chat.key, kind: action.chat.kind, title: action.chat.title }
@@ -1378,6 +1249,7 @@ export function install(rt) {
   }
 
   // ------------------------------------------------------------------ cards
+  const cardSpeaker = (sessionId, bot) => rt.isCustomerPart?.(sessionId) === true ? 'Customer support' : bot?.name ?? '?'
   const cardText = {
     question: (bot, question) => {
       const options = (question.options ?? []).map((option, index) => `${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`).join('\n')
@@ -1392,6 +1264,7 @@ export function install(rt) {
   }
 
   const sendCard = async (conn, cardKey, targets, body, buttons, numbered = false, tokenView) => {
+    if (imPlatform(conn.platform)?.public === true && (cardKey.startsWith('a:') || cardKey.startsWith('v:'))) return
     const data = await dataOf(conn.id)
     if (!runners.has(conn.id)) return
     const entries = data.cards[cardKey] = (data.cards[cardKey] ?? []).filter(entry => entry.binding !== undefined && (tokenView === undefined || entry.code !== undefined))
@@ -1413,7 +1286,7 @@ export function install(rt) {
       }
       const code = tokenView === undefined ? undefined : `V${++data.viewCodeSeq}`
       const message = code === undefined ? body : `${body}\n${imViewFormText(tokenView, code)}`
-      entries.push({ chatKey, binding: bindingOf(conn, chatKey), numbered, messageId: undefined, text: message, ...(code === undefined ? {} : { code, delivered: false, replyVersion: VIEW_REPLY_VERSION }) })
+      entries.push({ chatKey, binding: bindingOf(conn, chatKey), numbered, delivered: false, messageId: undefined, text: message, ...(code === undefined ? {} : { code, replyVersion: VIEW_REPLY_VERSION }) })
     }
     scheduleWrite(conn.id)
     if (tokenView !== undefined) {
@@ -1428,7 +1301,7 @@ export function install(rt) {
       if (tokenView !== undefined) {
         const found = viewById(cardKey.slice(2))
         const origin = found === undefined ? undefined : cardOrigin(found.sessionId, found.view)
-        if (origin?.conn.id !== conn.id || origin.chatKey !== chatKey || openCard(conn, chatKey, cardKey) === undefined) {
+        if (origin?.conn.id !== conn.id || origin.chatKey !== chatKey || openCard(conn, chatKey, cardKey, true) === undefined) {
           await unmarkCard(conn.id, cardKey, chatKey)
           continue
         }
@@ -1461,10 +1334,11 @@ export function install(rt) {
         const origin = cardOrigin(sessionId, question)
         if (origin === undefined || origin.conn.id !== conn.id) continue
         const buttons = imPlatform(conn.platform)?.buttons === true ? cardButtons.question(question) : undefined
-        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], cardText.question(bot.name, question), buttons, true)
+        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], cardText.question(cardSpeaker(sessionId, bot), question), buttons, true)
       }
       // Approvals: one card per open approval id, resent to chats whose earlier send dropped.
       for (const entry of rt.approvalsView?.() ?? []) {
+        if (imPlatform(conn.platform)?.public === true) continue
         const cardKey = `a:${entry.id}`
         const bot = rt.botOf(entry.botId)
         // A task approval belongs strictly to the IM chat that started that task (never fall back to an unrelated foreground IM chat).
@@ -1478,6 +1352,7 @@ export function install(rt) {
       }
       // Secret requests: text only — the key is typed on the computer or phone.
       for (const [botId, list] of Object.entries(state.secretRequests ?? {})) {
+        if (imPlatform(conn.platform)?.public === true) continue
         const bot = rt.botOf(botId)
         if (bot === undefined) continue
         for (const request of list) {
@@ -1502,7 +1377,7 @@ export function install(rt) {
         const picks = choices.length === 0 ? '' : `\n${choices.map((choice, index) => `${index + 1}. ${choice.label}`).join('\n')}\n(${text('numbers')})`
         const buttons = imPlatform(conn.platform)?.buttons === true && choices.length > 0
           ? choices.map((choice, index) => ({ data: `v:${view.id}:${index}`, label: choice.label })) : undefined
-        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], `${text('viewShow', { bot: bot.name })}${form !== '' ? `\n${form}` : view.title ? `\n${view.title}` : ''}${picks}`, buttons, choices.length > 0,
+        await sendCard(conn, cardKey, [{ chatKey: origin.chatKey, chat: origin.chat }], `${text('viewShow', { bot: cardSpeaker(sessionId, bot) })}${form !== '' ? `\n${form}` : view.title ? `\n${view.title}` : ''}${picks}`, buttons, choices.length > 0,
           view.issueDraft === undefined && choices.length === 0 ? view.view : undefined)
       }
     }
@@ -1582,8 +1457,8 @@ export function install(rt) {
     }
   }
 
-  const busyOf = (target) => {
-    if (target?.botId !== undefined) return rt.live.get(rt.chatOf(target.botId))?.turn !== undefined
+  const busyOf = (conn, chatKey, target) => {
+    if (target?.botId !== undefined) return rt.live.get(targetSession(conn, chatKey, target))?.turn !== undefined
     if (target?.roomId !== undefined) return (rt.roomWorkView?.()[target.roomId] ?? []).length > 0
     return false
   }
@@ -1606,7 +1481,11 @@ export function install(rt) {
       const handle = adapter.connect(fieldsOf(conn), env, {
         onMessage: (msg) => {
           const current = fresh(conn.id)
-          return current === undefined ? undefined : onMessage(current)(msg).catch(error => rt.warn('ds-bot: im message failed: %s', error))
+          if (current === undefined && platform?.public === true) return Promise.reject(stoppedInbound())
+          return current === undefined ? undefined : onMessage(current, runner)(msg).catch(error => {
+            rt.warn('ds-bot: im message failed: %s', reasonOf(error))
+            if (error?.retryInbound === true) throw error
+          })
         },
         onAction: (action) => {
           const current = fresh(conn.id)
@@ -1625,7 +1504,7 @@ export function install(rt) {
       if (typeof runner.handle?.typing === 'function') {
         runner.typing = setInterval(() => {
           for (const { chatKey, chat, target } of targetsOf(fresh(conn.id) ?? conn)) {
-            if (target !== undefined && busyOf(target)) void runner.handle.typing({ key: chat.key ?? chatKey, kind: chat.kind, title: chat.title }).catch?.(() => {})
+            if (target !== undefined && busyOf(conn, chatKey, target)) void runner.handle.typing({ key: chat.key ?? chatKey, kind: chat.kind, title: chat.title }).catch?.(() => {})
           }
         }, TYPING_MS)
         runner.typing.unref?.()
@@ -1637,6 +1516,7 @@ export function install(rt) {
     }
   }
   const stop = async (id) => {
+    customerFailures.clear(id)
     const runner = runners.get(id)
     runners.delete(id)
     if (runner === undefined) {
@@ -1695,8 +1575,9 @@ export function install(rt) {
     const run = syncing.then(async () => {
       const conns = connections()
       for (const conn of Object.values(conns)) {
+        const unboundPublic = imPlatform(conn.platform)?.public === true && rt.botOf(conn.botId) === undefined
         const wants = stopped !== true && adapters[conn.platform] !== undefined && conn.enabled !== false
-          && rt.readOnly() === undefined && hasSecrets(conn)
+          && !unboundPublic && rt.readOnly() === undefined && hasSecrets(conn)
         if (wants && !runners.has(conn.id)) await start(conn)
         else if (!wants && runners.has(conn.id)) await stop(conn.id)
       }
@@ -1745,6 +1626,25 @@ export function install(rt) {
     }
   }
 
+  const seedWecom = async () => {
+    const exists = () => Object.values(connections()).some(conn => conn.platform === 'wecom_kf')
+    if (stopped || rt.readOnly() !== undefined || exists()) return
+    const fields = await readWecomEnv()
+    if (!fields || stopped || rt.readOnly() !== undefined || exists()) return
+    const conn = {
+      id: `im_${randomBytes(4).toString('hex')}`, platform: 'wecom_kf', botId: null,
+      settings: { corpId: fields.corpId, openKfId: fields.openKfId }, secrets: {},
+      enabled: false, paired: [], requests: [], chats: {}, createdAt: Date.now(),
+    }
+    await saveSecrets(conn, imPlatform('wecom_kf'), fields)
+    if (stopped || rt.readOnly() !== undefined || exists()) {
+      for (const name of Object.values(conn.secrets)) await rt.secretEndpoint('secret-delete', { name }).catch(() => {})
+      return
+    }
+    connections()[conn.id] = conn
+    await rt.save({ required: true })
+  }
+
   const viewOf = (conn) => ({
     id: conn.id,
     platform: conn.platform,
@@ -1768,7 +1668,7 @@ export function install(rt) {
       if (platform.login === 'qr') throw new Error('This platform signs in by scanning a code; not available yet')
       const fields = cleanFields(platform, body.fields)
       for (const field of platform.fields) {
-        if (!field.options && (fields[field.key] === undefined || String(fields[field.key]).trim() === '')) throw new Error(`${field.label} is required`)
+        if (!field.options && !field.optional && (fields[field.key] === undefined || String(fields[field.key]).trim() === '')) throw new Error(`${field.label} is required`)
       }
       const env = await envFor({ id: 'im_check', platform: platform.id, settings: fields, secrets: {} }, { get: () => ({}), set: () => {} })
       const { account } = await checkAccount(platform, fields, env)
@@ -1991,7 +1891,7 @@ export function install(rt) {
     if (event.type === 'turn/start') {
       const room = rt.roomOf(session.id)
       if (room === undefined) {
-        resetOrigin(session.id)
+        if (rt.isCustomerPart?.(session.id) !== true) resetOrigin(session.id)
       } else {
         const working = rt.roomActive?.(room.id)
           || [...rt.groupOwners].some(([id, owner]) => owner.roomId === room.id && rt.live.get(id)?.turn !== undefined)
@@ -2010,14 +1910,13 @@ export function install(rt) {
       // Pure context notice injected before the user's message on a newly forked foreground;
       // never touch pendingReset or drop/mix the IM origin for this turn.
       if (source?.kind === SOURCE_KIND && source.role === 'task-handoff') {
-        // intentionally ignored
+        // This context notice does not start a new IM turn.
       } else {
         const imOrigin = source?.imOrigin
         const rpcId = source?.rpcId
-        // A late member result, part-switch handoff, or task report continues the work the chat asked for;
-        // any other first message starts a fresh turn, which clears the previous turn's origin.
+        const context = turnContext.has(source?.kind)
         const isTaskReport = source?.kind === SOURCE_KIND && source.role === 'task-report' && typeof source.taskId === 'string'
-        if (pendingReset.delete(session.id) && !(typeof imOrigin === 'string' || isTaskReport || (source?.kind === SOURCE_KIND && source.role === 'post'))) {
+        if (!context && pendingReset.delete(session.id) && !(typeof imOrigin === 'string' || isTaskReport || (source?.kind === SOURCE_KIND && source.role === 'post'))) {
           forgetHeldOrigins(session.id)
           resetOrigin(session.id)
         }
@@ -2093,14 +1992,15 @@ export function install(rt) {
       // working and post later; only a Bot's turn ending ends the chat's claim. A
       // pending reset means the turn never got a message to classify, so apply it now.
       if (rt.roomOf(session.id) === undefined) {
-        resetOrigin(session.id)
+        if (rt.isCustomerPart?.(session.id) !== true) resetOrigin(session.id)
         detachHeldOrigin(session.id)
       } else if (pendingReset.delete(session.id)) {
         resetOrigin(session.id)
       }
     }
     const botId = rt.chatOwners.get(session.id)
-    if (botId === undefined || rt.taskOwners?.has(session.id)) {
+    const customerTask = rt.isCustomerPart?.(session.id) === true
+    if (botId === undefined || (rt.taskOwners?.has(session.id) && !customerTask)) {
       // A group's own chat has no Bot of its own (onRoomLine handles it), and a background
       // task reports back through its foreground chat rather than streaming raw lines to IM.
       imVia.delete(session.id)
@@ -2138,6 +2038,7 @@ export function install(rt) {
           ? originFromSaved(rt.taskById?.(data.taskId)?.task?.imOrigin)
           : originOf(sessionId)
         if (origin === undefined) return
+        if (imPlatform(origin.conn.platform)?.public === true) return
         const bot = rt.botOf(data.botId)
         const buttons = imPlatform(origin.conn.platform)?.buttons === true ? cardButtons.approval(data.id) : undefined
         await sendCard(origin.conn, `a:${data.id}`, [{ chatKey: origin.chatKey, chat: origin.chat }], cardText.approval(bot?.name ?? '?', data), buttons, true)
@@ -2163,12 +2064,14 @@ export function install(rt) {
       void rt.refresh().then(() => sync()).catch(() => {})
     }, RECONCILE_MS)
     interval.unref?.()
-    void rt.load().then(() => sync()).catch(() => {})
+    const startup = rt.load().then(seedWecom).catch(() => {
+      rt.warn('ds-bot: WeCom environment seed could not be initialized; check IM settings and the secret store')
+    }).then(() => sync()).catch(() => {})
     return () => {
       stopped = true
       clearInterval(interval)
       resumedOrigins.clear()
-      return Promise.all([...runners.keys()].map(stop)).then(async () => {
+      return startup.then(() => Promise.all([...runners.keys()].map(stop))).then(async () => {
         for (const held of runtimes.values()) if (held.timer !== undefined) clearTimeout(held.timer)
         await Promise.all([...runtimes.keys()].map(writeRuntime)).catch(() => {})
       })

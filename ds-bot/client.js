@@ -276,6 +276,10 @@ var JA = {
   "Edition": "エディション",
   "DingTalk": "DingTalk",
   "WeCom": "WeCom",
+  "WeCom Customer Service": "WeCom カスタマーサービス",
+  "Corporation ID": "企業 ID",
+  "Secret": "シークレット",
+  "Customer service account ID (optional)": "カスタマーサービスアカウント ID（任意）",
   "In Telegram, open @BotFather and send /newbot.": "Telegram で @BotFather を開き、/newbot を送信します。",
   "Give the bot a name and a username.": "ボットの表示名とユーザー名を設定します。",
   "Paste the token that BotFather sends.": "BotFather から送られたトークンを下に貼り付けます。",
@@ -445,6 +449,12 @@ var JA = {
   "Found": "検出済み",
   "Arguments": "引数",
   "Agent": "エージェント",
+  "Sessions": "セッション",
+  "Open this earlier session": "この過去のセッションを開く",
+  "Session {number}": "セッション {number}",
+  "Current session": "現在のセッション",
+  "Customer conversation": "顧客との会話",
+  "Customer conversations": "顧客との会話",
   "This page could not be shown.": "このページを表示できませんでした。",
   "This view closed because of an error.": "エラーが発生したため、この画面を閉じました。",
   "This key comes from outside DS Bot, such as an environment variable, and cannot be changed here.": "このキーは環境変数など DS Bot の外部で設定されているため、ここでは変更できません。",
@@ -3023,6 +3033,10 @@ var KO = {
   Edition: "에디션",
   DingTalk: "DingTalk",
   WeCom: "WeCom",
+  "WeCom Customer Service": "WeCom 고객 서비스",
+  "Corporation ID": "기업 ID",
+  Secret: "시크릿",
+  "Customer service account ID (optional)": "고객 서비스 계정 ID (선택 사항)",
   "In Telegram, open @BotFather and send /newbot.": "Telegram에서 @BotFather를 열고 /newbot을 보냅니다.",
   "Give the bot a name and a username.": "봇의 이름과 사용자 이름을 지정합니다.",
   "Paste the token that BotFather sends.": "BotFather가 보낸 토큰을 아래에 붙여넣습니다.",
@@ -3195,6 +3209,12 @@ var KO = {
   Found: "감지됨",
   Arguments: "인수",
   Agent: "Agent",
+  Sessions: "세션",
+  "Open this earlier session": "이 이전 세션 열기",
+  "Session {number}": "세션 {number}",
+  "Current session": "현재 세션",
+  "Customer conversation": "고객 대화",
+  "Customer conversations": "고객 대화",
   "This page could not be shown.": "이 페이지를 표시할 수 없습니다.",
   "This view closed because of an error.": "오류가 발생하여 이 화면을 닫았습니다.",
   "This key comes from outside DS Bot, such as an environment variable, and cannot be changed here.": "이 키는 환경 변수 등 DS Bot 외부에서 설정되었으므로 여기서 변경할 수 없습니다.",
@@ -5813,6 +5833,10 @@ var ES = {
   Edition: "Edición",
   DingTalk: "DingTalk",
   WeCom: "WeCom",
+  "WeCom Customer Service": "Servicio de atención al cliente de WeCom",
+  "Corporation ID": "ID de empresa",
+  Secret: "Secreto",
+  "Customer service account ID (optional)": "ID de cuenta de atención al cliente (opcional)",
   "In Telegram, open @BotFather and send /newbot.": "En Telegram, abre @BotFather y envía /newbot.",
   "Give the bot a name and a username.": "Dale al bot un nombre y un nombre de usuario.",
   "Paste the token that BotFather sends.": "Pega el token que te envíe BotFather.",
@@ -5985,6 +6009,12 @@ var ES = {
   Found: "Encontrado",
   Arguments: "Argumentos",
   Agent: "Agente",
+  Sessions: "Sesiones",
+  "Open this earlier session": "Abrir esta sesión anterior",
+  "Session {number}": "Sesión {number}",
+  "Current session": "Sesión actual",
+  "Customer conversation": "Conversación con el cliente",
+  "Customer conversations": "Conversaciones con clientes",
   "This page could not be shown.": "No se pudo mostrar esta página.",
   "This view closed because of an error.": "Esta vista se cerró debido a un error.",
   "This key comes from outside DS Bot, such as an environment variable, and cannot be changed here.": "Esta clave proviene de fuera de DS Bot, como una variable de entorno, y no se puede cambiar aquí.",
@@ -8601,6 +8631,10 @@ var FR = {
   "Edition": "Édition",
   "DingTalk": "DingTalk",
   "WeCom": "WeCom",
+  "WeCom Customer Service": "Service client WeCom",
+  "Corporation ID": "ID de l’entreprise",
+  "Secret": "Secret",
+  "Customer service account ID (optional)": "ID du compte de service client (facultatif)",
   "In Telegram, open @BotFather and send /newbot.": "Dans Telegram, ouvrez @BotFather et envoyez /newbot.",
   "Give the bot a name and a username.": "Donnez un nom et un nom d’utilisateur au bot.",
   "Paste the token that BotFather sends.": "Collez le jeton envoyé par BotFather.",
@@ -8770,6 +8804,12 @@ var FR = {
   "Found": "Trouvé",
   "Arguments": "Arguments",
   "Agent": "Agent",
+  "Sessions": "Sessions",
+  "Open this earlier session": "Ouvrir cette session précédente",
+  "Session {number}": "Session {number}",
+  "Current session": "Session actuelle",
+  "Customer conversation": "Conversation client",
+  "Customer conversations": "Conversations clients",
   "This page could not be shown.": "Cette page n’a pas pu être affichée.",
   "This view closed because of an error.": "Cette vue a été fermée en raison d’une erreur.",
   "This key comes from outside DS Bot, such as an environment variable, and cannot be changed here.": "Cette clé provient de l’extérieur de DS Bot (comme une variable d’environnement) et ne peut pas être modifiée ici.",
@@ -11348,6 +11388,10 @@ var DE = {
   Edition: "Version",
   DingTalk: "DingTalk",
   WeCom: "WeCom",
+  "WeCom Customer Service": "WeCom-Kundenservice",
+  "Corporation ID": "Unternehmens-ID",
+  Secret: "Geheimnis",
+  "Customer service account ID (optional)": "Kundenservice-Konto-ID (optional)",
   "In Telegram, open @BotFather and send /newbot.": "Öffne in Telegram @BotFather und sende /newbot.",
   "Give the bot a name and a username.": "Gib dem Bot einen Namen und einen Benutzernamen.",
   "Paste the token that BotFather sends.": "Füge das Token ein, das BotFather sendet.",
@@ -11520,6 +11564,12 @@ var DE = {
   Found: "Gefunden",
   Arguments: "Argumente",
   Agent: "Agent",
+  Sessions: "Sitzungen",
+  "Open this earlier session": "Diese frühere Sitzung öffnen",
+  "Session {number}": "Sitzung {number}",
+  "Current session": "Aktuelle Sitzung",
+  "Customer conversation": "Kundengespräch",
+  "Customer conversations": "Kundengespräche",
   "This page could not be shown.": "Diese Seite konnte nicht angezeigt werden.",
   "This view closed because of an error.": "Diese Ansicht wurde wegen eines Fehlers geschlossen.",
   "This key comes from outside DS Bot, such as an environment variable, and cannot be changed here.": "Dieser Schlüssel stammt von außerhalb von DS Bot (z. B. aus einer Umgebungsvariable) und kann hier nicht geändert werden.",
@@ -14085,6 +14135,10 @@ var ZH = {
   Edition: "版本",
   DingTalk: "钉钉",
   WeCom: "企业微信",
+  "WeCom Customer Service": "企业微信客服",
+  "Corporation ID": "企业 ID",
+  Secret: "密钥",
+  "Customer service account ID (optional)": "客服账号 ID（可选）",
   "In Telegram, open @BotFather and send /newbot.": "在 Telegram 里打开 @BotFather，发送 /newbot。",
   "Give the bot a name and a username.": "给机器人起名字和用户名。",
   "Paste the token that BotFather sends.": "把 BotFather 发来的 token 粘贴到下面。",
@@ -14264,6 +14318,12 @@ var ZH = {
   Found: "已找到",
   Arguments: "参数",
   Agent: "Agent",
+  Sessions: "会话",
+  "Open this earlier session": "打开这个较早的会话",
+  "Session {number}": "会话 {number}",
+  "Current session": "当前会话",
+  "Customer conversation": "客户会话",
+  "Customer conversations": "客户会话",
   "This page could not be shown.": "这个页面无法显示。",
   "This view closed because of an error.": "该界面出错，已自动关闭。",
   "This key comes from outside DS Bot, such as an environment variable, and cannot be changed here.": "这个 key 来自 DS Bot 之外（例如环境变量），这里改不了。",
@@ -16987,6 +17047,7 @@ function teamActions({ call: call2, after, partFor, roster, ui, live, cards, hel
     groupRows: (roomId, from, to, anchor) => call2("group-rows", { roomId, from, ...to === void 0 ? {} : { to }, ...anchor === void 0 ? {} : { anchor } }).catch(() => null),
     groupRelayReplies: (sessionId, preview) => call2("group-relay-replies", { sessionId, preview }).catch(() => null),
     earlier: (sessionId, cursor) => call2("earlier", { sessionId, cursor: cursor ?? null }),
+    customerPage: (sessionId, cursor) => call2("customer-page", { sessionId, cursor: cursor ?? null }),
     // Hours come back in this browser's time zone, so days start at local midnight.
     usage: () => call2("usage", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     // The details panel's status line: turns, speed, cache hits and context for one Bot.
@@ -18465,7 +18526,7 @@ body[data-ds-dark-theme] .bt-q{--bt-q-edge:rgba(255,255,255,.16);--bt-q-rule:rgb
 .bt-q-head{display:flex;align-items:flex-start;gap:8px;min-width:0}
 .bt-q-text{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
 .bt-q-title{margin:0;font-size:15px;line-height:22px;font-weight:600;overflow-wrap:anywhere}
-.bt-q-detail{font-size:13px;line-height:18px;color:var(--bt-ink-2)}
+.bt-q-detail{font-size:13px;line-height:18px;color:var(--bt-ink-2);white-space:pre-wrap}
 .bt-q-x{position:relative;flex:none;width:20px;height:20px;border:0;padding:0;border-radius:6px;background:none;color:var(--bt-ink-2);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:background-color .12s ease,color .12s ease,${spring(SPRING_TAP, "scale")}}
 .bt-q-x::after{content:"";position:absolute;inset:-4px}
 .bt-q-x svg{width:14px;height:14px}
@@ -31473,6 +31534,18 @@ function BtwTurnTail({ turn, sessionId, useRoster, actions }) {
 // src/shared/im-platforms.js
 var IM_PLATFORMS = [
   {
+    id: "wecom_kf",
+    name: "WeCom Customer Service",
+    fields: [
+      { key: "corpId", label: "Corporation ID" },
+      { key: "secret", label: "Secret", secret: true },
+      { key: "openKfId", label: "Customer service account ID (optional)", optional: true }
+    ],
+    public: true,
+    buttons: false,
+    groups: false
+  },
+  {
     id: "telegram",
     name: "Telegram",
     fields: [{ key: "token", label: "Bot token", secret: true }],
@@ -32297,7 +32370,7 @@ function EarlierUser({ row, actions }) {
     row.via ? (0, import_react35.createElement)("div", { className: "bt-utime" }, (0, import_react35.createElement)(ViaTag, { via: row.via }), Number.isFinite(row.time) ? messageClock(row.time) : null) : null
   );
 }
-function EarlierParts({ sessionId, roster, actions }) {
+function EarlierParts({ sessionId, roster, actions, customer = false }) {
   const [view, setView] = (0, import_react35.useState)({ pages: [], cursor: void 0, loading: true, failed: false, startedAt: null });
   const top = (0, import_react35.useRef)(null);
   const busy = (0, import_react35.useRef)(false);
@@ -32308,10 +32381,11 @@ function EarlierParts({ sessionId, roster, actions }) {
     const mine = generation.current;
     const room2 = roster.roomsById[sessionId];
     const owner = roster.byId[sessionId] ?? (room2 === void 0 ? void 0 : { parts: room2.ownParts, sessionId: room2.sessionId });
-    const partIndex = partIndexOf(owner, sessionId, cursor);
+    const partIndex = customer ? cursor?.part ?? Infinity : partIndexOf(owner, sessionId, cursor);
     busy.current = true;
     setView((current2) => ({ ...current2, loading: true, failed: false }));
-    actions.earlier(sessionId, cursor).then((page) => {
+    const pageOf = customer ? actions.customerPage : actions.earlier;
+    pageOf(sessionId, cursor).then((page) => {
       if (mine !== generation.current) return;
       busy.current = false;
       const scroller = top.current && scrollParent(top.current);
@@ -32332,7 +32406,7 @@ function EarlierParts({ sessionId, roster, actions }) {
       setView((current2) => ({ ...current2, loading: false, failed: true }));
     });
   };
-  const closedEarlier = JSON.stringify((roster.byId[sessionId]?.parts ?? []).map((part) => roster.closedCards?.[part] ?? null));
+  const closedEarlier = customer ? "" : JSON.stringify((roster.byId[sessionId]?.parts ?? []).map((part) => roster.closedCards?.[part] ?? null));
   (0, import_react35.useEffect)(() => {
     generation.current += 1;
     busy.current = false;
@@ -32341,7 +32415,7 @@ function EarlierParts({ sessionId, roster, actions }) {
     return () => {
       generation.current += 1;
     };
-  }, [sessionId, closedEarlier]);
+  }, [sessionId, closedEarlier, customer]);
   (0, import_react35.useLayoutEffect)(() => {
     const pending = restore.current;
     restore.current = null;
@@ -32364,14 +32438,14 @@ function EarlierParts({ sessionId, roster, actions }) {
   for (const page of view.pages) items.push(...withBtwRows(page.items, page.btw));
   return (0, import_react35.createElement)(
     "div",
-    { className: "bt-earlier", role: "feed", "aria-label": t("Earlier messages"), "aria-busy": view.loading },
+    { className: "bt-earlier", role: "feed", "aria-label": t(customer ? "Customer conversation" : "Earlier messages"), "aria-busy": view.loading },
     (0, import_react35.createElement)(
       "div",
       { ref: top, className: "bt-earlier-top" },
       view.loading ? (0, import_react35.createElement)(Shimmer, null, t("Loading earlier messages…")) : view.failed ? (0, import_react35.createElement)("button", { type: "button", className: "bt-soft", onClick: () => load(view.cursor) }, t("Couldn’t load earlier messages · Retry")) : view.cursor ? (0, import_react35.createElement)("button", { type: "button", className: "bt-soft", onClick: () => load(view.cursor) }, t("Load earlier")) : null
     ),
-    (0, import_react35.createElement)(ChatRows, { items, sessionId, roster, actions, onBtwDelete: removeBtw }),
-    (0, import_react35.createElement)(PartLine, { time: view.startedAt })
+    (0, import_react35.createElement)(ChatRows, { items, sessionId, roster: customer ? { ...roster, views: {} } : roster, actions, onBtwDelete: customer ? void 0 : removeBtw }),
+    customer ? null : (0, import_react35.createElement)(PartLine, { time: view.startedAt })
   );
 }
 function ChatRows({ items, sessionId, roster, actions, useUi, clock: clock4 = false, onBtwDelete }) {
@@ -39905,7 +39979,7 @@ function AddView({ platform, roster, actions, onBack }) {
   const [busy, setBusy] = (0, import_react47.useState)(false);
   const [error, setError] = (0, import_react47.useState)(null);
   const set = (key, value) => setFields((current2) => ({ ...current2, [key]: value }));
-  const missing = shown.fields.some((field) => !field.options && String(fields[field.key] ?? "").trim() === "");
+  const missing = shown.fields.some((field) => !field.options && !field.optional && String(fields[field.key] ?? "").trim() === "");
   const add = () => {
     if (busy || botId === "" || missing) return;
     setBusy(true);
@@ -50357,6 +50431,45 @@ function GroupOverview({ room: room2, roster, actions, usage, useWork, useComput
     ) : null
   ];
 }
+function CustomerSessions({ bot, roster, actions }) {
+  const [customer, setCustomer] = (0, import_react77.useState)(null);
+  const body = (0, import_react77.useRef)(null);
+  useMorph(body, customer);
+  const sessions = bot.customerSessions ?? [];
+  if (sessions.length === 0) return null;
+  if (customer !== null) return (0, import_react77.createElement)(
+    "div",
+    { ref: body, className: "bt-drawer-model" },
+    (0, import_react77.createElement)("button", { type: "button", className: "bt-soft", onClick: () => setCustomer(null) }, (0, import_react77.createElement)(ChevronLeftIcon), t("Back to details")),
+    (0, import_react77.createElement)("div", { className: "bt-section-title" }, t("Customer conversation")),
+    (0, import_react77.createElement)("div", { className: "bt-muted" }, t("Read only")),
+    (0, import_react77.createElement)(EarlierParts, { key: customer, sessionId: customer, roster, actions, customer: true })
+  );
+  return (0, import_react77.createElement)(
+    "div",
+    { ref: body, className: "bt-drawer-model" },
+    (0, import_react77.createElement)(
+      "div",
+      { className: "bt-agent-sessions-head" },
+      (0, import_react77.createElement)("div", { className: "bt-section-title" }, t("Customer conversations"))
+    ),
+    (0, import_react77.createElement)("div", { className: "bt-agent-sessions" }, sessions.map((entry) => {
+      const when3 = Number.isFinite(entry.updatedAt) ? new Date(entry.updatedAt).toLocaleString() : "";
+      return (0, import_react77.createElement)(
+        "button",
+        {
+          key: entry.sessionId,
+          type: "button",
+          className: "bt-agent-session",
+          title: t("Customer conversation"),
+          onClick: () => setCustomer(entry.sessionId)
+        },
+        (0, import_react77.createElement)("span", { className: "bt-agent-session-name" }, `${t("Customer conversation")} · #${entry.reference ?? ""}`),
+        (0, import_react77.createElement)("span", { className: "bt-agent-session-meta" }, when3)
+      );
+    }))
+  );
+}
 function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, roster, actions, useSessions, useSessionStatus, useActivity, useWork, useBrowserTabs, useBrowserPages, useComputer }) {
   const owner = roster.byId[sessionId];
   const part = owner ? currentPart(owner) : sessionId;
@@ -50519,6 +50632,7 @@ function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, roster, a
           (0, import_react77.createElement)(ModelMenu, { bot, roster, actions, run: run2, wide: true, inline: true }),
           modelOf(bot, roster) ? null : (0, import_react77.createElement)("div", { className: "bt-note" }, t("Pick a model and {name} can start.", { name: bot.name }))
         ),
+        (0, import_react77.createElement)(CustomerSessions, { key: "customers", bot, actions, roster }),
         (0, import_react77.createElement)(PermissionRow, { key: "permission", bot, roster, actions, run: run2 }),
         (0, import_react77.createElement)(BotConnectors, { key: "connectors", bot, roster, actions, run: run2 }),
         (0, import_react77.createElement)(

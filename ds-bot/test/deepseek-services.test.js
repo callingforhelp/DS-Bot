@@ -223,7 +223,7 @@ const wav = (dataBytes = 4) => {
   bytes.set([82, 73, 70, 70]) // RIFF
   view.setUint32(4, 36 + dataBytes, true)
   bytes.set([87, 65, 86, 69], 8) // WAVE
-  bytes.set([102, 109, 116, 32], 12) // fmt 
+  bytes.set([102, 109, 116, 32], 12) // fmt
   view.setUint32(16, 16, true)
   view.setUint16(20, 1, true)
   view.setUint16(22, 1, true)

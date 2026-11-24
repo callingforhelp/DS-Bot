@@ -19,13 +19,15 @@ const bundle = await build({
   external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
 })
 const module = { exports: {} }
+let drawerState
+let drawerUpdate
 runInNewContext(bundle.outputFiles[0].text, {
   module, exports: module.exports, URL, URLSearchParams, setTimeout, clearTimeout,
   require: (name) => {
     const platform = {
       react: { createContext: (initial) => { const ctx = { value: initial }; ctx.Provider = ({ value, children }) => { ctx.value = value; return children }; return ctx }, useContext: ctx => ctx.value, useId: () => 'dv-id', 
         createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
-        useState: initial => [initial, () => {}], useEffect: () => {}, useRef: current => ({ current }),
+        useState: initial => [drawerState ?? initial, value => { drawerUpdate = value }], useEffect: () => {}, useRef: current => ({ current }),
         useLayoutEffect: () => {}, useMemo: make => make(), useCallback: fn => fn,
         useSyncExternalStore: (_subscribe, get) => get(), Fragment: 'fragment',
       },
@@ -337,6 +339,43 @@ test('no Bot shows a Sessions list or New session control, including local-agent
   const engine = drawer('a', {}, { ...roster, byId: { a: { id: 'a', name: 'Writer', sessionId: 'a', engine: 'claude-code', parts: ['a-old'] } } })
   assert.doesNotMatch(textOf(engine), /Sessions/)
   assert.equal(buttonsOf(engine).find(button => textOf(button).includes('New session')), undefined)
+})
+
+test('customer tasks show a read-only transcript without foreground session controls', () => {
+  let opened = 0
+  const tree = drawer('a', { openPart: () => { opened++ } }, {
+    ...roster, byId: { a: {
+      ...bot,
+      tasks: [{ id: 'customer-task', title: 'Customer conversation', origin: 'customer', customer: { connId: 'wecom', chatKey: 'customer-A' }, status: 'waiting_customer', sessionId: 'customer', segments: [] }],
+      customerSessions: [{ sessionId: 'customer', reference: 'CAFE1234', updatedAt: 1 }],
+    } },
+  })
+  const customer = buttonsOf(tree).find(button => button.props.title === 'Customer conversation')
+  assert.ok(customer)
+  assert.match(textOf(customer), /Customer conversation/)
+  assert.equal(customer.props.disabled ?? false, false)
+  customer.props.onClick()
+  assert.equal(drawerUpdate, 'customer')
+  assert.equal(opened, 0)
+  const component = (node, name) => {
+    if (Array.isArray(node)) return node.map(child => component(child, name)).find(Boolean)
+    if (!node || typeof node !== 'object') return undefined
+    return node.type?.name === name ? node : component(node.children ?? [], name)
+  }
+  const sessions = component(tree, 'CustomerSessions')
+  let reading
+  drawerState = drawerUpdate
+  try { reading = sessions.type(sessions.props) } finally { drawerState = undefined }
+  const transcript = component(reading, 'EarlierParts')
+  assert.equal(transcript.props.sessionId, 'customer')
+  assert.equal(transcript.props.customer, true)
+  assert.match(textOf(reading), /Customer conversation/)
+  assert.match(textOf(reading), /Read only/)
+  assert.equal(buttonsOf(reading).some(button => /Send|Open this/.test(textOf(button))), false)
+  assert.equal(opened, 0)
+  assert.equal(buttonsOf(tree).find(button => button.props.title === 'Open this session'), undefined)
+  assert.equal(buttonsOf(tree).some(button => textOf(button).includes('New session')), false)
+  assert.equal(opened, 0)
 })
 
 // A second instance of the drawer bundle whose React runs effects at once and keeps
