@@ -5,6 +5,12 @@ import { withScope } from './db.mjs'
 import { IngestError, ingestEvent } from './ingest.mjs'
 import { recordDecision, recordHumanApproval } from './authz.mjs'
 import { search } from './search.mjs'
+import {
+  syncPush, syncPull, searchTeamMemory, codeSearch, sessionTakeover,
+  forgetMemory, restoreMemory, listSkills, publishSkill,
+  listSharedArtifacts, registerSharedArtifact, handleMcpRpc, revokeDevice,
+  TeamMemoryError
+} from './team-memory.mjs'
 
 const MVP_SCOPES = new Set(['read-only'])
 
@@ -12,7 +18,7 @@ class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status }
 }
 
-const ROLES = new Set(['user', 'human', 'worker', 'ingest'])
+const ROLES = new Set(['user', 'human', 'worker', 'ingest', 'device', 'bot'])
 const READERS = new Set(['user', 'human'])
 const DUMMY_SECRET = 'dummy-secret-for-unknown-principals'
 
@@ -25,11 +31,16 @@ export function validatePrincipals(principals) {
   for (const [id, p] of Object.entries(principals)) {
     const bad = rule => errors.push(`${id}: ${rule}`)
     if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(id)) bad('id must match ^[a-z0-9][a-z0-9-]{0,39}$')
-    if (!ROLES.has(p?.role)) bad('role must be user, human, worker or ingest')
+    if (!ROLES.has(p?.role)) bad('role must be user, human, worker, ingest, device or bot')
     if (!Array.isArray(p?.tenants) || p.tenants.length === 0 || !p.tenants.every(t => typeof t === 'string' && t !== '')) bad('tenants must be a non-empty array of strings')
     if (typeof p?.secret !== 'string' || p.secret.length < 32) bad('secret must be a string of at least 32 characters')
     else if (secrets.has(p.secret)) bad(`shares its secret with ${secrets.get(p.secret)}`)
     else secrets.set(p.secret, id)
+    if (p?.org_role !== undefined && !['member', 'admin', 'owner'].includes(p.org_role)) bad('org_role must be member, admin or owner')
+    if (p?.bot_ids !== undefined && (!Array.isArray(p.bot_ids) || !p.bot_ids.every(b => typeof b === 'string'))) bad('bot_ids must be an array of strings')
+    if (p?.memory_scopes !== undefined && (!Array.isArray(p.memory_scopes) || !p.memory_scopes.every(s => typeof s === 'string'))) bad('memory_scopes must be an array of strings')
+    if (p?.device_id !== undefined && (typeof p.device_id !== 'string' || p.device_id === '')) bad('device_id must be a non-empty string')
+    if (p?.org_id !== undefined && (typeof p.org_id !== 'string' || p.org_id === '')) bad('org_id must be a non-empty string')
     if (p?.role === 'ingest') {
       if (!Array.isArray(p.tenants) || p.tenants.length !== 1) bad('an ingest principal has exactly one tenant')
       if (!Array.isArray(p.sources) || p.sources.length === 0) bad('an ingest principal needs a sources array')
@@ -179,6 +190,51 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
       for (const k of ['from', 'to']) if (input[k] !== undefined && (typeof input[k] !== 'string' || Number.isNaN(Date.parse(input[k])))) throw new HttpError(400, `${k} must be an ISO date`)
       const result = await search(pool, { tenant: p.tenant, project, agent: p.agent ?? '', principal: p.id, query, mode, limit, from: input.from, to: input.to, botId: input.bot_id }, embedderFor(p.tenant))
       return { status: 200, json: result }
+    },
+
+    async 'POST /v1/memory/sync/push'(p, input) {
+      const out = await syncPush(pool, p, input, { now })
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/memory/sync/pull'(p, input) {
+      const out = await syncPull(pool, p, input)
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/memory/search'(p, input) {
+      const out = await searchTeamMemory(pool, p, input, { embedder: embedderFor(p.tenant) })
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/memory/code-search'(p, input) {
+      const out = await codeSearch(pool, p, input)
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/memory/forget'(p, input) {
+      const out = await forgetMemory(pool, p, input, { now })
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/memory/restore'(p, input) {
+      const out = await restoreMemory(pool, p, input, { now })
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/skills'(p, input) {
+      const out = await publishSkill(pool, p, input)
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/shared-artifacts'(p, input) {
+      const out = await registerSharedArtifact(pool, p, input, { objectStore })
+      return { status: 200, json: out }
+    },
+
+    async 'POST /v1/memory/device/revoke'(p, input) {
+      const out = await revokeDevice(pool, p, input)
+      return { status: 200, json: out }
     },
   }
 
@@ -491,13 +547,46 @@ export function createApi({ pool, embedder, embedderFor = () => embedder, princi
         const out = await handleVoiceRoute(req, p, url.pathname, raw)
         return send(out.status, out.json)
       }
+      if (req.method === 'POST' && (url.pathname === '/v1/mcp' || url.pathname === '/mcp')) {
+        const input = parseJsonBody(raw)
+        const out = await handleMcpRpc(pool, p, input, { objectStore, embedder: embedderFor(p.tenant), now })
+        return send(out.status, out.json)
+      }
+      const takeoverMatch = /^\/v1\/memory\/sessions\/([^/]+)\/takeover$/.exec(url.pathname)
+      if (takeoverMatch && (req.method === 'GET' || req.method === 'POST')) {
+        let sessionId
+        try { sessionId = decodeURIComponent(takeoverMatch[1]) } catch { throw new HttpError(400, 'bad session id') }
+        const input = req.method === 'POST' ? parseJsonBody(raw) : {}
+        if (url.searchParams.has('max_turns')) input.max_turns = Number(url.searchParams.get('max_turns'))
+        const out = await sessionTakeover(pool, p, { ...input, session_id: sessionId })
+        return send(200, out)
+      }
+      if (url.pathname === '/v1/skills' && req.method === 'GET') {
+        const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined
+        const out = await listSkills(pool, p, { limit })
+        return send(200, out)
+      }
+      if (url.pathname === '/v1/shared-artifacts' && req.method === 'GET') {
+        const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined
+        const out = await listSharedArtifacts(pool, p, { limit })
+        return send(200, out)
+      }
+      if (url.pathname === '/v1/memory/sync/pull' && req.method === 'GET') {
+        const cursor = url.searchParams.has('cursor') ? Number(url.searchParams.get('cursor')) : undefined
+        const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined
+        const include_own = url.searchParams.get('include_own') === 'true'
+        const device_id = url.searchParams.get('device_id') ?? undefined
+        const out = await syncPull(pool, p, { cursor, limit, include_own, device_id })
+        return send(200, out)
+      }
       const route = routes[`${req.method} ${url.pathname}`]
       if (!route) throw new HttpError(404, 'not found')
       const input = parseJsonBody(raw)
       const out = await route(p, input)
       return send(out.status, out.json)
     } catch (error) {
-      if (error instanceof HttpError) return send(error.status, { error: error.message })
+      if (error instanceof HttpError || error instanceof TeamMemoryError) return send(error.status, { error: error.message })
+      if (Number.isInteger(error?.status)) return send(error.status, { error: error.message })
       if (error?.code === 'MACHINE_VERSION_CONFLICT') return send(409, { error: error.message })
       console.error('[api] unhandled error:', req.method, url.pathname, error?.message ?? error)
       return send(500, { error: 'internal error' })

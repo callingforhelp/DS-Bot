@@ -2,7 +2,21 @@ import { randomUUID } from 'node:crypto'
 
 // Actions that change something outside the sandbox. A message between Bots, or a Bot's own
 // words, is never an approval: only a row written by an authenticated human principal is.
-export const PROTECTED = new Set(['git.push', 'git.merge', 'deploy', 'secret.use', 'workspace.write'])
+export const PROTECTED = new Set(['git.push', 'git.merge', 'deploy', 'secret.use', 'workspace.write',
+  'memory.purge_hard', 'skill.publish_org', 'transcript.export_external', 'device.revoke'])
+
+// Org RBAC for the protected team-memory actions. This is the role floor: the action still needs a
+// human approval row in the ledger (authorizeAction). Roles rank member < admin < owner.
+const ORG_RANK = { member: 1, admin: 2, owner: 3 }
+const MIN_ORG_ROLE = { 'memory.purge_hard': 'admin', 'skill.publish_org': 'admin', 'device.revoke': 'admin', 'transcript.export_external': 'owner' }
+export const orgRoleAllows = (orgRole, action) => {
+  const min = MIN_ORG_ROLE[action]
+  return min === undefined || (ORG_RANK[orgRole] ?? 0) >= ORG_RANK[min]
+}
+// Throws a 403-shaped error unless the principal's org role meets the action's floor.
+export function requireOrgRole(p, action) {
+  if (!orgRoleAllows(p?.org_role, action)) throw Object.assign(new Error(`org role ${p?.org_role ?? 'none'} cannot ${action}`), { status: 403 })
+}
 
 export async function recordDecision(c, { tenant, project, run, actor, action, scope, verdict, reason, approvalRef }) {
   const id = randomUUID()
