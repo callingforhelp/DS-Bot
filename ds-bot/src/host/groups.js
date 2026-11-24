@@ -15,7 +15,7 @@
 // it started, or that is called while still at earlier work, lets the round go on. Its
 // turn keeps running in its group Session, and what it ends with is posted to the group,
 // where the member that asked for it answers.
-import { BotResponseRefusal, newTaskContext, reviewFixOf } from './bot-response-policy.js'
+import { BotResponseRefusal, hearsWithoutMention, newTaskContext, reviewFixOf } from './bot-response-policy.js'
 import { randomUUID } from 'node:crypto'
 import { claimsFor } from './claims.js'
 import { readFileSync } from 'node:fs'
@@ -1473,6 +1473,14 @@ export function install(rt) {
     const found = named.filter(other => other.id !== member.id)
     const callees = (rt.isAdminOf(room, member.id) && all ? [...found, ...others.filter(other => !found.includes(other))] : found)
       .filter(peer => !called.has(peer.id))
+    // A member who opted to hear this sender without an @ is called too. The policy
+    // check below still drops a sender the card does not allow.
+    if (byBot) {
+      for (const peer of others) {
+        if (called.has(peer.id) || callees.includes(peer)) continue
+        if (hearsWithoutMention(peer, member.id, room)) callees.push(peer)
+      }
+    }
     // Counted before the callers below, because a status post calls nobody at all.
     let idleStep = false
     if (worked) {
@@ -1515,9 +1523,11 @@ export function install(rt) {
       const lineage = round.lineage ??= new Map()
       lineage.set(peer.id, new Set([...(lineage.get(peer.id) ?? []), ...chain]))
     }
-    callIn(round, callees, `${member.name} mentioned you`, member.id, {
-      parent, event: `line:${room.seq}`, reviewFix, text, category,
-    })
+    const namedPeers = callees.filter(peer => all || found.includes(peer))
+    const heard = callees.filter(peer => !namedPeers.includes(peer))
+    const callScope = { parent, event: `line:${room.seq}`, reviewFix, text, category }
+    if (namedPeers.length > 0) callIn(round, namedPeers, `${member.name} mentioned you`, member.id, callScope)
+    if (heard.length > 0) callIn(round, heard, `${member.name} posted in the group`, member.id, callScope)
     // An @Name from the admin hands the member its goal task.
     if (rt.isAdminOf(room, member.id)) for (const peer of callees) rt.goalTaskWorking?.(room.id, peer.id)
   }
@@ -2180,15 +2190,25 @@ export function install(rt) {
     const raw = openingCallFor(room, opener)
     if (opener.admitted !== undefined) return { ...raw, speakers: raw.speakers.filter(bot => Object.hasOwn(opener.admitted, bot.id)) }
     if (opener.goal === 'nudge') return { ...raw, speakers: [] }
-    if (opener.botId === undefined || opener.kickoff || opener.goal !== undefined || raw.speakers.length === 0) return raw
+    const ordinaryBot = opener.botId !== undefined && opener.kickoff !== true && opener.goal === undefined && opener.quiet !== true && opener.done !== true && opener.late !== true && opener.progress !== true && opener.member !== true
+    const speakers = [...raw.speakers]
+    // Members who chose to hear this sender without an @ join the round. A user
+    // message and a goal or result post keep the speaker list they already had.
+    if (ordinaryBot) {
+      for (const bot of room.members.map(id => rt.botOf(id)).filter(Boolean)) {
+        if (bot.id === opener.botId || speakers.some(item => item.id === bot.id)) continue
+        if (hearsWithoutMention(bot, opener.botId, room)) speakers.push(bot)
+      }
+    }
+    if (opener.botId === undefined || opener.kickoff || opener.goal !== undefined || speakers.length === 0) return { ...raw, speakers }
     // A Bot's message starts only the members the Bot-response policies allow. The user's
     // message never comes here with a botId.
     const everyone = room.members.map(rt.botOf).filter(Boolean)
     const named = (mentionsOf(opener, everyone) ?? mentionsIn(opener.text ?? '', everyone, opener.references)).found
     const idle = isIdleRelayText(opener.text ?? '', everyone, [])
-    const speakers = raw.speakers.filter(bot => rt.botResponse.check({ sender: opener.botId, recipient: bot, room, result: resultCall(opener, bot, named), named: named.includes(bot), idle, text: opener.text,
+    const allowed = speakers.filter(bot => rt.botResponse.check({ sender: opener.botId, recipient: bot, room, result: resultCall(opener, bot, named), named: named.includes(bot), idle, text: opener.text,
       event: opener.event, parent: opener.parent, finding: opener.finding, category: opener.category, reviewFix: opener.reviewFix ?? reviewFixOf(opener.text), kind: 'post' }).allow)
-    return { speakers, ordered: raw.ordered && speakers.length > 1 }
+    return { speakers: allowed, ordered: raw.ordered && allowed.length > 1 }
   }
   // A completion or late reply that goes back to the member that asked for the work is
   // its result, not a call: it is kept and answered whatever the policy says. A member

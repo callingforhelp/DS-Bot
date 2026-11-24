@@ -136,20 +136,36 @@ export function ResponsibilityCard({ bot, coordinator, onSave }) {
 // the setting existed until one is picked. Only the user sees this card and changes it.
 export const RESPONSE_MODES = [
   ['off', 'Off', 'Messages from other Bots never start new work. Your own messages always do.'],
-  ['selected', 'Selected Bots', 'Only the Bots you pick below can start new work with a message.'],
+  ['selected', 'Selected Bots', 'The Bots you pick below are allowed to start new work. The group rules say when an @ is required.'],
   ['all', 'All Bots', 'Any Bot can start new work with a message. The loop limits still apply.'],
+]
+export const MENTION_CHOICES = [
+  ['allowed', 'Only an allowed Bot'],
+  ['anyone', 'Anyone in the group'],
+]
+export const UNNAMED_CHOICES = [
+  ['ignore', 'Ignore'],
+  ['selected', 'Reply to a Selected Bot'],
+  ['allowed', 'Reply to any allowed Bot'],
 ]
 
 export function BotResponseCard({ policy, candidates, onChange }) {
   const mode = policy?.mode
   const allowed = policy?.allow ?? []
+  const mention = policy?.mention ?? 'allowed'
+  const unnamed = policy?.unnamed ?? 'ignore'
   const hint = mode === undefined ? t('Not chosen yet: Bot messages work as they did before this setting.') : t(RESPONSE_MODES.find(([id]) => id === mode)?.[2] ?? '')
-  const toggle = id => onChange({ mode: 'selected', allow: allowed.includes(id) ? allowed.filter(item => item !== id) : [...allowed, id] })
+  const kept = {
+    ...(policy?.mention ? { mention: policy.mention } : {}),
+    ...(policy?.unnamed ? { unnamed: policy.unnamed } : {}),
+  }
+  const base = () => ({ mode, ...(mode === 'selected' ? { allow: allowed } : {}), mention, unnamed })
+  const toggle = id => onChange({ mode: 'selected', ...kept, allow: allowed.includes(id) ? allowed.filter(item => item !== id) : [...allowed, id] })
   return h(Card, { title: t('Responding to Bots') },
     h('div', { className: 'bt-set-row bt-bs-row bt-bs-stack' },
       h(Segmented, { label: t('Responding to Bots'), value: mode ?? '' }, RESPONSE_MODES.map(([id, label]) => h('button', {
         key: id, type: 'button', 'aria-pressed': mode === id,
-        onClick: () => { if (mode !== id) onChange({ mode: id, ...(id === 'selected' ? { allow: allowed } : {}) }) },
+        onClick: () => { if (mode !== id) onChange({ mode: id, ...kept, ...(id === 'selected' ? { allow: allowed } : {}) }) },
       }, t(label)))),
       h('span', { key: mode ?? 'unset', className: 'bt-set-hint bt-veil' }, hint)),
     mode === 'all' ? h('div', { className: 'bt-set-row bt-br-warn', role: 'note' },
@@ -160,6 +176,17 @@ export function BotResponseCard({ policy, candidates, onChange }) {
       h('div', { className: 'bt-ng-picks', role: 'group', 'aria-label': t('Allowed Bots') },
         candidates.map(bot => h('button', { key: bot.id, type: 'button', role: 'checkbox', className: 'bt-ng-chip', 'aria-checked': allowed.includes(bot.id), onClick: () => toggle(bot.id) },
           h(BotMark, { bot, size: 22 }), h('span', { className: 'bt-ng-name' }, bot.name))))) : null,
+    mode === 'off' || mode === undefined ? null : h('div', { className: 'bt-set-row bt-bs-row bt-bs-stack' },
+      h('span', { className: 'bt-bs-label' }, t('In a group')),
+      h(Segmented, { label: t('When @mentioned'), value: mention }, MENTION_CHOICES.map(([id, label]) => h('button', {
+        key: id, type: 'button', 'aria-pressed': mention === id,
+        onClick: () => { if (mention !== id) onChange({ ...base(), mention: id }) },
+      }, t(label)))),
+      h(Segmented, { label: t('When not @mentioned'), value: unnamed }, UNNAMED_CHOICES.map(([id, label]) => h('button', {
+        key: id, type: 'button', 'aria-pressed': unnamed === id,
+        onClick: () => { if (unnamed !== id) onChange({ ...base(), unnamed: id }) },
+      }, t(label)))),
+      h('span', { className: 'bt-set-hint' }, t('The group card uses the same rules. Where this Bot and the group disagree, the stricter rule wins. Off still blocks every Bot.'))),
     mode === undefined ? null : h('div', { className: 'bt-set-row bt-br-foot' },
       h('span', { className: 'bt-set-hint' }, t('A Bot message can be ignored when this setting does not allow its sender, when it does not name this Bot, when it is only thanks or a status update, when it would send work back to a Bot it came from, or when the same fix was already tried twice. Your own messages are never ignored.')),
       h('button', { type: 'button', className: 'bt-mini', onClick: () => onChange(null) }, t('Reset'))))
