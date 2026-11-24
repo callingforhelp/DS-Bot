@@ -2,6 +2,8 @@
 import http.client
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from broker import (
     BrokerStore,
     ThreadingHTTPServer,
+    ThreadingUnixStreamServer,
     make_handler,
     redact_secrets,
     sync_new_bot_capabilities,
@@ -473,6 +476,597 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(st, 200)
         self.assertEqual(listed2["notes"], [])
+
+    def test_pre_migration_decisions_schema_upgrade(self) -> None:
+        legacy_db = os.path.join(self.tmpdir.name, "legacy_decisions.db")
+        conn = sqlite3.connect(legacy_db)
+        conn.executescript(
+            """
+            CREATE TABLE decisions (
+                decision_id TEXT PRIMARY KEY,
+                idempotency_key TEXT UNIQUE,
+                title TEXT NOT NULL,
+                context TEXT NOT NULL DEFAULT '',
+                options TEXT NOT NULL DEFAULT '[]',
+                source_env TEXT NOT NULL DEFAULT 'aws',
+                source_room TEXT,
+                source_bot TEXT,
+                aws_session_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                choice TEXT,
+                note TEXT,
+                resolved_by TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                resolved_at REAL
+            );
+            INSERT INTO decisions (
+                decision_id, idempotency_key, title, context, options,
+                source_env, source_bot, status, created_at, updated_at
+            ) VALUES (
+                'dec_legacy1', 'legacy-k1', 'Legacy Choice', 'Legacy ctx',
+                '["Yes", "No"]', 'aws', 'Chief', 'pending', 100.0, 100.0
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        upgraded = BrokerStore(legacy_db)
+        try:
+            cols = {
+                row["name"]
+                for row in upgraded.conn.execute("PRAGMA table_info(decisions)").fetchall()
+            }
+            self.assertTrue({"kind", "card_id", "resume_job_id"}.issubset(cols))
+            legacy = upgraded.get_decision("dec_legacy1")
+            self.assertIsNotNone(legacy)
+            self.assertEqual(legacy["kind"], "decision")
+            self.assertIsNone(legacy["card_id"])
+            self.assertIsNone(legacy["resume_job_id"])
+
+            created, was_created = upgraded.create_decision(
+                {
+                    "title": "New card",
+                    "kind": "question",
+                    "card_id": "q_new_1",
+                    "source_env": "mac_waiting",
+                    "source_bot": "Chief",
+                }
+            )
+            self.assertTrue(was_created)
+            self.assertEqual(created["kind"], "question")
+            self.assertEqual(created["card_id"], "q_new_1")
+
+            resolved = upgraded.resolve_decision("dec_legacy1", "1", auto_resume=False)
+            self.assertEqual(resolved["status"], "resolved")
+            self.assertEqual(resolved["choice"], "Yes")
+        finally:
+            upgraded.close()
+
+    def test_create_decision_mac_waiting_kind_card_id_and_refresh(self) -> None:
+        st_bad, _ = self._req(
+            "POST",
+            "/v1/decisions",
+            {"title": "Bad kind", "kind": "unknown_kind"},
+            token="work-secret",
+        )
+        self.assertEqual(st_bad, 400)
+
+        st_fb, fb = self._req(
+            "POST",
+            "/v1/decisions",
+            {"title": "Fallback env", "source_env": "weird"},
+            token="prod-secret",
+        )
+        self.assertEqual(st_fb, 201)
+        self.assertEqual(fb["decision"]["source_env"], "aws")
+        self.assertEqual(fb["decision"]["kind"], "decision")
+        self.assertIsNone(fb["decision"]["card_id"])
+
+        payload = {
+            "title": "Deploy v2?",
+            "context": "Staging green",
+            "options": ["Ship", "Hold"],
+            "kind": "question",
+            "card_id": "card-q1",
+            "source_env": "mac_waiting",
+            "source_bot": "Chief",
+            "idempotency_key": "dsbot_q:card-q1",
+        }
+        st1, d1 = self._req("POST", "/v1/decisions", payload, token="work-secret")
+        self.assertEqual(st1, 201)
+        self.assertTrue(d1["created"])
+        dec_id = d1["decision"]["decision_id"]
+        self.assertEqual(d1["decision"]["kind"], "question")
+        self.assertEqual(d1["decision"]["card_id"], "card-q1")
+        self.assertEqual(d1["decision"]["source_env"], "mac_waiting")
+        first_updated = d1["decision"]["updated_at"]
+
+        st2, d2 = self._req("POST", "/v1/decisions", payload, token="work-secret")
+        self.assertEqual(st2, 200)
+        self.assertFalse(d2["created"])
+        self.assertEqual(d2["decision"]["decision_id"], dec_id)
+        self.assertEqual(d2["decision"]["updated_at"], first_updated)
+
+        time.sleep(0.01)
+        refreshed_payload = {
+            **payload,
+            "title": "Deploy v2.1?",
+            "context": "Staging green + canary ok",
+            "options": ["Ship now", "Hold", "Rollback"],
+            "kind": "view",
+            "card_id": "card-v1",
+        }
+        st3, d3 = self._req("POST", "/v1/decisions", refreshed_payload, token="work-secret")
+        self.assertEqual(st3, 200)
+        self.assertFalse(d3["created"])
+        self.assertEqual(d3["decision"]["decision_id"], dec_id)
+        self.assertEqual(d3["decision"]["title"], "Deploy v2.1?")
+        self.assertEqual(d3["decision"]["context"], "Staging green + canary ok")
+        self.assertEqual(d3["decision"]["options"], ["Ship now", "Hold", "Rollback"])
+        self.assertEqual(d3["decision"]["kind"], "view")
+        self.assertEqual(d3["decision"]["card_id"], "card-v1")
+        self.assertGreater(d3["decision"]["updated_at"], first_updated)
+
+        # Resolve with auto_resume=False, then confirm closed mac_waiting row is not overwritten
+        st_res, _ = self._req(
+            "POST",
+            f"/v1/decisions/{dec_id}/resolve",
+            {"choice": "1", "auto_resume": False},
+            token="prod-secret",
+        )
+        self.assertEqual(st_res, 200)
+        st4, d4 = self._req(
+            "POST",
+            "/v1/decisions",
+            {**refreshed_payload, "title": "Should not overwrite"},
+            token="work-secret",
+        )
+        self.assertEqual(st4, 200)
+        self.assertEqual(d4["decision"]["status"], "resolved")
+        self.assertEqual(d4["decision"]["title"], "Deploy v2.1?")
+
+        # Non-mac_waiting pending row stays immutable on duplicate idempotency_key
+        st_aws1, aws1 = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "AWS decision",
+                "source_env": "aws",
+                "idempotency_key": "aws-immutable-1",
+            },
+            token="prod-secret",
+        )
+        self.assertEqual(st_aws1, 201)
+        st_aws2, aws2 = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "AWS mutated?",
+                "source_env": "aws",
+                "idempotency_key": "aws-immutable-1",
+            },
+            token="prod-secret",
+        )
+        self.assertEqual(st_aws2, 200)
+        self.assertEqual(aws2["decision"]["decision_id"], aws1["decision"]["decision_id"])
+        self.assertEqual(aws2["decision"]["title"], "AWS decision")
+
+    def test_worker_decisions_reconcile(self) -> None:
+        st_unauth, _ = self._req(
+            "POST", "/v1/worker/decisions/reconcile", {"active_keys": []}
+        )
+        self.assertEqual(st_unauth, 401)
+        st_prod, _ = self._req(
+            "POST",
+            "/v1/worker/decisions/reconcile",
+            {"active_keys": []},
+            token="prod-secret",
+        )
+        self.assertEqual(st_prod, 403)
+
+        for bad_body in [{}, {"active_keys": "not-a-list"}, {"active_keys": [1, 2]}]:
+            st_bad, _ = self._req(
+                "POST",
+                "/v1/worker/decisions/reconcile",
+                bad_body,
+                token="work-secret",
+            )
+            self.assertEqual(st_bad, 400)
+
+        _, keep_d = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "Keep active",
+                "kind": "question",
+                "card_id": "keep-1",
+                "source_env": "mac_waiting",
+                "source_bot": "Chief",
+                "idempotency_key": "dsbot_q:keep-1",
+            },
+            token="work-secret",
+        )
+        _, drop_d = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "Dropped locally",
+                "kind": "approval",
+                "card_id": "drop-1",
+                "source_env": "mac_waiting",
+                "source_bot": "Chief",
+                "idempotency_key": "dsbot_a:drop-1",
+            },
+            token="work-secret",
+        )
+        _, null_key_d = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "Legacy mac_waiting without key",
+                "kind": "view",
+                "source_env": "mac_waiting",
+                "source_bot": "Chief",
+            },
+            token="work-secret",
+        )
+        _, aws_d = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "AWS pending",
+                "source_env": "aws",
+                "source_bot": "Chief",
+                "idempotency_key": "aws-keep",
+            },
+            token="prod-secret",
+        )
+        _, mac_d = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "Mac non-waiting pending",
+                "source_env": "mac",
+                "source_bot": "Chief",
+                "idempotency_key": "mac-keep",
+            },
+            token="work-secret",
+        )
+
+        st_rec, rec = self._req(
+            "POST",
+            "/v1/worker/decisions/reconcile",
+            {"active_keys": ["dsbot_q:keep-1"]},
+            token="work-secret",
+        )
+        self.assertEqual(st_rec, 200)
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["count"], 2)
+        resolved_ids = {d["decision_id"] for d in rec["resolved"]}
+        self.assertEqual(
+            resolved_ids,
+            {drop_d["decision"]["decision_id"], null_key_d["decision"]["decision_id"]},
+        )
+        for item in rec["resolved"]:
+            self.assertEqual(item["status"], "resolved")
+            self.assertEqual(item["choice"], "(answered in DS Bot.app)")
+            self.assertEqual(item["note"], "Closed locally in DS Bot desktop UI")
+            self.assertEqual(item["resolved_by"], "mac-dsbot-ui")
+            self.assertIsNotNone(item["resolved_at"])
+            self.assertIsNone(item["resume_job_id"])
+
+        for untouched in (keep_d, aws_d, mac_d):
+            dec_id = untouched["decision"]["decision_id"]
+            st_g, got = self._req("GET", f"/v1/decisions/{dec_id}", token="prod-secret")
+            self.assertEqual(st_g, 200)
+            self.assertEqual(got["decision"]["status"], "pending")
+
+        st_jobs, jobs = self._req("GET", "/v1/jobs?limit=20", token="prod-secret")
+        self.assertEqual(st_jobs, 200)
+        self.assertEqual(jobs["jobs"], [])
+
+        # Shrinking active_keys to [] closes remaining mac_waiting row
+        st_rec2, rec2 = self._req(
+            "POST",
+            "/v1/worker/decisions/reconcile",
+            {"active_keys": []},
+            token="work-secret",
+        )
+        self.assertEqual(st_rec2, 200)
+        self.assertEqual(rec2["count"], 1)
+        self.assertEqual(
+            rec2["resolved"][0]["decision_id"], keep_d["decision"]["decision_id"]
+        )
+
+    def test_resolve_decision_numeric_expansion_resume_wakeup_and_guards(self) -> None:
+        st_nf, _ = self._req(
+            "POST",
+            "/v1/decisions/dec_missing/resolve",
+            {"choice": "1"},
+            token="prod-secret",
+        )
+        self.assertEqual(st_nf, 404)
+
+        _, appr = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "Allow bash tool?",
+                "kind": "approval",
+                "card_id": "appr-1",
+                "source_env": "mac_waiting",
+                "source_bot": "Coder",
+                "options": ["Approve", "Deny"],
+            },
+            token="work-secret",
+        )
+        appr_id = appr["decision"]["decision_id"]
+        st_conflict, conflict = self._req(
+            "POST",
+            f"/v1/decisions/{appr_id}/resolve",
+            {"choice": "1", "resolved_by": "slack:U1"},
+            token="prod-secret",
+        )
+        self.assertEqual(st_conflict, 409)
+        self.assertFalse(conflict["ok"])
+        self.assertIn("DS Bot.app", conflict["error"])
+        _, appr_check = self._req("GET", f"/v1/decisions/{appr_id}", token="prod-secret")
+        self.assertEqual(appr_check["decision"]["status"], "pending")
+
+        # Question decision: numeric option expansion + atomic resume job + long-poll wakeup
+        _, q_created = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "Which DB engine?",
+                "context": "Pick storage backend",
+                "options": ["Postgres", "SQLite"],
+                "kind": "question",
+                "card_id": "q-42",
+                "source_env": "mac_waiting",
+                "source_bot": "Planner",
+                "aws_session_id": "slack:C100:1.0",
+            },
+            token="work-secret",
+        )
+        q_id = q_created["decision"]["decision_id"]
+
+        claim_results: dict[str, object] = {}
+
+        def wait_worker() -> None:
+            t0 = time.monotonic()
+            st_w, data_w = self._req(
+                "POST",
+                "/v1/worker/claim",
+                {"worker_id": "mac-resume", "hostname": "mini", "wait_sec": 5.0},
+                token="work-secret",
+            )
+            claim_results["elapsed"] = time.monotonic() - t0
+            claim_results["status"] = st_w
+            claim_results["data"] = data_w
+
+        wt = threading.Thread(target=wait_worker, daemon=True)
+        wt.start()
+        time.sleep(0.15)
+
+        st_res, res = self._req(
+            "POST",
+            f"/v1/decisions/{q_id}/resolve",
+            {
+                "choice": "2",
+                "note": "Need local file portability",
+                "resolved_by": "slack:U42",
+                "aws_session_id": "slack:C100:2.0",
+            },
+            token="prod-secret",
+        )
+        self.assertEqual(st_res, 200)
+        dec = res["decision"]
+        self.assertEqual(dec["status"], "resolved")
+        self.assertEqual(dec["choice"], "SQLite")
+        self.assertEqual(dec["note"], "Need local file portability")
+        self.assertEqual(dec["resolved_by"], "slack:U42")
+        resume_job_id = dec["resume_job_id"]
+        self.assertTrue(resume_job_id)
+
+        wt.join(timeout=3.0)
+        self.assertFalse(wt.is_alive())
+        self.assertEqual(claim_results["status"], 200)
+        self.assertLess(claim_results["elapsed"], 1.5)
+        claimed_job = claim_results["data"]["job"]
+        self.assertEqual(claimed_job["job_id"], resume_job_id)
+        self.assertEqual(claimed_job["target"], "dsbot")
+        self.assertEqual(claimed_job["role"], "decision_resume")
+        self.assertEqual(claimed_job["bot"], "Planner")
+        self.assertIsNone(claimed_job["group_name"])
+        self.assertEqual(claimed_job["aws_session_id"], "slack:C100:2.0")
+        self.assertEqual(claimed_job["idempotency_key"], f"decision_resume:{q_id}")
+        self.assertEqual(
+            claimed_job["task"],
+            "\n".join(
+                [
+                    f"[USER_DECISION_RESOLVED decision_id={q_id} kind=question card_id=q-42]",
+                    "Question: Which DB engine?",
+                    "Selected answer: SQLite",
+                    "Note: Need local file portability",
+                    "",
+                    "Proceed with this decision and report the outcome.",
+                ]
+            ),
+        )
+
+        # Idempotent second resolve returns existing row without duplicate job
+        st_res2, res2 = self._req(
+            "POST",
+            f"/v1/decisions/{q_id}/resolve",
+            {"choice": "1", "note": "Should be ignored"},
+            token="prod-secret",
+        )
+        self.assertEqual(st_res2, 200)
+        self.assertEqual(res2["decision"]["choice"], "SQLite")
+        self.assertEqual(res2["decision"]["resume_job_id"], resume_job_id)
+        st_jobs, jobs = self._req("GET", "/v1/jobs?limit=20", token="prod-secret")
+        self.assertEqual(st_jobs, 200)
+        self.assertEqual(len(jobs["jobs"]), 1)
+
+        # Group decision with no card_id, no aws_session_id, and empty note
+        _, grp_d = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "Merge release PR?",
+                "options": ["Merge", "Wait"],
+                "source_env": "mac",
+                "source_room": "1+1 Routing",
+                "source_bot": "Chief",
+            },
+            token="work-secret",
+        )
+        grp_id = grp_d["decision"]["decision_id"]
+        st_grp, grp_res = self._req(
+            "POST",
+            f"/v1/decisions/{grp_id}/resolve",
+            {"choice": "1"},
+            token="prod-secret",
+        )
+        self.assertEqual(st_grp, 200)
+        grp_job_id = grp_res["decision"]["resume_job_id"]
+        self.assertTrue(grp_job_id)
+        st_gj, gj = self._req("GET", f"/v1/jobs/{grp_job_id}", token="prod-secret")
+        self.assertEqual(st_gj, 200)
+        self.assertEqual(gj["job"]["group"], "1+1 Routing")
+        self.assertIsNone(gj["job"]["bot"])
+        self.assertEqual(gj["job"]["aws_session_id"], f"decision:{grp_id}")
+        self.assertEqual(
+            gj["job"]["task"],
+            "\n".join(
+                [
+                    f"[USER_DECISION_RESOLVED decision_id={grp_id} kind=decision card_id=none]",
+                    "Question: Merge release PR?",
+                    "Selected answer: Merge",
+                    "",
+                    "Proceed with this decision and report the outcome.",
+                ]
+            ),
+        )
+
+        # auto_resume=False resolves without creating any resume job
+        _, nores_d = self._req(
+            "POST",
+            "/v1/decisions",
+            {
+                "title": "FYI choice",
+                "options": ["Ack"],
+                "source_env": "mac_waiting",
+                "source_bot": "Chief",
+            },
+            token="work-secret",
+        )
+        nores_id = nores_d["decision"]["decision_id"]
+        st_nr, nr = self._req(
+            "POST",
+            f"/v1/decisions/{nores_id}/resolve",
+            {"choice": "1", "auto_resume": False},
+            token="prod-secret",
+        )
+        self.assertEqual(st_nr, 200)
+        self.assertEqual(nr["decision"]["choice"], "Ack")
+        self.assertIsNone(nr["decision"]["resume_job_id"])
+        st_jobs_end, jobs_end = self._req("GET", "/v1/jobs?limit=20", token="prod-secret")
+        self.assertEqual(st_jobs_end, 200)
+        self.assertEqual(len(jobs_end["jobs"]), 2)
+
+    def test_mcp_bridge_decision_contract(self) -> None:
+        sock_path = os.path.join(self.tmpdir.name, "broker.sock")
+        if len(sock_path.encode("utf-8")) >= 100:
+            self.skipTest("temp socket path exceeds macOS AF_UNIX limit")
+        unix_handler = make_handler(
+            self.store,
+            producer_token="prod-secret",
+            worker_token="work-secret",
+            team_memory_dir=self.team_mem_dir,
+        )
+        unix_server = ThreadingUnixStreamServer(sock_path, unix_handler)
+        unix_thread = threading.Thread(target=unix_server.serve_forever, daemon=True)
+        unix_thread.start()
+        try:
+            mcp_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "mac-broker-mcp.mjs"
+            )
+            requests = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "decision_create",
+                        "arguments": {
+                            "title": "MCP Question",
+                            "options": ["Alpha", "Beta"],
+                            "kind": "question",
+                            "card_id": "mcp-card-1",
+                            "source_bot": "Chief",
+                        },
+                    },
+                }
+            ]
+            env = {
+                **os.environ,
+                "BROKER_UNIX_SOCK": sock_path,
+                "BROKER_PRODUCER_TOKEN": "prod-secret",
+            }
+            proc = subprocess.run(
+                ["node", mcp_path],
+                input=json.dumps(requests[0]) + "\n",
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10,
+                check=True,
+            )
+            create_resp = json.loads(proc.stdout.strip().splitlines()[-1])
+            create_body = json.loads(create_resp["result"]["content"][0]["text"])
+            self.assertFalse(create_resp["result"]["isError"])
+            dec_id = create_body["decision"]["decision_id"]
+            self.assertEqual(create_body["decision"]["kind"], "question")
+            self.assertEqual(create_body["decision"]["card_id"], "mcp-card-1")
+
+            resolve_req = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "decision_resolve",
+                    "arguments": {
+                        "decision_id": dec_id,
+                        "choice": "2",
+                        "aws_session_id": "sess-mcp-99",
+                        "auto_resume": True,
+                    },
+                },
+            }
+            proc2 = subprocess.run(
+                ["node", mcp_path],
+                input=json.dumps(resolve_req) + "\n",
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10,
+                check=True,
+            )
+            res_resp = json.loads(proc2.stdout.strip().splitlines()[-1])
+            res_body = json.loads(res_resp["result"]["content"][0]["text"])
+            self.assertFalse(res_resp["result"]["isError"])
+            self.assertTrue(res_body["resume_job_id"])
+            self.assertEqual(
+                res_body["resume_job_id"], res_body["decision"]["resume_job_id"]
+            )
+            self.assertEqual(res_body["decision"]["choice"], "Beta")
+        finally:
+            unix_server.shutdown()
+            unix_server.server_close()
 
 
 if __name__ == "__main__":

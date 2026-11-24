@@ -182,6 +182,7 @@ class RouterConfig:
     db_path: str = "/var/lib/slack-router/router.db"
     watch_interval_sec: float = 0.5
     cloud_timeout_sec: float = 180.0
+    alert_channel: str = ""
 
     @classmethod
     def from_env(cls) -> "RouterConfig":
@@ -212,18 +213,37 @@ class RouterConfig:
         raw_groups = os.environ.get("SLACK_KNOWN_GROUPS")
         if raw_groups is not None:
             cfg.known_groups = [x.strip() for x in raw_groups.split(",") if x.strip()]
+        raw_alert = os.environ.get("SLACK_ALERT_CHANNEL", "").strip()
+        if raw_alert:
+            cfg.alert_channel = raw_alert
+        elif cfg.channel_map:
+            cfg.alert_channel = next(iter(cfg.channel_map))
+        else:
+            cfg.alert_channel = ""
         return cfg
 
 
 @dataclass
 class ParsedCommand:
-    action: str  # message | cloud | queue | cancel | move_to_cloud | empty
+    action: str  # message | cloud | queue | cancel | move_to_cloud | decisions | decide | empty
     text: str = ""
     bot: Optional[str] = None
     group: Optional[str] = None
     job_id: Optional[str] = None
+    decision_id: str = ""
+    choice: str = ""
+    note: str = ""
     force: bool = False
     local_only: bool = False
+
+
+def _split_decide_args(rest: str) -> tuple[str, str, str]:
+    head, sep, note_part = rest.strip().partition("|")
+    note = note_part.strip() if sep else ""
+    parts = head.strip().split(None, 1)
+    decision_id = parts[0].strip() if parts else ""
+    choice = parts[1].strip() if len(parts) > 1 else ""
+    return decision_id, choice, note
 
 
 def parse_incoming_command(
@@ -238,7 +258,7 @@ def parse_incoming_command(
 ) -> ParsedCommand:
     text = str(raw_text or "")
     if self_user_id:
-        text = text.replace(f"<@{self_user_id}>", " ")
+        text = re.sub(rf"<@{re.escape(self_user_id)}(?:\|[^>]*)?>", " ", text)
     text = text.strip()
     if not text:
         return ParsedCommand(action="empty")
@@ -246,6 +266,29 @@ def parse_incoming_command(
     low = text.lower()
     if re.match(r"^/queue(?:\s|$)", low):
         return ParsedCommand(action="queue")
+
+    if re.match(r"^/(?:decisions|waiting)(?:\s|$)", low):
+        return ParsedCommand(action="decisions")
+
+    m_decide = re.match(r"^/decide(?:\s+(.*))?$", text, re.IGNORECASE | re.DOTALL)
+    if m_decide:
+        decision_id, choice, note = _split_decide_args(m_decide.group(1) or "")
+        return ParsedCommand(
+            action="decide",
+            decision_id=decision_id,
+            choice=choice,
+            note=note,
+        )
+
+    m_approve = re.match(r"^/approve(?:\s+(.*))?$", text, re.IGNORECASE | re.DOTALL)
+    if m_approve:
+        decision_id, choice, note = _split_decide_args(m_approve.group(1) or "")
+        return ParsedCommand(
+            action="decide",
+            decision_id=decision_id,
+            choice=choice or "1",
+            note=note,
+        )
 
     m_cancel = re.match(r"^/cancel(?:\s+(\S+))?", text, re.IGNORECASE)
     if m_cancel:
@@ -363,6 +406,11 @@ class RouterStore:
                     completed_at REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_tracked_open ON tracked_jobs(completed_at, created_at);
+                CREATE TABLE IF NOT EXISTS notified_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    notified_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_notified_decisions_at ON notified_decisions(notified_at);
                 """
             )
             self.conn.commit()
@@ -383,10 +431,34 @@ class RouterStore:
             self.conn.commit()
             return (cur.rowcount or 0) > 0
 
+    def mark_decision_notified_if_new(self, decision_id: str) -> bool:
+        clean_id = str(decision_id or "").strip()
+        if not clean_id:
+            return False
+        now = time.time()
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO notified_decisions (decision_id, notified_at) VALUES (?, ?)",
+                (clean_id, now),
+            )
+            self.conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    def unmark_decision_notified(self, decision_id: str) -> None:
+        clean_id = str(decision_id or "").strip()
+        if not clean_id:
+            return
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM notified_decisions WHERE decision_id = ?",
+                (clean_id,),
+            )
+            self.conn.commit()
+
     def track_job(
         self,
-        *,
         job_id: str,
+        *,
         channel: str,
         thread_ts: str,
         msg_ts: str,
@@ -499,6 +571,20 @@ class SlackApiClient:
             pass
 
 
+class BrokerError(RuntimeError):
+    """Error returned by the mac-job-broker HTTP API or transport."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload
+
+
 class BrokerProducerClient:
     def __init__(self, base_url: str, producer_token: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -514,11 +600,35 @@ class BrokerProducerClient:
             with urllib.request.urlopen(req, timeout=15.0) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             try:
                 return exc.code, json.loads(raw)
             except Exception:
                 return exc.code, {"ok": False, "error": raw}
+
+    def _req_checked(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict[str, Any]] = None,
+        *,
+        allow_404: bool = False,
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            code, data = self._req(method, path, body)
+        except urllib.error.URLError as exc:
+            raise BrokerError(f"Broker request failed: {exc}", status_code=None) from exc
+        except (OSError, ValueError) as exc:
+            raise BrokerError(f"Broker request failed: {exc}", status_code=None) from exc
+        if allow_404 and code == 404:
+            return code, data
+        if code < 200 or code >= 300 or not data.get("ok"):
+            err = str(data.get("error") or f"HTTP {code}")
+            raise BrokerError(err, status_code=code, payload=data)
+        return code, data
 
     def healthz(self) -> dict[str, Any]:
         req = urllib.request.Request(f"{self.base_url}/healthz", method="GET")
@@ -557,6 +667,55 @@ class BrokerProducerClient:
                 "reply_excerpt": reply_excerpt,
             },
         )
+
+    def list_decisions(
+        self, status: Optional[str] = "pending", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"limit": int(limit)}
+        if status:
+            params["status"] = str(status)
+        qs = urllib.parse.urlencode(params)
+        _, data = self._req_checked("GET", f"/v1/decisions?{qs}")
+        decisions = data.get("decisions")
+        return list(decisions) if isinstance(decisions, list) else []
+
+    def get_decision(self, decision_id: str) -> Optional[dict[str, Any]]:
+        dec_id = urllib.parse.quote(str(decision_id or "").strip(), safe="")
+        if not dec_id:
+            raise BrokerError("decision_id is required", status_code=400)
+        code, data = self._req_checked("GET", f"/v1/decisions/{dec_id}", allow_404=True)
+        if code == 404:
+            return None
+        dec = data.get("decision")
+        return dict(dec) if isinstance(dec, dict) else None
+
+    def resolve_decision(
+        self,
+        decision_id: str,
+        *,
+        choice: str,
+        note: str = "",
+        resolved_by: str = "slack",
+        aws_session_id: str = "",
+    ) -> dict[str, Any]:
+        dec_id = urllib.parse.quote(str(decision_id or "").strip(), safe="")
+        if not dec_id:
+            raise BrokerError("decision_id is required", status_code=400)
+        payload: dict[str, Any] = {
+            "choice": choice,
+            "note": note,
+            "resolved_by": resolved_by,
+        }
+        if aws_session_id:
+            payload["aws_session_id"] = aws_session_id
+        _, data = self._req_checked("POST", f"/v1/decisions/{dec_id}/resolve", payload)
+        dec = data.get("decision")
+        if not isinstance(dec, dict):
+            raise BrokerError("Broker resolve_decision returned invalid decision payload", status_code=200, payload=data)
+        return dec
+
+
+BrokerHttpClient = BrokerProducerClient
 
 
 class Ec2DsBotClient:
@@ -723,10 +882,55 @@ class SlackRouter:
         self._ws_lock = threading.Lock()
         self._active_ws: Optional[SimpleWebSocket] = None
 
-    def _post_thread(self, channel: str, thread_ts: str, text: str) -> None:
+    def _post_thread(self, channel: str, thread_ts: Optional[str], text: str) -> None:
         formatted = markdown_to_mrkdwn(redact_secrets(text))
         for part in chunk_slack_text(formatted):
             self.slack.post_message(channel, part, thread_ts=thread_ts)
+
+    def _post_channel(self, channel: str, text: str) -> None:
+        self._post_thread(channel, None, text)
+
+    @staticmethod
+    def _format_decision_lines(d: dict[str, Any], *, is_alert: bool = False) -> list[str]:
+        dec_id = str(d.get("decision_id") or "").strip()
+        kind = str(d.get("kind") or "decision").strip().lower()
+        bot = str(d.get("source_bot") or "").strip()
+        room = str(d.get("source_room") or "").strip()
+        if room and bot and room != bot:
+            who = f"{room} / {bot}"
+        else:
+            who = room or bot or str(d.get("source_env") or "DS Bot").strip()
+        title = str(d.get("title") or "(untitled)").strip()
+        context = str(d.get("context") or "").strip()
+        raw_opts = d.get("options")
+        options = (
+            [str(o).strip() for o in raw_opts if str(o).strip()]
+            if isinstance(raw_opts, list)
+            else []
+        )
+
+        lines: list[str] = []
+        if is_alert:
+            lines.append(f":bell: **Needs You** [{kind}] **{who}** (`{dec_id}`)")
+            lines.append(title)
+            if context and context != title:
+                excerpt = context.replace("\r\n", "\n").strip()
+                if len(excerpt) > 350:
+                    excerpt = excerpt[:347].rstrip() + "..."
+                lines.append(excerpt)
+        else:
+            lines.append(f"- `{dec_id}` [{kind}] **{who}** — {title}")
+
+        for idx, opt in enumerate(options, 1):
+            lines.append(f"  {idx}. {opt}")
+
+        if kind == "approval":
+            lines.append("  :lock: Approve in DS Bot.app on Mac")
+        elif options:
+            lines.append(f"  Reply `/decide {dec_id} 1` (or `/decide {dec_id} <choice> | <note>`)")
+        else:
+            lines.append(f"  Reply `/decide {dec_id} <choice> [| <note>]`")
+        return lines
 
     def handle_interactive(self, payload: dict[str, Any]) -> None:
         # v2 hook: answer_waiting card actions go here once mcp-server exposes answer_waiting.
@@ -900,6 +1104,97 @@ class SlackRouter:
             self._post_thread(channel, thread_ts, "\n".join(lines))
             return
 
+        if parsed.action == "decisions":
+            try:
+                decisions = self.broker.list_decisions(status="pending", limit=20)
+            except Exception as exc:
+                self._post_thread(
+                    channel,
+                    thread_ts,
+                    f":x: `/decisions` failed: {redact_secrets(str(exc))}",
+                )
+                return
+            if not decisions:
+                self._post_thread(channel, thread_ts, "No pending decisions waiting right now.")
+                return
+            ordered = sorted(
+                reversed(decisions), key=lambda d: float(d.get("created_at") or 0.0)
+            )
+            lines = [f"Pending decisions ({len(ordered)}):"]
+            for d in ordered:
+                lines.extend(self._format_decision_lines(d, is_alert=False))
+            self._post_thread(channel, thread_ts, "\n".join(lines))
+            return
+
+        if parsed.action == "decide":
+            if not parsed.decision_id or not parsed.choice:
+                self._post_thread(
+                    channel,
+                    thread_ts,
+                    "Usage: `/decide <decision_id> <choice_or_number> [| optional note]`",
+                )
+                return
+            try:
+                decision = self.broker.resolve_decision(
+                    parsed.decision_id,
+                    choice=parsed.choice,
+                    note=parsed.note,
+                    resolved_by=f"slack:{user_id}",
+                    aws_session_id=f"slack:{channel}:{thread_ts}",
+                )
+            except Exception as exc:
+                if isinstance(exc, BrokerError) and exc.status_code == 409:
+                    self._post_thread(
+                        channel,
+                        thread_ts,
+                        f":lock: Cannot resolve `{parsed.decision_id}` from Slack — host tool approvals must be approved directly in **DS Bot.app** on your Mac.",
+                    )
+                    return
+                if isinstance(exc, BrokerError) and exc.status_code == 404:
+                    self._post_thread(
+                        channel,
+                        thread_ts,
+                        f":warning: Decision `{parsed.decision_id}` was not found.",
+                    )
+                    return
+                self._post_thread(
+                    channel,
+                    thread_ts,
+                    f":x: Could not resolve `{parsed.decision_id}`: {redact_secrets(str(exc))}",
+                )
+                return
+
+            chosen = str(decision.get("choice") or parsed.choice).strip()
+            resume_job_id = str(decision.get("resume_job_id") or "").strip()
+            if resume_job_id:
+                self.store.track_job(
+                    resume_job_id,
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    msg_ts=msg_ts,
+                    user_id=user_id,
+                    bot_name=decision.get("source_bot"),
+                    group_name=decision.get("source_room"),
+                    local_only=True,
+                )
+                self.slack.add_reaction(channel, msg_ts, "eyes")
+                who = str(
+                    decision.get("source_room")
+                    or decision.get("source_bot")
+                    or "DS Bot"
+                ).strip()
+                reply_msg = (
+                    f":white_check_mark: Resolved `{parsed.decision_id}` -> `{chosen}`. "
+                    f"Queued resume job `{resume_job_id}` for **{who}**; I will post the outcome here when it finishes."
+                )
+            else:
+                reply_msg = f":white_check_mark: Resolved `{parsed.decision_id}` -> `{chosen}`."
+            note_val = str(decision.get("note") or parsed.note or "").strip()
+            if note_val:
+                reply_msg += f"\nNote: {note_val}"
+            self._post_thread(channel, thread_ts, reply_msg)
+            return
+
         if parsed.action == "cancel":
             if not parsed.job_id:
                 self._post_thread(channel, thread_ts, "Usage: `/cancel <job_id>`")
@@ -1037,12 +1332,49 @@ class SlackRouter:
                     completed += 1
             return completed
 
+    def watch_pending_decisions_once(self) -> int:
+        alert_channel = str(self.config.alert_channel or "").strip()
+        if not alert_channel:
+            return 0
+        with self._watch_lock:
+            try:
+                decisions = self.broker.list_decisions(status="pending", limit=20)
+            except Exception as exc:
+                sys.stderr.write(f"[slack-router] list_decisions failed: {exc}\n")
+                return 0
+            if not decisions:
+                return 0
+            ordered = sorted(
+                reversed(decisions), key=lambda d: float(d.get("created_at") or 0.0)
+            )
+            posted = 0
+            for d in ordered:
+                dec_id = str(d.get("decision_id") or "").strip()
+                if not dec_id:
+                    continue
+                if not self.store.mark_decision_notified_if_new(dec_id):
+                    continue
+                text = "\n".join(self._format_decision_lines(d, is_alert=True))
+                try:
+                    self._post_channel(alert_channel, text)
+                    posted += 1
+                except Exception as exc:
+                    self.store.unmark_decision_notified(dec_id)
+                    sys.stderr.write(
+                        f"[slack-router] decision alert failed for {dec_id}: {exc}\n"
+                    )
+            return posted
+
     def _watcher_loop(self) -> None:
         while not self._stop_event.wait(self.config.watch_interval_sec):
             try:
                 self.watch_tracked_jobs_once()
             except Exception as exc:
-                sys.stderr.write(f"[slack-router] watcher error: {exc}\n")
+                sys.stderr.write(f"[slack-router] job watcher error: {exc}\n")
+            try:
+                self.watch_pending_decisions_once()
+            except Exception as exc:
+                sys.stderr.write(f"[slack-router] decision watcher error: {exc}\n")
 
     def stop(self) -> None:
         self._stop_event.set()

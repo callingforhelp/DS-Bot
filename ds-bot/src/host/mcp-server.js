@@ -223,6 +223,7 @@ export function clientTools(rt, client, { pollMs = POLL_MS, current = () => clie
       const owned = ({ botId, roomId }) => !isPrivate(botId) && (roomId !== undefined ? allowedRoom(rt.roomOf(roomId)) : allowedBot(rt.botOf(botId)))
       const approvals = (rt.approvalsView?.() ?? []).filter(owned).map(entry => ({
         kind: 'approval',
+        ...(entry.id ? { id: String(entry.id) } : {}),
         bot: rt.botOf(entry.botId)?.name,
         ...(entry.roomId ? { group: rt.roomOf(entry.roomId)?.name } : {}),
         tool: entry.tool,
@@ -231,9 +232,30 @@ export function clientTools(rt, client, { pollMs = POLL_MS, current = () => clie
       const questions = Object.entries(state.questions ?? {}).flatMap(([sessionId, question]) => {
         const bot = rt.botOf(rt.selfOf?.(sessionId))
         if (!allowedBot(bot)) return []
-        return [{ kind: 'question', bot: bot.name, question: String(question?.question ?? '') }]
+        return [{
+          kind: 'question',
+          ...(question?.id ? { id: String(question.id) } : {}),
+          bot: bot.name,
+          question: String(question?.question ?? ''),
+          ...(typeof question?.detail === 'string' && question.detail.trim() !== '' ? { detail: question.detail } : {}),
+          options: Array.isArray(question?.options)
+            ? question.options.map(o => (typeof o === 'string' ? o : String(o?.label ?? ''))).filter(Boolean)
+            : [],
+          multiSelect: question?.multiSelect === true,
+          allowCustom: question?.allowCustom !== false,
+        }]
       })
-      return { waiting: [...approvals, ...questions], answerIn: 'DS Bot on this computer' }
+      const views = Object.entries(state.views ?? {}).flatMap(([sessionId, view]) => {
+        const bot = rt.botOf(rt.selfOf?.(sessionId))
+        if (!allowedBot(bot) || view?.issueDraft !== undefined) return []
+        return [{
+          kind: 'view',
+          ...(view?.id ? { id: String(view.id) } : {}),
+          bot: bot.name,
+          title: String(view?.title ?? ''),
+        }]
+      })
+      return { waiting: [...approvals, ...questions, ...views], answerIn: 'DS Bot on this computer' }
     },
   }
   return async (name, args) => {

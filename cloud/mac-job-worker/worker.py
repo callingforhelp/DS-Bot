@@ -1041,6 +1041,831 @@ class ContextSyncManager:
             return len(notes)
 
 
+_DECISION_RESOLVED_HEADER_RE = re.compile(r"\[USER_DECISION_RESOLVED\b([^\]]*)\]")
+_DECISION_CARD_ID_RE = re.compile(r"\bcard_id=([^\s\]]+)")
+_DECISION_KIND_RE = re.compile(r"\bkind=([^\s\]]+)")
+
+
+def _resolve_dsbot_home(dsbot_home: Optional[str] = None) -> str:
+    raw = (
+        os.environ.get("DSBOT_HOME", "/Users/chief/.ds-bot")
+        if dsbot_home is None
+        else str(dsbot_home)
+    ).strip()
+    return os.path.expanduser(raw) if raw else ""
+
+
+def _read_dsbot_state_readonly(dsbot_home: str) -> dict[str, Any]:
+    if not dsbot_home:
+        return {}
+    state_path = os.path.join(dsbot_home, "bot", "state.json")
+    if not os.path.isfile(state_path):
+        return {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _is_card_closed_in_state(
+    state: dict[str, Any], card_id: str, kind: str = ""
+) -> bool:
+    if not card_id or not isinstance(state, dict):
+        return False
+    closed = state.get("closedCards")
+    if isinstance(closed, dict):
+        if card_id in closed and closed[card_id] is not False:
+            return True
+        for val in closed.values():
+            if isinstance(val, dict) and card_id in val and val[card_id] is not False:
+                return True
+            if isinstance(val, list) and card_id in val:
+                return True
+    elif isinstance(closed, list):
+        if card_id in closed:
+            return True
+    norm_kind = kind.strip().lower()
+    if norm_kind == "question":
+        questions = state.get("questions")
+        if isinstance(questions, dict):
+            return not any(
+                isinstance(entry, dict)
+                and str(entry.get("id") or "").strip() == card_id
+                for entry in questions.values()
+            )
+    elif norm_kind == "view":
+        views = state.get("views")
+        if isinstance(views, dict):
+            return not any(
+                isinstance(entry, dict)
+                and str(entry.get("id") or "").strip() == card_id
+                for entry in views.values()
+            )
+    return False
+
+
+def _extract_option_labels(raw_options: Any) -> list[str]:
+    if not isinstance(raw_options, list):
+        return []
+    labels: list[str] = []
+    seen: set[str] = set()
+    for opt in raw_options:
+        if isinstance(opt, str):
+            label = opt.strip()
+        elif isinstance(opt, dict):
+            label = str(
+                opt.get("label")
+                or opt.get("title")
+                or opt.get("text")
+                or opt.get("value")
+                or ""
+            ).strip()
+        else:
+            label = ""
+        if label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return labels
+
+
+def _extract_view_options_and_detail(view_entry: dict[str, Any]) -> tuple[list[str], str]:
+    options: list[str] = []
+    seen_opts: set[str] = set()
+
+    def _add_opt(label: str) -> None:
+        clean = label.strip()
+        if clean and clean not in seen_opts:
+            seen_opts.add(clean)
+            options.append(clean)
+
+    for key in ("options", "actions", "buttons"):
+        for lbl in _extract_option_labels(view_entry.get(key)):
+            _add_opt(lbl)
+
+    detail_parts: list[str] = []
+    explicit_detail = str(view_entry.get("detail") or "").strip()
+    if explicit_detail:
+        detail_parts.append(explicit_detail)
+
+    def _walk_node(node: Any) -> None:
+        if isinstance(node, list):
+            for child in node:
+                _walk_node(child)
+            return
+        if not isinstance(node, dict):
+            return
+        ntype = str(node.get("type") or "").strip().lower()
+        if ntype == "confirm":
+            _add_opt(str(node.get("confirmLabel") or "Confirm"))
+            _add_opt(str(node.get("cancelLabel") or "Cancel"))
+        elif ntype == "options":
+            for lbl in _extract_option_labels(node.get("options")):
+                _add_opt(lbl)
+        elif ntype == "submit":
+            _add_opt(str(node.get("label") or "Submit"))
+        elif ntype == "button":
+            _add_opt(str(node.get("label") or node.get("title") or ""))
+        elif ntype in ("text", "callout") and not explicit_detail:
+            txt = node.get("text")
+            if isinstance(txt, str) and txt.strip():
+                detail_parts.append(txt.strip())
+        elif ntype == "html" and not explicit_detail:
+            summary = node.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                detail_parts.append(summary.strip())
+
+        for sub_key in ("actions", "buttons"):
+            for lbl in _extract_option_labels(node.get(sub_key)):
+                _add_opt(lbl)
+        if "children" in node:
+            _walk_node(node.get("children"))
+
+    if "view" in view_entry:
+        _walk_node(view_entry.get("view"))
+
+    detail = "\n".join(detail_parts).strip()
+    return options, detail
+
+
+def _build_state_session_index(
+    state: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]], dict[str, str], dict[str, str]]:
+    bot_by_id: dict[str, dict[str, Any]] = {}
+    bot_name_to_ids: dict[str, list[str]] = {}
+    session_to_bot_id: dict[str, str] = {}
+    session_to_group: dict[str, str] = {}
+
+    rooms = state.get("rooms")
+    room_names: dict[str, str] = {}
+    if isinstance(rooms, dict):
+        for rkey, room in rooms.items():
+            if not isinstance(room, dict):
+                continue
+            rid = str(room.get("id") or rkey).strip()
+            rname = str(room.get("name") or "").strip()
+            if rid and rname:
+                room_names[rid] = rname
+
+    bots = state.get("bots")
+    if isinstance(bots, dict):
+        for key, bot in bots.items():
+            if not isinstance(bot, dict):
+                continue
+            bid = str(bot.get("id") or key).strip()
+            if not bid:
+                continue
+            bot_by_id[bid] = bot
+            key_s = str(key).strip()
+            if key_s and key_s != bid:
+                bot_by_id.setdefault(key_s, bot)
+            bname = str(bot.get("name") or "").strip()
+            if bname:
+                bot_name_to_ids.setdefault(bname.lower(), []).append(bid)
+            session_to_bot_id[bid] = bid
+            if key_s:
+                session_to_bot_id[key_s] = bid
+            bsid = str(bot.get("sessionId") or "").strip()
+            if bsid:
+                session_to_bot_id[bsid] = bid
+            for seg in bot.get("segments") or []:
+                if isinstance(seg, dict) and seg.get("sessionId"):
+                    session_to_bot_id[str(seg["sessionId"]).strip()] = bid
+            for task in bot.get("tasks") or []:
+                if not isinstance(task, dict):
+                    continue
+                trname = room_names.get(str(task.get("roomId") or "").strip(), "")
+                tsid = str(task.get("sessionId") or "").strip()
+                if tsid:
+                    session_to_bot_id[tsid] = bid
+                    if trname:
+                        session_to_group[tsid] = trname
+                for seg in task.get("segments") or []:
+                    if isinstance(seg, dict) and seg.get("sessionId"):
+                        segsid = str(seg["sessionId"]).strip()
+                        session_to_bot_id[segsid] = bid
+                        if trname:
+                            session_to_group[segsid] = trname
+
+    if isinstance(rooms, dict):
+        for rkey, room in rooms.items():
+            if not isinstance(room, dict):
+                continue
+            rname = str(room.get("name") or "").strip()
+            rsessions = room.get("sessions")
+            if isinstance(rsessions, dict):
+                for bot_id, sid in rsessions.items():
+                    sid_s = str(sid or "").strip()
+                    if sid_s:
+                        session_to_bot_id[sid_s] = str(bot_id).strip()
+                        if rname:
+                            session_to_group[sid_s] = rname
+            rsegments = room.get("segments")
+            if isinstance(rsegments, dict):
+                for bot_id, seg_list in rsegments.items():
+                    if not isinstance(seg_list, list):
+                        continue
+                    for seg in seg_list:
+                        if isinstance(seg, dict) and seg.get("sessionId"):
+                            sid_s = str(seg["sessionId"]).strip()
+                            session_to_bot_id[sid_s] = str(bot_id).strip()
+                            if rname:
+                                session_to_group[sid_s] = rname
+
+    sessions = state.get("sessions")
+    if isinstance(sessions, dict):
+        for sid, sref in sessions.items():
+            sid_s = str(sid).strip()
+            if not sid_s:
+                continue
+            if isinstance(sref, str):
+                target = sref.strip()
+                if target in bot_by_id:
+                    session_to_bot_id.setdefault(sid_s, target)
+                elif target.lower() in bot_name_to_ids:
+                    session_to_bot_id.setdefault(sid_s, bot_name_to_ids[target.lower()][0])
+            elif isinstance(sref, dict):
+                bref = str(
+                    sref.get("botId")
+                    or sref.get("self")
+                    or sref.get("selfId")
+                    or sref.get("bot_id")
+                    or sref.get("bot")
+                    or ""
+                ).strip()
+                if bref in bot_by_id:
+                    session_to_bot_id.setdefault(sid_s, bref)
+                elif bref.lower() in bot_name_to_ids:
+                    session_to_bot_id.setdefault(sid_s, bot_name_to_ids[bref.lower()][0])
+                grp = str(
+                    sref.get("group") or sref.get("room") or sref.get("roomName") or ""
+                ).strip()
+                if grp:
+                    session_to_group.setdefault(sid_s, grp)
+
+    return bot_by_id, bot_name_to_ids, session_to_bot_id, session_to_group
+
+
+def _resolve_state_entry_owner(
+    sid: str,
+    entry: dict[str, Any],
+    index: tuple[dict[str, dict[str, Any]], dict[str, list[str]], dict[str, str], dict[str, str]],
+) -> tuple[str, str, bool, str]:
+    bot_by_id, bot_name_to_ids, session_to_bot_id, session_to_group = index
+    candidates = [
+        str(sid).strip(),
+        str(entry.get("callSessionId") or "").strip(),
+        str(entry.get("sessionId") or "").strip(),
+    ]
+    bot_id = ""
+    group_name = ""
+    for cand in candidates:
+        if not cand:
+            continue
+        if not bot_id and cand in session_to_bot_id:
+            bot_id = session_to_bot_id[cand]
+        if not group_name and cand in session_to_group:
+            group_name = session_to_group[cand]
+    if not bot_id:
+        explicit_bid = str(entry.get("botId") or entry.get("self") or "").strip()
+        if explicit_bid:
+            bot_id = explicit_bid
+    if not bot_id:
+        explicit_bname = str(entry.get("bot") or "").strip().lower()
+        if explicit_bname and explicit_bname in bot_name_to_ids:
+            bot_id = bot_name_to_ids[explicit_bname][0]
+    if not bot_id and sid.strip().lower() in bot_name_to_ids:
+        bot_id = bot_name_to_ids[sid.strip().lower()][0]
+
+    bot_obj = bot_by_id.get(bot_id)
+    bot_name = (
+        str(bot_obj.get("name") or "").strip()
+        if bot_obj
+        else str(entry.get("bot") or "").strip()
+    )
+    is_private = bool(bot_obj and bot_obj.get("private") is True)
+    if not group_name:
+        group_name = str(
+            entry.get("group") or entry.get("roomName") or entry.get("room") or ""
+        ).strip()
+    return bot_id, bot_name, is_private, group_name
+
+
+def _compute_waiting_idempotency_key(item: dict[str, Any]) -> str:
+    kind = str(item.get("kind") or "").strip().lower()
+    card_id = str(item.get("id") or "").strip()
+    bot = str(item.get("bot") or "").strip()
+    if kind == "question":
+        if card_id:
+            return f"dsbot_q:{card_id}"
+        q_text = str(item.get("question") or "").strip()
+        digest = hashlib.sha1(q_text.encode("utf-8")).hexdigest()[:12]
+        return f"dsbot_q:{bot}:{digest}"
+    if kind == "view":
+        if card_id:
+            return f"dsbot_v:{card_id}"
+        title = str(item.get("title") or "").strip()
+        digest = hashlib.sha1(title.encode("utf-8")).hexdigest()[:12]
+        return f"dsbot_v:{bot}:{digest}"
+    if kind == "approval":
+        if card_id:
+            return f"dsbot_a:{card_id}"
+        group = str(item.get("group") or "").strip()
+        tool = str(item.get("tool") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        digest = hashlib.sha1(reason.encode("utf-8")).hexdigest()[:12]
+        return f"dsbot_a:{bot}:{group}:{tool}:{digest}"
+    raw = json.dumps(item, sort_keys=True, ensure_ascii=False)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"dsbot_w:{digest}"
+
+
+def _match_state_entry(
+    entries: Any,
+    index: tuple[dict[str, dict[str, Any]], dict[str, list[str]], dict[str, str], dict[str, str]],
+    *,
+    card_id: str,
+    bot_name: str,
+    text_key: str,
+    text_val: str,
+    skip_issue_draft: bool = False,
+    allowed_bot_ids: Optional[set[str]] = None,
+) -> Optional[tuple[str, dict[str, Any], str]]:
+    if not isinstance(entries, dict):
+        return None
+    if card_id:
+        for sid, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            if skip_issue_draft and entry.get("issueDraft") is not None:
+                continue
+            if str(entry.get("id") or "").strip() == card_id:
+                resolved_bot_id, _, is_private, resolved_group = _resolve_state_entry_owner(
+                    str(sid), entry, index
+                )
+                if is_private:
+                    return None
+                if allowed_bot_ids is not None and (
+                    not resolved_bot_id or resolved_bot_id not in allowed_bot_ids
+                ):
+                    return None
+                return str(sid), entry, resolved_group
+        return None
+
+    wanted_bot = bot_name.strip().lower()
+    if not wanted_bot:
+        return None
+    wanted_text = text_val.strip()
+    fallback: Optional[tuple[str, dict[str, Any], str]] = None
+    for sid, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        if skip_issue_draft and entry.get("issueDraft") is not None:
+            continue
+        resolved_bot_id, resolved_bot, is_private, resolved_group = _resolve_state_entry_owner(
+            str(sid), entry, index
+        )
+        if is_private or resolved_bot.strip().lower() != wanted_bot:
+            continue
+        if allowed_bot_ids is not None and (
+            not resolved_bot_id or resolved_bot_id not in allowed_bot_ids
+        ):
+            continue
+        candidate_text = str(entry.get(text_key) or "").strip()
+        if wanted_text and candidate_text == wanted_text:
+            return str(sid), entry, resolved_group
+        if fallback is None:
+            fallback = (str(sid), entry, resolved_group)
+    return fallback
+
+
+def collect_local_waiting_items(
+    mcp_url: str,
+    mcp_token: str,
+    dsbot_home: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Collect normalized waiting items from local DS Bot MCP, enriched read-only from state.json."""
+    waiting_res = _mcp_call_tool(mcp_url, mcp_token, "list_waiting", {}, timeout=15.0)
+    raw_waiting = waiting_res.get("waiting") or []
+    if not isinstance(raw_waiting, list):
+        raw_waiting = []
+
+    resolved_home = _resolve_dsbot_home(dsbot_home)
+    state = _read_dsbot_state_readonly(resolved_home)
+    index = _build_state_session_index(state) if state else ({}, {}, {}, {})
+    state_questions = state.get("questions") if isinstance(state.get("questions"), dict) else {}
+    state_views = state.get("views") if isinstance(state.get("views"), dict) else {}
+
+    allowed_bot_ids: set[str] = set()
+    allowed_bot_names: set[str] = set()
+    allowed_checked = False
+    if state_questions or state_views:
+        try:
+            bots_res = _mcp_call_tool(mcp_url, mcp_token, "list_bots", {}, timeout=15.0)
+            bots_list = bots_res.get("bots")
+            if isinstance(bots_list, list):
+                allowed_checked = True
+                for b in bots_list:
+                    if not isinstance(b, dict) or b.get("private") is True:
+                        continue
+                    bid = str(b.get("id") or "").strip()
+                    bname = str(b.get("name") or "").strip().lower()
+                    if bid:
+                        allowed_bot_ids.add(bid)
+                    if bname:
+                        allowed_bot_names.add(bname)
+        except Exception:
+            allowed_checked = False
+
+    scoped_allowed_ids = allowed_bot_ids if (allowed_checked and allowed_bot_ids) else None
+
+    normalized: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    seen_view_sids: set[str] = set()
+    seen_view_ids: set[str] = set()
+
+    for raw in raw_waiting:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("kind") or "").strip().lower()
+        if not kind:
+            continue
+        bot = str(raw.get("bot") or "").strip()
+        group = str(raw.get("group") or "").strip()
+        card_id = str(raw.get("id") or "").strip()
+
+        if kind == "question":
+            q_text = str(raw.get("question") or "").strip()
+            matched = _match_state_entry(
+                state_questions,
+                index,
+                card_id=card_id,
+                bot_name=bot,
+                text_key="question",
+                text_val=q_text,
+                allowed_bot_ids=scoped_allowed_ids,
+            )
+            state_q = matched[1] if matched else {}
+            if not card_id and state_q.get("id"):
+                card_id = str(state_q["id"]).strip()
+            if not q_text and state_q.get("question"):
+                q_text = str(state_q["question"]).strip()
+            if not group and matched and matched[2]:
+                group = matched[2]
+            detail = str(raw.get("detail") or state_q.get("detail") or "").strip()
+            options = _extract_option_labels(raw.get("options"))
+            if not options:
+                options = _extract_option_labels(state_q.get("options"))
+            multi_select = (
+                bool(raw["multiSelect"])
+                if "multiSelect" in raw
+                else bool(state_q.get("multiSelect") is True)
+            )
+            allow_custom = (
+                bool(raw["allowCustom"])
+                if "allowCustom" in raw
+                else bool(state_q.get("allowCustom") is not False)
+            )
+            item: dict[str, Any] = {
+                "kind": "question",
+                "bot": bot,
+                "question": q_text,
+                "options": options,
+                "multiSelect": multi_select,
+                "allowCustom": allow_custom,
+            }
+            if card_id:
+                item["id"] = card_id
+            if group:
+                item["group"] = group
+            if detail:
+                item["detail"] = detail
+
+        elif kind == "view":
+            title = str(raw.get("title") or "").strip()
+            matched = _match_state_entry(
+                state_views,
+                index,
+                card_id=card_id,
+                bot_name=bot,
+                text_key="title",
+                text_val=title,
+                skip_issue_draft=True,
+                allowed_bot_ids=scoped_allowed_ids,
+            )
+            state_v = matched[1] if matched else {}
+            if matched:
+                seen_view_sids.add(matched[0])
+            if not card_id and state_v.get("id"):
+                card_id = str(state_v["id"]).strip()
+            if not title and state_v.get("title"):
+                title = str(state_v["title"]).strip()
+            if not group and matched and matched[2]:
+                group = matched[2]
+            state_opts, state_detail = (
+                _extract_view_options_and_detail(state_v) if state_v else ([], "")
+            )
+            options = _extract_option_labels(raw.get("options")) or state_opts
+            detail = str(raw.get("detail") or state_detail or "").strip()
+            item = {
+                "kind": "view",
+                "bot": bot,
+                "title": title,
+                "options": options,
+            }
+            if card_id:
+                item["id"] = card_id
+                seen_view_ids.add(card_id)
+            if group:
+                item["group"] = group
+            if detail:
+                item["detail"] = detail
+
+        elif kind == "approval":
+            tool = str(raw.get("tool") or "").strip()
+            reason = str(raw.get("reason") or "").strip()
+            item = {
+                "kind": "approval",
+                "bot": bot,
+                "tool": tool,
+                "reason": reason,
+                "options": [],
+            }
+            if card_id:
+                item["id"] = card_id
+            if group:
+                item["group"] = group
+        else:
+            item = dict(raw)
+
+        item["idempotency_key"] = _compute_waiting_idempotency_key(item)
+        if item["idempotency_key"] not in seen_keys:
+            seen_keys.add(item["idempotency_key"])
+            normalized.append(item)
+
+    if state_views and allowed_checked:
+        extra_views: list[dict[str, Any]] = []
+        for sid, view_obj in state_views.items():
+            sid_s = str(sid)
+            if sid_s in seen_view_sids or not isinstance(view_obj, dict):
+                continue
+            if view_obj.get("issueDraft") is not None:
+                continue
+            vid = str(view_obj.get("id") or "").strip()
+            if vid and vid in seen_view_ids:
+                continue
+            bot_id, bot_name, is_private, group_name = _resolve_state_entry_owner(
+                sid_s, view_obj, index
+            )
+            if is_private:
+                continue
+            if allowed_bot_ids:
+                if not bot_id or bot_id not in allowed_bot_ids:
+                    continue
+            else:
+                if not bot_name or bot_name.lower() not in allowed_bot_names:
+                    continue
+            title = str(view_obj.get("title") or "").strip()
+            options, detail = _extract_view_options_and_detail(view_obj)
+            v_item: dict[str, Any] = {
+                "kind": "view",
+                "bot": bot_name,
+                "title": title,
+                "options": options,
+            }
+            if vid:
+                v_item["id"] = vid
+            if group_name:
+                v_item["group"] = group_name
+            if detail:
+                v_item["detail"] = detail
+            v_item["idempotency_key"] = _compute_waiting_idempotency_key(v_item)
+            if v_item["idempotency_key"] not in seen_keys:
+                seen_keys.add(v_item["idempotency_key"])
+                extra_views.append(v_item)
+
+        extra_views.sort(
+            key=lambda v: (
+                str(v.get("bot") or "").lower(),
+                str(v.get("title") or ""),
+                v["idempotency_key"],
+            )
+        )
+        normalized.extend(extra_views)
+
+    return normalized
+
+
+def _format_waiting_items(items: list[dict[str, Any]]) -> str:
+    blocks: list[str] = []
+    for item in items:
+        kind = str(item.get("kind") or "waiting").strip().lower()
+        bot = str(item.get("bot") or "").strip()
+        group = str(item.get("group") or "").strip()
+        who = (
+            f"{bot} (group {group})"
+            if bot and group
+            else (bot or group or "DS Bot")
+        )
+        card_id = str(item.get("id") or "").strip()
+        id_suffix = f" [id={card_id}]" if card_id else ""
+        lines: list[str] = []
+        if kind == "question":
+            q_text = str(item.get("question") or "").strip()
+            lines.append(f"Question from {who}: {q_text}{id_suffix}")
+            detail = str(item.get("detail") or "").strip()
+            if detail:
+                lines.append(f"Detail: {detail}")
+            opts = item.get("options") or []
+            if opts:
+                lines.append("Options:")
+                for idx, opt in enumerate(opts, 1):
+                    lines.append(f"{idx}. {opt}")
+        elif kind == "view":
+            title = str(item.get("title") or "").strip()
+            lines.append(f"View from {who}: {title}{id_suffix}")
+            detail = str(item.get("detail") or "").strip()
+            if detail:
+                lines.append(f"Detail: {detail}")
+            opts = item.get("options") or []
+            if opts:
+                lines.append("Options:")
+                for idx, opt in enumerate(opts, 1):
+                    lines.append(f"{idx}. {opt}")
+        elif kind == "approval":
+            tool = str(item.get("tool") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            tool_part = f" (tool={tool})" if tool else ""
+            reason_part = f": {reason}" if reason else ""
+            lines.append(f"Approval needed for {who}{tool_part}{reason_part}{id_suffix}")
+        else:
+            lines.append(f"{kind} from {who}{id_suffix}")
+        blocks.append("\n".join(lines))
+    return "[LOCAL_DSBOT_WAITING] " + "\n\n".join(blocks)
+
+
+class WaitingSyncManager:
+    """Mirrors local DS Bot waiting cards into broker decisions and reconciles closed ones."""
+
+    def __init__(
+        self,
+        broker: Optional[BrokerClient] = None,
+        mcp_url: Optional[str] = None,
+        mcp_token: Optional[str] = None,
+        dsbot_home: Optional[str] = None,
+        mcp_token_file: Optional[str] = None,
+        *,
+        client: Optional[BrokerClient] = None,
+    ) -> None:
+        resolved_broker = broker if broker is not None else client
+        if resolved_broker is None:
+            raise ValueError("broker/client is required")
+        self.broker = resolved_broker
+        self.client = resolved_broker
+        self.mcp_url = (mcp_url or "").strip()
+        self.mcp_token = mcp_token
+        self.dsbot_home = dsbot_home
+        self.mcp_token_file = mcp_token_file
+        self._lock = threading.Lock()
+        self._initialized = False
+        self._last_snapshot_hash = ""
+        self._last_active_keys: tuple[str, ...] = ()
+        self._last_item_hashes: dict[str, str] = {}
+
+    @staticmethod
+    def _item_to_decision_payload(item: dict[str, Any]) -> dict[str, Any]:
+        kind = str(item.get("kind") or "decision").strip().lower()
+        if kind not in ("decision", "question", "view", "approval"):
+            kind = "decision"
+        bot = str(item.get("bot") or "").strip() or None
+        group = str(item.get("group") or "").strip() or None
+        card_id = str(item.get("id") or "").strip() or None
+        options = [
+            redact_secrets(str(o).strip())[:300]
+            for o in (item.get("options") or [])
+            if str(o).strip()
+        ]
+        if kind == "question":
+            raw_title = str(item.get("question") or "").strip()
+            title = redact_secrets(raw_title or f"Question from {bot or 'DS Bot'}")[:300]
+            context = redact_secrets(str(item.get("detail") or "").strip())[:8000]
+        elif kind == "view":
+            raw_title = str(item.get("title") or "").strip()
+            title = redact_secrets(raw_title or f"View from {bot or 'DS Bot'}")[:300]
+            context = redact_secrets(str(item.get("detail") or "").strip())[:8000]
+        elif kind == "approval":
+            tool = str(item.get("tool") or "").strip()
+            reason = redact_secrets(str(item.get("reason") or "").strip())
+            if tool and reason:
+                raw_title = f"Approve {tool}: {reason}"
+            elif reason:
+                raw_title = reason
+            elif tool:
+                raw_title = f"Approve {tool}"
+            else:
+                raw_title = f"Approval needed for {bot or 'DS Bot'}"
+            title = redact_secrets(raw_title)[:300]
+            ctx_lines = [
+                p
+                for p in (
+                    f"Tool: {tool}" if tool else "",
+                    f"Reason: {reason}" if reason else "",
+                )
+                if p
+            ]
+            context = redact_secrets("\n".join(ctx_lines))[:8000]
+            options = []
+        else:
+            title = redact_secrets(str(item.get("title") or f"Waiting in {bot or 'DS Bot'}"))[:300]
+            context = redact_secrets(str(item.get("detail") or "").strip())[:8000]
+
+        return {
+            "source_env": "mac_waiting",
+            "kind": kind,
+            "card_id": card_id,
+            "title": title,
+            "context": context,
+            "options": options,
+            "source_bot": bot,
+            "source_room": group,
+            "idempotency_key": str(item["idempotency_key"]),
+        }
+
+    def sync_once(self, force: bool = False) -> bool:
+        tok = _read_mcp_token(self.mcp_token, self.mcp_token_file)
+        if not self.mcp_url or not tok:
+            return False
+
+        items = collect_local_waiting_items(
+            self.mcp_url, tok, dsbot_home=self.dsbot_home
+        )
+        payloads = sorted(
+            (self._item_to_decision_payload(item) for item in items),
+            key=lambda p: p["idempotency_key"],
+        )
+        active_keys = tuple(p["idempotency_key"] for p in payloads)
+        snapshot_json = json.dumps(payloads, sort_keys=True, ensure_ascii=False)
+        snapshot_hash = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+
+        with self._lock:
+            if (
+                not force
+                and self._initialized
+                and snapshot_hash == self._last_snapshot_hash
+            ):
+                return False
+
+            new_item_hashes: dict[str, str] = {}
+            posted_any = False
+            for payload in payloads:
+                key = payload["idempotency_key"]
+                item_hash = hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+                new_item_hashes[key] = item_hash
+                if (
+                    force
+                    or not self._initialized
+                    or self._last_item_hashes.get(key) != item_hash
+                ):
+                    code, data = self.broker.post(
+                        "/v1/decisions", payload, timeout=10.0
+                    )
+                    if code not in (200, 201) or not data.get("ok"):
+                        raise RuntimeError(
+                            f"POST /v1/decisions failed ({code}): {redact_secrets(str(data))}"
+                        )
+                    self._last_item_hashes[key] = item_hash
+                    posted_any = True
+
+            reconcile_needed = (
+                force
+                or not self._initialized
+                or active_keys != self._last_active_keys
+            )
+            if reconcile_needed:
+                code, data = self.broker.post(
+                    "/v1/worker/decisions/reconcile",
+                    {"active_keys": list(active_keys)},
+                    timeout=10.0,
+                )
+                if code != 200 or not data.get("ok"):
+                    raise RuntimeError(
+                        f"POST /v1/worker/decisions/reconcile failed ({code}): {redact_secrets(str(data))}"
+                    )
+                posted_any = True
+
+            self._initialized = True
+            self._last_snapshot_hash = snapshot_hash
+            self._last_active_keys = active_keys
+            self._last_item_hashes = new_item_hashes
+            return posted_any
+
+    def sync(self, force: bool = False) -> bool:
+        return self.sync_once(force=force)
+
+
 _PROBE_SESSION_PREFIXES = ("e2e-", "probe-", "healthcheck-")
 _PROBE_BANNER_PREFIX = "[Automated healthcheck probe from mac-job-worker"
 
@@ -1066,7 +1891,32 @@ def run_dsbot_via_local_mcp(
     *,
     empty_done_grace_sec: float = 45.0,
     poll_sleep_sec: float = 1.0,
+    dsbot_home: Optional[str] = None,
 ) -> dict[str, Optional[str]]:
+    if str(job.get("role") or "").strip() == "decision_resume":
+        raw_task = str(job.get("task") or "")
+        hdr_match = _DECISION_RESOLVED_HEADER_RE.search(raw_task)
+        hdr_text = hdr_match.group(1) if hdr_match else ""
+        card_match = _DECISION_CARD_ID_RE.search(hdr_text) if hdr_text else None
+        kind_match = _DECISION_KIND_RE.search(hdr_text) if hdr_text else None
+        card_id = card_match.group(1).strip().strip("\"'") if card_match else ""
+        card_kind = kind_match.group(1).strip().strip("\"'").lower() if kind_match else ""
+        if card_id and card_id.lower() != "none":
+            resolved_home = _resolve_dsbot_home(dsbot_home)
+            state = _read_dsbot_state_readonly(resolved_home)
+            if _is_card_closed_in_state(state, card_id, kind=card_kind):
+                closed_summary = (
+                    f"[DECISION_ALREADY_CLOSED_LOCALLY card_id={card_id}] "
+                    "Skipped duplicate resume because card was already answered in DS Bot.app."
+                )
+                return {
+                    "status": "succeeded",
+                    "result_summary": closed_summary,
+                    "summary": closed_summary,
+                    "pr_url": None,
+                    "error": None,
+                }
+
     task = _frame_dsbot_task(job, str(job["task"]))
     timeout_sec = max(1, int(job.get("timeout_sec") or 900))
     deadline = time.monotonic() + timeout_sec
@@ -1133,11 +1983,13 @@ def run_dsbot_via_local_mcp(
     empty_grace_deadline = min(deadline, time.monotonic() + max(0.0, empty_done_grace_sec))
 
     def _matching_waiting() -> list[dict[str, Any]]:
-        w_res = _mcp_call_tool(mcp_url, mcp_token, "list_waiting", {}, timeout=15.0)
+        items = collect_local_waiting_items(
+            mcp_url, mcp_token, dsbot_home=dsbot_home
+        )
         wanted = match_key[1].lower()
         return [
             item
-            for item in (w_res.get("waiting") or [])
+            for item in items
             if str(item.get(match_key[0]) or "").strip().lower() == wanted
         ]
 
@@ -1203,10 +2055,7 @@ def run_dsbot_via_local_mcp(
         if txt:
             summary_parts.append(f"[{msg.get('from') or target_label}] {txt}")
     if waiting_for_target:
-        summary_parts.append(
-            "[LOCAL_DSBOT_WAITING] "
-            + json.dumps(waiting_for_target, ensure_ascii=False)
-        )
+        summary_parts.append(_format_waiting_items(waiting_for_target))
 
     if not summary_parts:
         return {
@@ -1231,6 +2080,7 @@ def default_dsbot_runner(
     headless_patch: str,
     mcp_url: Optional[str] = None,
     mcp_token: Optional[str] = None,
+    dsbot_home: Optional[str] = None,
 ) -> dict[str, Optional[str]]:
     resolved_url = (
         mcp_url
@@ -1250,7 +2100,9 @@ def default_dsbot_runner(
 
     if engine != "headless-cli" and resolved_url and resolved_token:
         try:
-            return run_dsbot_via_local_mcp(job, resolved_url, resolved_token)
+            return run_dsbot_via_local_mcp(
+                job, resolved_url, resolved_token, dsbot_home=dsbot_home
+            )
         except _McpBeforeSendError as exc:
             if engine == "local-mcp":
                 return {
@@ -1493,7 +2345,9 @@ class MacJobWorker:
             "job_id": job_id,
             "worker_id": self.worker_id,
             "status": res.get("status") or "failed",
-            "result_summary": redact_secrets(res.get("result_summary") or ""),
+            "result_summary": redact_secrets(
+                res.get("result_summary") or res.get("summary") or ""
+            ),
             "pr_url": res.get("pr_url"),
             "error": redact_secrets(res.get("error") or "") if res.get("error") else None,
             "workspace_id": res.get("workspace_id"),
@@ -1654,17 +2508,18 @@ def main() -> None:
         claim_wait_sec=claim_wait_sec,
     )
 
+    dsbot_home = os.path.expanduser(os.environ.get("DSBOT_HOME", "/Users/chief/.ds-bot"))
+    mcp_url = os.environ.get("LOCAL_DSBOT_MCP_URL", "http://127.0.0.1:8797/mcp").strip()
+    mcp_token_file = os.environ.get(
+        "LOCAL_DSBOT_MCP_TOKEN_FILE", "/Users/chief/.mac-job-worker/dsbot-mcp-token"
+    )
+
     context_sync_enabled = (
         os.environ.get("CONTEXT_SYNC_ENABLED", "1").strip().lower()
         not in ("0", "false", "no", "off")
     )
     context_sync: Optional[ContextSyncManager] = None
     if context_sync_enabled:
-        dsbot_home = os.path.expanduser(os.environ.get("DSBOT_HOME", "~/.ds-bot"))
-        mcp_url = os.environ.get("LOCAL_DSBOT_MCP_URL", "http://127.0.0.1:8797/mcp").strip()
-        mcp_token_file = os.environ.get(
-            "LOCAL_DSBOT_MCP_TOKEN_FILE", "/Users/chief/.mac-job-worker/dsbot-mcp-token"
-        )
         context_sync = ContextSyncManager(
             broker=broker,
             dsbot_home=dsbot_home,
@@ -1672,6 +2527,43 @@ def main() -> None:
             mcp_url=mcp_url,
             mcp_token_file=mcp_token_file,
         )
+
+    waiting_sync_enabled = (
+        os.environ.get("WAITING_SYNC_ENABLED", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    waiting_sync_interval = max(
+        0.5, float(os.environ.get("WAITING_SYNC_INTERVAL_SEC", "5.0"))
+    )
+    waiting_sync: Optional[WaitingSyncManager] = None
+    if waiting_sync_enabled:
+        waiting_sync = WaitingSyncManager(
+            broker=broker,
+            mcp_url=mcp_url,
+            mcp_token=None,
+            dsbot_home=dsbot_home,
+            mcp_token_file=mcp_token_file,
+        )
+    last_waiting_sync = 0.0
+    waiting_sync_run_lock = threading.Lock()
+    connected_event = threading.Event()
+
+    def _run_waiting_sync(phase: str, *, min_interval: float = 0.0) -> None:
+        nonlocal last_waiting_sync
+        if waiting_sync is None:
+            return
+        with waiting_sync_run_lock:
+            now = time.monotonic()
+            if min_interval > 0.0 and (now - last_waiting_sync) < min_interval:
+                return
+            try:
+                waiting_sync.sync_once()
+                last_waiting_sync = time.monotonic()
+            except Exception as exc:
+                last_waiting_sync = time.monotonic()
+                sys.stderr.write(
+                    f"[worker] waiting-sync {phase} error: {redact_secrets(str(exc))}\n"
+                )
 
     stop_event = threading.Event()
     if handoff_tunnel is not None:
@@ -1692,6 +2584,15 @@ def main() -> None:
                     sys.stderr.write(f"[worker] context-sync loop error: {exc}\n")
 
         threading.Thread(target=context_sync_loop, daemon=True).start()
+
+    if waiting_sync is not None:
+
+        def waiting_sync_loop() -> None:
+            while not stop_event.wait(waiting_sync_interval):
+                if connected_event.is_set():
+                    _run_waiting_sync("loop", min_interval=waiting_sync_interval)
+
+        threading.Thread(target=waiting_sync_loop, daemon=True).start()
 
     def handle_sig(signum: int, _frame: Any) -> None:
         sys.stderr.write(f"[worker] received signal {signum}, shutting down\n")
@@ -1716,6 +2617,7 @@ def main() -> None:
                 n = worker.reconcile()
                 sys.stderr.write(f"[worker] reconciled {n} job(s)\n")
                 reconciled_once = True
+                connected_event.set()
             except Exception as exc:
                 sys.stderr.write(f"[worker] reconcile error: {exc}\n")
                 stop_event.wait(poll_interval)
@@ -1730,6 +2632,7 @@ def main() -> None:
                         )
                 except Exception as exc:
                     sys.stderr.write(f"[worker] context-sync connect error: {exc}\n")
+            _run_waiting_sync("connect")
 
         try:
             flushed = worker.flush_pending_decisions(spool_file)
@@ -1747,13 +2650,16 @@ def main() -> None:
                         context_sync.sync_to_ec2()
                     except Exception as exc:
                         sys.stderr.write(f"[worker] post-job context-sync error: {exc}\n")
+                _run_waiting_sync("post-job")
                 continue
+            _run_waiting_sync("idle", min_interval=waiting_sync_interval)
             if claim_wait_sec > 0.0 and (time.monotonic() - poll_t0) >= min(
                 claim_wait_sec * 0.5, 5.0
             ):
                 continue
         except Exception as exc:
             sys.stderr.write(f"[worker] poll error: {exc}\n")
+            _run_waiting_sync("idle-error", min_interval=waiting_sync_interval)
         stop_event.wait(poll_interval)
 
     tunnel.stop()

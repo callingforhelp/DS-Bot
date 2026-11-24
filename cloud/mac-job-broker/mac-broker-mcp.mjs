@@ -158,6 +158,15 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Optional list of choices (e.g. ["Approve", "Reject"]).',
         },
+        kind: {
+          type: 'string',
+          enum: ['decision', 'question', 'view', 'approval'],
+          description: 'Optional decision kind (defaults to "decision").',
+        },
+        card_id: {
+          type: 'string',
+          description: 'Optional local card identifier.',
+        },
         source_room: { type: 'string', description: 'Group chat or room name.' },
         source_bot: { type: 'string', description: 'Bot name requesting the decision.' },
         idempotency_key: { type: 'string', description: 'Optional dedup key.' },
@@ -185,6 +194,15 @@ const TOOLS = [
         decision_id: { type: 'string' },
         choice: { type: 'string' },
         note: { type: 'string' },
+        aws_session_id: {
+          type: 'string',
+          description: 'Optional AWS session ID to associate with any auto-resumed Mac job.',
+        },
+        auto_resume: {
+          type: 'boolean',
+          description:
+            'Whether to auto-enqueue a decision_resume job for the originating bot/group (default true).',
+        },
       },
       required: ['decision_id', 'choice'],
     },
@@ -307,6 +325,8 @@ async function handleToolCall(name, args) {
       title: args?.title || '',
       context: args?.context || '',
       options: Array.isArray(args?.options) ? args.options : [],
+      ...(args?.kind !== undefined ? { kind: args.kind } : {}),
+      ...(args?.card_id !== undefined ? { card_id: args.card_id } : {}),
       source_env: 'aws',
       source_room: args?.source_room,
       source_bot: args?.source_bot,
@@ -331,13 +351,23 @@ async function handleToolCall(name, args) {
   }
   if (name === 'decision_resolve') {
     const id = encodeURIComponent(String(args?.decision_id || ''));
-    const res = await brokerRequest('POST', `/v1/decisions/${id}/resolve`, {
+    const payload = {
       choice: args?.choice || '',
       note: args?.note || '',
       resolved_by: 'aws-ds-bot',
-    });
+      aws_session_id: args?.aws_session_id || DEFAULT_SESSION_ID,
+      ...(args?.auto_resume !== undefined ? { auto_resume: Boolean(args.auto_resume) } : {}),
+    };
+    const res = await brokerRequest('POST', `/v1/decisions/${id}/resolve`, payload);
+    const out =
+      res.data && typeof res.data === 'object' && res.data.decision
+        ? {
+            ...res.data,
+            resume_job_id: res.data.decision.resume_job_id ?? null,
+          }
+        : res.data;
     return {
-      content: [{ type: 'text', text: JSON.stringify(res.data, null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(out, null, 2) }],
       isError: res.status >= 400,
     };
   }

@@ -26,6 +26,12 @@ DEFAULT_LEASE_TTL_SEC = 120
 DEFAULT_JOB_EXPIRY_SEC = 24 * 3600
 WORKER_ONLINE_WINDOW_SEC = 75
 SWEEP_INTERVAL_SEC = 15
+ALLOWED_DECISION_KINDS = ("decision", "question", "view", "approval")
+ALLOWED_DECISION_SOURCE_ENVS = ("aws", "mac", "mac_waiting")
+
+
+class DecisionConflictError(Exception):
+    """Raised when a decision cannot be resolved via the requested path."""
 
 SECRET_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -190,6 +196,9 @@ class BrokerStore:
                     title TEXT NOT NULL,
                     context TEXT NOT NULL DEFAULT '',
                     options TEXT NOT NULL DEFAULT '[]',
+                    kind TEXT NOT NULL DEFAULT 'decision',
+                    card_id TEXT,
+                    resume_job_id TEXT,
                     source_env TEXT NOT NULL DEFAULT 'aws',
                     source_room TEXT,
                     source_bot TEXT,
@@ -246,6 +255,17 @@ class BrokerStore:
                     self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
                     pass
+            existing_decision_cols = {
+                row["name"]
+                for row in self.conn.execute("PRAGMA table_info(decisions)").fetchall()
+            }
+            for col, col_type in [
+                ("kind", "TEXT NOT NULL DEFAULT 'decision'"),
+                ("card_id", "TEXT"),
+                ("resume_job_id", "TEXT"),
+            ]:
+                if col not in existing_decision_cols:
+                    self.conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {col_type}")
             self.conn.commit()
 
     def close(self) -> None:
@@ -297,7 +317,10 @@ class BrokerStore:
             )
             self.conn.commit()
 
-    def enqueue_job(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    def _enqueue_job_locked(
+        self, payload: dict[str, Any], *, commit: bool = True
+    ) -> tuple[dict[str, Any], bool]:
+        """Insert a job while the caller already holds self._lock."""
         target = str(payload.get("target") or "dsbot").strip()
         if target in ("paradev", "paradev_register"):
             raise ValueError(
@@ -330,50 +353,56 @@ class BrokerStore:
         expires_at = now + DEFAULT_JOB_EXPIRY_SEC
         job_id = f"mac_{uuid.uuid4().hex[:12]}"
 
-        with self._lock:
-            if idem_key:
-                existing = self.conn.execute(
-                    "SELECT * FROM jobs WHERE idempotency_key = ?", (idem_key,)
-                ).fetchone()
-                if existing is not None:
-                    return self._row_to_dict(existing), False
-            self.conn.execute(
-                """
-                INSERT INTO jobs (
-                    job_id, idempotency_key, target, task, repo, branch,
-                    timeout_sec, aws_session_id, status, attempt,
-                    workspace_id, terminal_id, agent, cwd, local_only, role,
-                    bot, group_name, created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    idem_key,
-                    target,
-                    redact_secrets(task),
-                    repo,
-                    branch,
-                    timeout_sec,
-                    aws_session_id,
-                    workspace_id,
-                    terminal_id,
-                    agent,
-                    cwd,
-                    local_only,
-                    role,
-                    bot,
-                    group_name,
-                    now,
-                    now,
-                    expires_at,
-                ),
-            )
-            self.conn.commit()
-            row = self.conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+        if idem_key:
+            existing = self.conn.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = ?", (idem_key,)
             ).fetchone()
-        self.notify_job_available()
+            if existing is not None:
+                return self._row_to_dict(existing), False
+        self.conn.execute(
+            """
+            INSERT INTO jobs (
+                job_id, idempotency_key, target, task, repo, branch,
+                timeout_sec, aws_session_id, status, attempt,
+                workspace_id, terminal_id, agent, cwd, local_only, role,
+                bot, group_name, created_at, updated_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                idem_key,
+                target,
+                redact_secrets(task),
+                repo,
+                branch,
+                timeout_sec,
+                aws_session_id,
+                workspace_id,
+                terminal_id,
+                agent,
+                cwd,
+                local_only,
+                role,
+                bot,
+                group_name,
+                now,
+                now,
+                expires_at,
+            ),
+        )
+        if commit:
+            self.conn.commit()
+        row = self.conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
         return self._row_to_dict(row), True
+
+    def enqueue_job(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        with self._lock:
+            job, created = self._enqueue_job_locked(payload, commit=True)
+        if created:
+            self.notify_job_available()
+        return job, created
 
     def notify_job_available(self) -> None:
         with self._job_event_cond:
@@ -705,6 +734,12 @@ class BrokerStore:
                 d["options"] = json.loads(d["options"])
             except Exception:
                 d["options"] = []
+        elif not isinstance(d.get("options"), list):
+            d["options"] = []
+        raw_kind = str(d.get("kind") or "").strip().lower()
+        d["kind"] = raw_kind if raw_kind in ALLOWED_DECISION_KINDS else "decision"
+        d.setdefault("card_id", None)
+        d.setdefault("resume_job_id", None)
         return d
 
     def create_decision(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -714,9 +749,20 @@ class BrokerStore:
         context = redact_secrets(str(payload.get("context") or "").strip())[:8000]
         raw_opts = payload.get("options")
         options = [redact_secrets(str(o).strip())[:300] for o in raw_opts] if isinstance(raw_opts, list) else []
+        options_json = json.dumps(options)
         source_env = str(payload.get("source_env") or "aws").strip()
-        if source_env not in ("aws", "mac"):
+        if source_env not in ALLOWED_DECISION_SOURCE_ENVS:
             source_env = "aws"
+        raw_kind = payload.get("kind")
+        if raw_kind is None or str(raw_kind).strip() == "":
+            kind = "decision"
+        else:
+            kind = str(raw_kind).strip().lower()
+            if kind not in ALLOWED_DECISION_KINDS:
+                raise ValueError(
+                    "kind must be one of: decision, question, view, approval"
+                )
+        card_id = str(payload.get("card_id") or "").strip()[:200] or None
         source_room = str(payload.get("source_room") or "").strip() or None
         source_bot = str(payload.get("source_bot") or "").strip() or None
         aws_session_id = str(payload.get("aws_session_id") or "").strip() or None
@@ -731,21 +777,65 @@ class BrokerStore:
                     "SELECT * FROM decisions WHERE idempotency_key = ?", (idem_key,)
                 ).fetchone()
                 if existing is not None:
+                    if (
+                        existing["status"] == "pending"
+                        and existing["source_env"] == "mac_waiting"
+                    ):
+                        existing_kind = (
+                            str(existing["kind"] or "decision").strip().lower()
+                            or "decision"
+                        )
+                        changed = (
+                            existing["title"] != title
+                            or existing["context"] != context
+                            or existing["options"] != options_json
+                            or existing_kind != kind
+                            or existing["card_id"] != card_id
+                        )
+                        if changed:
+                            self.conn.execute(
+                                """
+                                UPDATE decisions
+                                SET title = ?,
+                                    context = ?,
+                                    options = ?,
+                                    kind = ?,
+                                    card_id = ?,
+                                    updated_at = ?
+                                WHERE decision_id = ?
+                                """,
+                                (
+                                    title,
+                                    context,
+                                    options_json,
+                                    kind,
+                                    card_id,
+                                    now,
+                                    existing["decision_id"],
+                                ),
+                            )
+                            self.conn.commit()
+                            existing = self.conn.execute(
+                                "SELECT * FROM decisions WHERE decision_id = ?",
+                                (existing["decision_id"],),
+                            ).fetchone()
                     return self._decision_to_dict(existing), False
             self.conn.execute(
                 """
                 INSERT INTO decisions (
                     decision_id, idempotency_key, title, context, options,
-                    source_env, source_room, source_bot, aws_session_id,
+                    kind, card_id, source_env, source_room, source_bot, aws_session_id,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     decision_id,
                     idem_key,
                     title,
                     context,
-                    json.dumps(options),
+                    options_json,
+                    kind,
+                    card_id,
                     source_env,
                     source_room,
                     source_bot,
@@ -784,24 +874,138 @@ class BrokerStore:
                 ).fetchall()
         return [self._decision_to_dict(r) for r in rows]
 
+    def reconcile_mac_waiting_decisions(
+        self, active_keys: list[str]
+    ) -> list[dict[str, Any]]:
+        """Close pending mac_waiting decisions absent from active_keys without resuming."""
+        if not isinstance(active_keys, list) or not all(
+            isinstance(k, str) for k in active_keys
+        ):
+            raise ValueError("active_keys must be a list of strings")
+        active_set = {k.strip() for k in active_keys if k.strip()}
+        now = time.time()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM decisions
+                WHERE status = 'pending' AND source_env = 'mac_waiting'
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+            to_resolve = [
+                r
+                for r in rows
+                if r["idempotency_key"] is None or r["idempotency_key"] not in active_set
+            ]
+            if not to_resolve:
+                return []
+            updated_rows = []
+            for row in to_resolve:
+                dec_id = row["decision_id"]
+                self.conn.execute(
+                    """
+                    UPDATE decisions
+                    SET status = 'resolved',
+                        choice = '(answered in DS Bot.app)',
+                        note = 'Closed locally in DS Bot desktop UI',
+                        resolved_by = 'mac-dsbot-ui',
+                        resolved_at = ?,
+                        updated_at = ?
+                    WHERE decision_id = ? AND status = 'pending'
+                    """,
+                    (now, now, dec_id),
+                )
+                updated = self.conn.execute(
+                    "SELECT * FROM decisions WHERE decision_id = ?", (dec_id,)
+                ).fetchone()
+                if updated is not None:
+                    updated_rows.append(updated)
+            self.conn.commit()
+        return [self._decision_to_dict(r) for r in updated_rows]
+
     def resolve_decision(
         self,
         decision_id: str,
         choice: str,
         note: str = "",
         resolved_by: str = "user",
+        *,
+        aws_session_id: Optional[str] = None,
+        auto_resume: bool = True,
     ) -> Optional[dict[str, Any]]:
         clean_choice = redact_secrets(str(choice or "").strip())[:500]
         if not clean_choice:
             raise ValueError("choice is required")
         clean_note = redact_secrets(str(note or "").strip())[:4000]
+        clean_resolved_by = str(resolved_by or "user").strip() or "user"
         now = time.time()
+        job_created = False
+
         with self._lock:
             row = self.conn.execute(
                 "SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)
             ).fetchone()
             if row is None:
                 return None
+            kind_val = str(row["kind"] or "decision").strip().lower() or "decision"
+            if kind_val == "approval":
+                raise DecisionConflictError(
+                    "Host tool approvals can only be granted in DS Bot.app on the Mac"
+                )
+            if row["status"] == "resolved":
+                return self._decision_to_dict(row)
+
+            try:
+                options = json.loads(row["options"] or "[]")
+            except Exception:
+                options = []
+            if not isinstance(options, list):
+                options = []
+            if clean_choice.isascii() and clean_choice.isdigit():
+                idx = int(clean_choice)
+                if 1 <= idx <= len(options):
+                    expanded = redact_secrets(str(options[idx - 1]).strip())[:500]
+                    if expanded:
+                        clean_choice = expanded
+
+            source_room = str(row["source_room"] or "").strip()
+            source_bot = str(row["source_bot"] or "").strip()
+            resume_job_id = row["resume_job_id"]
+            if (
+                auto_resume
+                and clean_resolved_by != "mac-dsbot-ui"
+                and (source_bot or source_room)
+            ):
+                card_id_val = str(row["card_id"] or "").strip() or "none"
+                task_lines = [
+                    f"[USER_DECISION_RESOLVED decision_id={decision_id} kind={kind_val} card_id={card_id_val}]",
+                    f"Question: {row['title']}",
+                    f"Selected answer: {clean_choice}",
+                ]
+                if clean_note:
+                    task_lines.append(f"Note: {clean_note}")
+                task_lines.append("")
+                task_lines.append("Proceed with this decision and report the outcome.")
+                resume_task = "\n".join(task_lines)
+                resolved_session_id = (
+                    str(aws_session_id or "").strip()
+                    or str(row["aws_session_id"] or "").strip()
+                    or f"decision:{decision_id}"
+                )
+                job_payload: dict[str, Any] = {
+                    "target": "dsbot",
+                    "role": "decision_resume",
+                    "task": resume_task,
+                    "aws_session_id": resolved_session_id,
+                    "idempotency_key": f"decision_resume:{decision_id}",
+                }
+                if source_room:
+                    job_payload["group"] = source_room
+                else:
+                    job_payload["bot"] = source_bot
+                job, job_created = self._enqueue_job_locked(job_payload, commit=False)
+                resume_job_id = job["job_id"]
+
             self.conn.execute(
                 """
                 UPDATE decisions
@@ -810,15 +1014,27 @@ class BrokerStore:
                     note = ?,
                     resolved_by = ?,
                     resolved_at = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    resume_job_id = ?
                 WHERE decision_id = ?
                 """,
-                (clean_choice, clean_note, resolved_by, now, now, decision_id),
+                (
+                    clean_choice,
+                    clean_note,
+                    clean_resolved_by,
+                    now,
+                    now,
+                    resume_job_id,
+                    decision_id,
+                ),
             )
             self.conn.commit()
             updated = self.conn.execute(
                 "SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)
             ).fetchone()
+
+        if job_created:
+            self.notify_job_available()
         return self._decision_to_dict(updated)
 
     def add_cloud_note(
@@ -1345,6 +1561,27 @@ def make_handler(
                 self._send_json(200, {"ok": True, "jobs": jobs})
                 return
 
+            if path == "/v1/worker/decisions/reconcile":
+                if not self._check_auth(worker_token):
+                    return
+                if "active_keys" not in body:
+                    self._send_json(
+                        400, {"ok": False, "error": "active_keys list is required"}
+                    )
+                    return
+                try:
+                    resolved_list = store.reconcile_mac_waiting_decisions(
+                        body.get("active_keys")
+                    )
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(
+                    200,
+                    {"ok": True, "resolved": resolved_list, "count": len(resolved_list)},
+                )
+                return
+
             if path == "/v1/worker/heartbeat":
                 if not self._check_auth(worker_token):
                     return
@@ -1404,13 +1641,35 @@ def make_handler(
                 if not self._check_auth(producer_token, worker_token):
                     return
                 dec_id = path[len("/v1/decisions/") : -len("/resolve")].strip("/")
+                raw_auto_resume = body.get("auto_resume")
+                if raw_auto_resume is None:
+                    auto_resume = True
+                elif isinstance(raw_auto_resume, str):
+                    auto_resume = raw_auto_resume.strip().lower() not in (
+                        "false",
+                        "0",
+                        "no",
+                        "off",
+                        "",
+                    )
+                else:
+                    auto_resume = bool(raw_auto_resume)
                 try:
                     dec = store.resolve_decision(
                         dec_id,
                         choice=str(body.get("choice") or ""),
                         note=str(body.get("note") or ""),
                         resolved_by=str(body.get("resolved_by") or "user"),
+                        aws_session_id=(
+                            str(body.get("aws_session_id")).strip()
+                            if body.get("aws_session_id") is not None
+                            else None
+                        ),
+                        auto_resume=auto_resume,
                     )
+                except DecisionConflictError as exc:
+                    self._send_json(409, {"ok": False, "error": str(exc)})
+                    return
                 except ValueError as exc:
                     self._send_json(400, {"ok": False, "error": str(exc)})
                     return

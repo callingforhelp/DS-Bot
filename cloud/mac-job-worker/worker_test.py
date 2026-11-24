@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import subprocess
@@ -7,6 +8,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler
 from unittest.mock import patch
 
@@ -22,11 +25,13 @@ from worker import (
     HttpHealthProbe,
     MacJobWorker,
     SsmTunnelManager,
+    WaitingSyncManager,
     _acquire_dir_lock,
     _ensure_local_git_repo,
     _frame_dsbot_task,
     _release_dir_lock,
     build_mac_context_markdown,
+    collect_local_waiting_items,
     default_dsbot_runner,
     default_git_sync_runner,
     is_authorized_local_path,
@@ -450,10 +455,12 @@ class LocalMacWorkerTest(unittest.TestCase):
             for k in (
                 "WORKER_STATE_DIR",
                 "MAC_WORKER_ALLOWED_ROOTS",
+                "DSBOT_HOME",
             )
         }
         for k in ("WORKER_STATE_DIR", "MAC_WORKER_ALLOWED_ROOTS"):
             os.environ.pop(k, None)
+        os.environ["DSBOT_HOME"] = os.path.join(self.tmpdir.name, "isolated-dsbot-home")
 
     def tearDown(self) -> None:
         for k, v in self._saved_env.items():
@@ -1183,6 +1190,801 @@ class LocalMacWorkerTest(unittest.TestCase):
             ec2_srv.shutdown()
             ec2_srv.server_close()
             store.close()
+
+    def _start_fake_mcp(self, tool_fn, *, expected_token: str = "tok"):
+        class FakeMcp(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                if self.headers.get("Authorization") != f"Bearer {expected_token}":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                params = req.get("params") or {}
+                tool_name = params.get("name") or ""
+                args = params.get("arguments") or {}
+                res = tool_fn(tool_name, args)
+                body = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req.get("id"),
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(res)}],
+                            "structuredContent": res,
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeMcp)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+
+    @staticmethod
+    def _write_state_json(dsbot_home: str, payload: dict) -> str:
+        bot_dir = os.path.join(dsbot_home, "bot")
+        os.makedirs(bot_dir, exist_ok=True)
+        path = os.path.join(bot_dir, "state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return path
+
+    def test_collect_local_waiting_items_enriches_state_and_scopes_bots(self) -> None:
+        with tempfile.TemporaryDirectory() as dsbot_home:
+            self._write_state_json(
+                dsbot_home,
+                {
+                    "bots": {
+                        "b1": {"id": "b1", "name": "Chief", "sessionId": "s1"},
+                        "b2": {"id": "b2", "name": "PrivateBot", "private": True, "sessionId": "s2"},
+                        "b3": {"id": "b3", "name": "UnlistedBot", "sessionId": "s3"},
+                    },
+                    "rooms": {
+                        "r1": {"id": "r1", "name": "Ops", "sessions": {"b1": "gs1"}},
+                    },
+                    "sessions": {
+                        "s_alias": {"self": "b1"},
+                    },
+                    "questions": {
+                        "s1": {
+                            "id": "q-111",
+                            "question": "Deploy to prod?",
+                            "detail": "Migration v4 ready",
+                            "options": [
+                                {"label": "Ship it", "description": "Deploy now"},
+                                {"label": "Hold"},
+                            ],
+                            "multiSelect": False,
+                            "allowCustom": False,
+                        },
+                        "s2": {
+                            "id": "q-priv",
+                            "question": "Secret question?",
+                            "options": [{"label": "Secret"}],
+                        },
+                    },
+                    "views": {
+                        "s_alias": {
+                            "id": "v-222",
+                            "title": "Release gate",
+                            "view": {
+                                "type": "stack",
+                                "children": [
+                                    {"type": "text", "text": "All checks green"},
+                                    {
+                                        "type": "confirm",
+                                        "confirmLabel": "Approve Release",
+                                        "cancelLabel": "Abort",
+                                    },
+                                ],
+                            },
+                        },
+                        "s1_issue": {
+                            "id": "v-issue",
+                            "title": "DS Bot issue draft",
+                            "callSessionId": "s1",
+                            "issueDraft": {"title": "bug"},
+                        },
+                        "s2": {
+                            "id": "v-priv",
+                            "title": "Private View",
+                            "view": {"type": "submit", "label": "SecretAction"},
+                        },
+                        "s3": {
+                            "id": "v-unlisted",
+                            "title": "Unlisted View",
+                            "view": {"type": "submit", "label": "UnlistedAction"},
+                        },
+                    },
+                },
+            )
+
+            def handle_tool(name: str, _args: dict) -> dict:
+                if name == "list_waiting":
+                    return {
+                        "waiting": [
+                            {"kind": "question", "bot": "Chief", "question": "Deploy to prod?"},
+                            {
+                                "kind": "approval",
+                                "bot": "Chief",
+                                "group": "Ops",
+                                "tool": "bash",
+                                "reason": "restart nginx",
+                            },
+                        ],
+                        "answerIn": "DS Bot on this computer",
+                    }
+                if name == "list_bots":
+                    return {
+                        "bots": [
+                            {"id": "b1", "name": "Chief", "main": True, "working": False}
+                        ]
+                    }
+                return {}
+
+            srv, mcp_url = self._start_fake_mcp(handle_tool)
+            try:
+                items = collect_local_waiting_items(mcp_url, "tok", dsbot_home=dsbot_home)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+            by_kind = {item["kind"]: item for item in items}
+            self.assertEqual(len(items), 3)
+            self.assertEqual(set(by_kind.keys()), {"question", "approval", "view"})
+
+            q = by_kind["question"]
+            self.assertEqual(q["id"], "q-111")
+            self.assertEqual(q["detail"], "Migration v4 ready")
+            self.assertEqual(q["options"], ["Ship it", "Hold"])
+            self.assertFalse(q["multiSelect"])
+            self.assertFalse(q["allowCustom"])
+            self.assertEqual(q["idempotency_key"], "dsbot_q:q-111")
+
+            v = by_kind["view"]
+            self.assertEqual(v["id"], "v-222")
+            self.assertEqual(v["bot"], "Chief")
+            self.assertEqual(v["title"], "Release gate")
+            self.assertEqual(v["detail"], "All checks green")
+            self.assertEqual(v["options"], ["Approve Release", "Abort"])
+            self.assertEqual(v["idempotency_key"], "dsbot_v:v-222")
+
+            a = by_kind["approval"]
+            expected_a_hash = hashlib.sha1(b"restart nginx").hexdigest()[:12]
+            self.assertEqual(a["idempotency_key"], f"dsbot_a:Chief:Ops:bash:{expected_a_hash}")
+
+            # Corrupt state.json gracefully falls back to deterministic question hash key
+            corrupt_path = os.path.join(dsbot_home, "bot", "state.json")
+            with open(corrupt_path, "w", encoding="utf-8") as f:
+                f.write("{broken json")
+            srv2, mcp_url2 = self._start_fake_mcp(handle_tool)
+            try:
+                fallback_items = collect_local_waiting_items(mcp_url2, "tok", dsbot_home=dsbot_home)
+            finally:
+                srv2.shutdown()
+                srv2.server_close()
+            q_fb = next(i for i in fallback_items if i["kind"] == "question")
+            expected_q_hash = hashlib.sha1(b"Deploy to prod?").hexdigest()[:12]
+            self.assertEqual(q_fb["idempotency_key"], f"dsbot_q:Chief:{expected_q_hash}")
+
+    def test_dsbot_runner_formats_waiting_question_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as dsbot_home:
+            self._write_state_json(
+                dsbot_home,
+                {
+                    "bots": {"b1": {"id": "b1", "name": "Chief", "sessionId": "s1"}},
+                    "questions": {
+                        "s1": {
+                            "id": "q-fmt",
+                            "question": "Choose deploy target?",
+                            "detail": "Staging passes smoke suite",
+                            "options": [{"label": "Staging"}, {"label": "Production"}],
+                        }
+                    },
+                },
+            )
+
+            def handle_tool(name: str, _args: dict) -> dict:
+                if name == "send_to_bot":
+                    return {"sent": True, "after": 100}
+                if name == "wait_for_reply":
+                    return {"done": False, "working": True, "after": 100, "messages": []}
+                if name == "list_waiting":
+                    return {
+                        "waiting": [
+                            {
+                                "kind": "question",
+                                "bot": "Chief",
+                                "question": "Choose deploy target?",
+                            }
+                        ]
+                    }
+                return {}
+
+            srv, mcp_url = self._start_fake_mcp(handle_tool)
+            try:
+                res = run_dsbot_via_local_mcp(
+                    {"task": "deploy", "bot": "Chief", "timeout_sec": 10},
+                    mcp_url,
+                    "tok",
+                    dsbot_home=dsbot_home,
+                )
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+            self.assertEqual(res["status"], "succeeded")
+            summary = res["result_summary"]
+            self.assertTrue(summary.startswith("[LOCAL_DSBOT_WAITING] "))
+            self.assertIn("Choose deploy target?", summary)
+            self.assertIn("Staging passes smoke suite", summary)
+            self.assertIn("1. Staging", summary)
+            self.assertIn("2. Production", summary)
+            self.assertIn("q-fmt", summary)
+            self.assertNotIn('{"kind":', summary)
+
+    def test_waiting_sync_manager_mirrors_dedups_and_reconciles(self) -> None:
+        from broker import BrokerStore, ThreadingHTTPServer as THS, make_handler as mk_handler
+
+        store = BrokerStore(os.path.join(self.tmpdir.name, "jobs-waiting.db"))
+        srv = THS(
+            ("127.0.0.1", 0),
+            mk_handler(store, producer_token="prod-tok", worker_token="work-tok"),
+        )
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as dsbot_home:
+                state_holder = {
+                    "waiting": [
+                        {
+                            "kind": "question",
+                            "id": "q-sync-1",
+                            "bot": "Chief",
+                            "question": "Use blue-green?",
+                            "detail": "Zero downtime rollout",
+                            "options": ["Blue-green", "Rolling"],
+                        },
+                        {
+                            "kind": "approval",
+                            "id": "a-sync-1",
+                            "bot": "Coder",
+                            "group": "Ops",
+                            "tool": "bash",
+                            "reason": "systemctl restart app",
+                        },
+                        {
+                            "kind": "view",
+                            "id": "v-sync-1",
+                            "bot": "Chief",
+                            "title": "Confirm checklist",
+                        },
+                    ]
+                }
+                self._write_state_json(
+                    dsbot_home,
+                    {
+                        "bots": {"b1": {"id": "b1", "name": "Chief", "sessionId": "s1"}},
+                        "views": {
+                            "s1": {
+                                "id": "v-sync-1",
+                                "title": "Confirm checklist",
+                                "view": {
+                                    "type": "confirm",
+                                    "confirmLabel": "Confirm",
+                                    "cancelLabel": "Cancel",
+                                },
+                            }
+                        },
+                    },
+                )
+
+                def handle_tool(name: str, _args: dict) -> dict:
+                    if name == "list_waiting":
+                        return {"waiting": list(state_holder["waiting"])}
+                    if name == "list_bots":
+                        return {"bots": [{"id": "b1", "name": "Chief"}]}
+                    return {}
+
+                mcp_srv, mcp_url = self._start_fake_mcp(handle_tool)
+                try:
+                    raw_client = BrokerClient(
+                        f"http://127.0.0.1:{srv.server_address[1]}", "work-tok"
+                    )
+                    http_calls: list[tuple[str, dict]] = []
+
+                    class CountingBrokerClient:
+                        def post(self, path: str, payload: dict, timeout: float = 15.0):
+                            http_calls.append((path, payload))
+                            return raw_client.post(path, payload, timeout=timeout)
+
+                        def get(self, path: str, timeout: float = 15.0):
+                            return raw_client.get(path, timeout=timeout)
+
+                    aws_dec, _ = store.create_decision(
+                        {
+                            "title": "Unrelated AWS decision",
+                            "source_env": "aws",
+                            "idempotency_key": "aws-keep-1",
+                        }
+                    )
+
+                    sync_mgr = WaitingSyncManager(
+                        client=CountingBrokerClient(),
+                        mcp_url=mcp_url,
+                        mcp_token="tok",
+                        dsbot_home=dsbot_home,
+                    )
+                    self.assertTrue(sync_mgr.sync_once())
+                    post_paths = [p for p, _ in http_calls]
+                    self.assertEqual(post_paths.count("/v1/decisions"), 3)
+                    self.assertEqual(post_paths.count("/v1/worker/decisions/reconcile"), 1)
+
+                    pending = store.list_decisions(status="pending", limit=20)
+                    by_key = {d["idempotency_key"]: d for d in pending}
+                    self.assertIn("dsbot_q:q-sync-1", by_key)
+                    self.assertIn("dsbot_a:a-sync-1", by_key)
+                    self.assertIn("dsbot_v:v-sync-1", by_key)
+                    self.assertIn("aws-keep-1", by_key)
+                    self.assertEqual(by_key["dsbot_q:q-sync-1"]["kind"], "question")
+                    self.assertEqual(by_key["dsbot_q:q-sync-1"]["card_id"], "q-sync-1")
+                    self.assertEqual(by_key["dsbot_q:q-sync-1"]["options"], ["Blue-green", "Rolling"])
+                    self.assertEqual(by_key["dsbot_a:a-sync-1"]["kind"], "approval")
+                    self.assertEqual(by_key["dsbot_a:a-sync-1"]["source_room"], "Ops")
+                    self.assertEqual(by_key["dsbot_v:v-sync-1"]["kind"], "view")
+                    self.assertEqual(by_key["dsbot_v:v-sync-1"]["options"], ["Confirm", "Cancel"])
+
+                    # Unchanged snapshot -> zero broker HTTP calls
+                    http_calls.clear()
+                    self.assertFalse(sync_mgr.sync_once())
+                    self.assertEqual(http_calls, [])
+
+                    # Remove question and view locally -> reconcile closes them without resume jobs
+                    state_holder["waiting"] = [state_holder["waiting"][1]]
+                    self._write_state_json(
+                        dsbot_home,
+                        {"bots": {"b1": {"id": "b1", "name": "Chief", "sessionId": "s1"}}, "views": {}},
+                    )
+                    http_calls.clear()
+                    self.assertTrue(sync_mgr.sync_once())
+                    self.assertEqual([p for p, _ in http_calls], ["/v1/worker/decisions/reconcile"])
+                    self.assertEqual(http_calls[0][1], {"active_keys": ["dsbot_a:a-sync-1"]})
+
+                    q_after = store.get_decision(by_key["dsbot_q:q-sync-1"]["decision_id"])
+                    v_after = store.get_decision(by_key["dsbot_v:v-sync-1"]["decision_id"])
+                    a_after = store.get_decision(by_key["dsbot_a:a-sync-1"]["decision_id"])
+                    self.assertEqual(q_after["status"], "resolved")
+                    self.assertEqual(q_after["resolved_by"], "mac-dsbot-ui")
+                    self.assertIsNone(q_after["resume_job_id"])
+                    self.assertEqual(v_after["status"], "resolved")
+                    self.assertEqual(v_after["resolved_by"], "mac-dsbot-ui")
+                    self.assertEqual(a_after["status"], "pending")
+                    self.assertEqual(store.get_decision(aws_dec["decision_id"])["status"], "pending")
+                    self.assertEqual(store.stats(), {})  # zero decision_resume jobs created
+
+                    # Empty waiting list -> reconciles with active_keys=[]
+                    state_holder["waiting"] = []
+                    http_calls.clear()
+                    self.assertTrue(sync_mgr.sync_once())
+                    self.assertEqual(http_calls, [("/v1/worker/decisions/reconcile", {"active_keys": []})])
+                    self.assertEqual(store.get_decision(a_after["decision_id"])["status"], "resolved")
+                    self.assertEqual(store.get_decision(aws_dec["decision_id"])["status"], "pending")
+
+                    # Still empty -> zero broker HTTP calls
+                    http_calls.clear()
+                    self.assertFalse(sync_mgr.sync_once())
+                    self.assertEqual(http_calls, [])
+                finally:
+                    mcp_srv.shutdown()
+                    mcp_srv.server_close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            store.close()
+
+    def test_closed_loop_waiting_sync_resolve_and_worker_resume(self) -> None:
+        from broker import BrokerStore, ThreadingHTTPServer as THS, make_handler as mk_handler
+
+        store = BrokerStore(os.path.join(self.tmpdir.name, "jobs-loop.db"))
+        srv = THS(
+            ("127.0.0.1", 0),
+            mk_handler(store, producer_token="prod-tok", worker_token="work-tok"),
+        )
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as dsbot_home:
+                self._write_state_json(
+                    dsbot_home,
+                    {
+                        "bots": {"b1": {"id": "b1", "name": "Chief", "sessionId": "s1"}},
+                        "questions": {
+                            "s1": {
+                                "id": "q-e2e-1",
+                                "question": "Ship PR #42?",
+                                "detail": "All tests green",
+                                "options": [{"label": "Ship it"}, {"label": "Abort"}],
+                            }
+                        },
+                    },
+                )
+                mcp_calls: list[tuple[str, dict]] = []
+
+                def handle_tool(name: str, args: dict) -> dict:
+                    mcp_calls.append((name, args))
+                    if name == "list_waiting":
+                        if any(c[0] == "send_to_bot" for c in mcp_calls):
+                            return {"waiting": []}
+                        return {
+                            "waiting": [
+                                {"kind": "question", "bot": "Chief", "question": "Ship PR #42?"}
+                            ]
+                        }
+                    if name == "send_to_bot":
+                        return {"sent": True, "after": 2000}
+                    if name == "wait_for_reply":
+                        return {
+                            "done": True,
+                            "working": False,
+                            "after": 2500,
+                            "messages": [
+                                {
+                                    "kind": "bot",
+                                    "from": "Chief",
+                                    "text": "Shipped PR #42 per Slack decision!",
+                                    "time": 2500,
+                                }
+                            ],
+                        }
+                    return {}
+
+                mcp_srv, mcp_url = self._start_fake_mcp(handle_tool)
+                try:
+                    broker_url = f"http://127.0.0.1:{srv.server_address[1]}"
+                    client = BrokerClient(broker_url, "work-tok")
+                    sync_mgr = WaitingSyncManager(
+                        broker=client,
+                        mcp_url=mcp_url,
+                        mcp_token="tok",
+                        dsbot_home=dsbot_home,
+                    )
+                    self.assertTrue(sync_mgr.sync_once())
+
+                    pending = store.list_decisions(status="pending", limit=10)
+                    self.assertEqual(len(pending), 1)
+                    dec_id = pending[0]["decision_id"]
+
+                    req = urllib.request.Request(
+                        f"{broker_url}/v1/decisions/{dec_id}/resolve",
+                        data=json.dumps(
+                            {
+                                "choice": "1",
+                                "note": "LGTM ship now",
+                                "resolved_by": "slack:U123",
+                            }
+                        ).encode("utf-8"),
+                        method="POST",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": "Bearer prod-tok",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=10.0) as resp:
+                        self.assertEqual(resp.status, 200)
+                        resolved = json.loads(resp.read().decode("utf-8"))["decision"]
+
+                    self.assertEqual(resolved["choice"], "Ship it")
+                    resume_job_id = resolved["resume_job_id"]
+                    self.assertTrue(resume_job_id)
+
+                    worker = MacJobWorker(
+                        broker=client,
+                        worker_id="mac-e2e",
+                        state_dir=os.path.join(self.tmpdir.name, "worker-e2e"),
+                        dsbot_runner=lambda job: default_dsbot_runner(
+                            job,
+                            "/nonexistent/dsh",
+                            "/nonexistent/patch.yml",
+                            mcp_url=mcp_url,
+                            mcp_token="tok",
+                            dsbot_home=dsbot_home,
+                        ),
+                    )
+                    done_payload = worker.poll_once()
+                    self.assertIsNotNone(done_payload)
+                    self.assertEqual(done_payload["status"], "succeeded")
+                    self.assertIn("Shipped PR #42 per Slack decision!", done_payload["result_summary"])
+
+                    sent_calls = [args for name, args in mcp_calls if name == "send_to_bot"]
+                    self.assertEqual(len(sent_calls), 1)
+                    self.assertEqual(sent_calls[0]["bot"], "Chief")
+                    self.assertIn("card_id=q-e2e-1", sent_calls[0]["text"])
+                    self.assertIn("Selected answer: Ship it", sent_calls[0]["text"])
+                    self.assertIn("Note: LGTM ship now", sent_calls[0]["text"])
+
+                    job_row = store.get_job(resume_job_id)
+                    self.assertEqual(job_row["status"], "succeeded")
+                    self.assertIn("Shipped PR #42 per Slack decision!", job_row["result_summary"])
+                finally:
+                    mcp_srv.shutdown()
+                    mcp_srv.server_close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            store.close()
+
+    def test_decision_resume_skips_when_card_already_closed_locally(self) -> None:
+        from broker import BrokerStore, ThreadingHTTPServer as THS, make_handler as mk_handler
+
+        for closed_shape in (
+            {"s1": {"q-race-1": "replied"}},
+            {"q-race-1": "dismissed"},
+            ["q-race-1"],
+        ):
+            with tempfile.TemporaryDirectory() as dsbot_home:
+                self._write_state_json(
+                    dsbot_home,
+                    {"bots": {}, "closedCards": closed_shape},
+                )
+                mcp_calls: list[tuple[str, dict]] = []
+
+                def handle_tool(name: str, args: dict) -> dict:
+                    mcp_calls.append((name, args))
+                    return {}
+
+                mcp_srv, mcp_url = self._start_fake_mcp(handle_tool)
+                try:
+                    res = run_dsbot_via_local_mcp(
+                        {
+                            "role": "decision_resume",
+                            "bot": "Chief",
+                            "task": (
+                                "[USER_DECISION_RESOLVED decision_id=dec_1 kind=question card_id=q-race-1]\n"
+                                "Question: Ship?\nSelected answer: Yes\n"
+                            ),
+                        },
+                        mcp_url,
+                        "tok",
+                        dsbot_home=dsbot_home,
+                    )
+                    self.assertEqual(mcp_calls, [])
+                    self.assertEqual(res["status"], "succeeded")
+                    self.assertIn("[DECISION_ALREADY_CLOSED_LOCALLY card_id=q-race-1]", res["summary"])
+                    self.assertIn("[DECISION_ALREADY_CLOSED_LOCALLY card_id=q-race-1]", res["result_summary"])
+                finally:
+                    mcp_srv.shutdown()
+                    mcp_srv.server_close()
+
+        # Also verify end-to-end through broker + MacJobWorker.poll_once()
+        store = BrokerStore(os.path.join(self.tmpdir.name, "jobs-race.db"))
+        srv = THS(
+            ("127.0.0.1", 0),
+            mk_handler(store, producer_token="prod-tok", worker_token="work-tok"),
+        )
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as dsbot_home:
+                self._write_state_json(
+                    dsbot_home,
+                    {"closedCards": {"s1": {"q-race-e2e": "replied"}}},
+                )
+                dec, _ = store.create_decision(
+                    {
+                        "title": "Race question",
+                        "options": ["Yes", "No"],
+                        "kind": "question",
+                        "card_id": "q-race-e2e",
+                        "source_env": "mac_waiting",
+                        "source_bot": "Chief",
+                    }
+                )
+                resolved = store.resolve_decision(dec["decision_id"], "1", resolved_by="slack:U1")
+                mcp_calls2: list[str] = []
+                mcp_srv2, mcp_url2 = self._start_fake_mcp(
+                    lambda name, _args: (mcp_calls2.append(name), {})[1]
+                )
+                try:
+                    worker = MacJobWorker(
+                        broker=BrokerClient(f"http://127.0.0.1:{srv.server_address[1]}", "work-tok"),
+                        worker_id="mac-race",
+                        state_dir=os.path.join(self.tmpdir.name, "worker-race"),
+                        dsbot_runner=lambda job: default_dsbot_runner(
+                            job,
+                            "/nonexistent/dsh",
+                            "/nonexistent/patch.yml",
+                            mcp_url=mcp_url2,
+                            mcp_token="tok",
+                            dsbot_home=dsbot_home,
+                        ),
+                    )
+                    done_payload = worker.poll_once()
+                    self.assertIsNotNone(done_payload)
+                    self.assertEqual(done_payload["status"], "succeeded")
+                    self.assertEqual(mcp_calls2, [])
+                    job_row = store.get_job(resolved["resume_job_id"])
+                    self.assertIn("[DECISION_ALREADY_CLOSED_LOCALLY card_id=q-race-e2e]", job_row["result_summary"])
+                finally:
+                    mcp_srv2.shutdown()
+                    mcp_srv2.server_close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            store.close()
+
+    def test_decision_resume_skips_when_question_or_view_absent_from_state(self) -> None:
+        cases = [
+            (
+                "answerQuestion_deleted_from_questions",
+                {"bots": {}, "questions": {}, "closedCards": {}},
+                "question",
+                "q-ans-1",
+            ),
+            (
+                "closeCard_callId_mismatch",
+                {
+                    "bots": {},
+                    "questions": {"s_other": {"id": "q-other"}},
+                    "closedCards": {"s1": {"call_xyz": "dismissed"}},
+                },
+                "question",
+                "q-callid-1",
+            ),
+            (
+                "answerView_deleted_from_views",
+                {"bots": {}, "views": {}, "closedCards": {}},
+                "view",
+                "v-ans-1",
+            ),
+        ]
+        for label, state_payload, kind, card_id in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as dsbot_home:
+                    self._write_state_json(dsbot_home, state_payload)
+                    mcp_calls: list[str] = []
+                    mcp_srv, mcp_url = self._start_fake_mcp(
+                        lambda name, _args: (mcp_calls.append(name), {})[1]
+                    )
+                    try:
+                        res = run_dsbot_via_local_mcp(
+                            {
+                                "role": "decision_resume",
+                                "bot": "Chief",
+                                "task": (
+                                    f"[USER_DECISION_RESOLVED decision_id=dec_1 kind={kind} card_id={card_id}]\n"
+                                    "Question: Ship?\nSelected answer: Yes\n"
+                                ),
+                            },
+                            mcp_url,
+                            "tok",
+                            dsbot_home=dsbot_home,
+                        )
+                        self.assertEqual(mcp_calls, [])
+                        self.assertEqual(res["status"], "succeeded")
+                        self.assertIn(
+                            f"[DECISION_ALREADY_CLOSED_LOCALLY card_id={card_id}]",
+                            res["result_summary"],
+                        )
+                    finally:
+                        mcp_srv.shutdown()
+                        mcp_srv.server_close()
+
+        # Negative check: still-open question in state.questions proceeds with send_to_bot
+        with tempfile.TemporaryDirectory() as dsbot_home:
+            self._write_state_json(
+                dsbot_home,
+                {
+                    "bots": {"b1": {"id": "b1", "name": "Chief", "sessionId": "s1"}},
+                    "questions": {"s1": {"id": "q-still-open", "question": "Ship?"}},
+                    "closedCards": {},
+                },
+            )
+            mcp_calls2: list[str] = []
+
+            def handle_open(name: str, _args: dict) -> dict:
+                mcp_calls2.append(name)
+                if name == "send_to_bot":
+                    return {"sent": True, "after": 100}
+                if name == "wait_for_reply":
+                    return {
+                        "done": True,
+                        "working": False,
+                        "after": 150,
+                        "messages": [{"kind": "bot", "from": "Chief", "text": "Resumed!", "time": 150}],
+                    }
+                return {}
+
+            mcp_srv2, mcp_url2 = self._start_fake_mcp(handle_open)
+            try:
+                res2 = run_dsbot_via_local_mcp(
+                    {
+                        "role": "decision_resume",
+                        "bot": "Chief",
+                        "task": (
+                            "[USER_DECISION_RESOLVED decision_id=dec_2 kind=question card_id=q-still-open]\n"
+                            "Question: Ship?\nSelected answer: Yes\n"
+                        ),
+                    },
+                    mcp_url2,
+                    "tok",
+                    dsbot_home=dsbot_home,
+                )
+                self.assertIn("send_to_bot", mcp_calls2)
+                self.assertEqual(res2["status"], "succeeded")
+                self.assertIn("Resumed!", res2["result_summary"])
+            finally:
+                mcp_srv2.shutdown()
+                mcp_srv2.server_close()
+
+    def test_collect_local_waiting_items_blocks_duplicate_name_out_of_scope_bot(self) -> None:
+        with tempfile.TemporaryDirectory() as dsbot_home:
+            self._write_state_json(
+                dsbot_home,
+                {
+                    "bots": {
+                        "b_out": {"id": "b_out", "name": "Coder", "sessionId": "s_out"},
+                        "b_in": {"id": "b_in", "name": "Coder", "sessionId": "s_in"},
+                    },
+                    "questions": {
+                        "s_out": {
+                            "id": "q-out",
+                            "question": "Deploy?",
+                            "detail": "Out-of-scope secret detail",
+                            "options": [{"label": "LeakOpt"}],
+                        },
+                        "s_in": {
+                            "id": "q-in",
+                            "question": "Deploy?",
+                            "detail": "In-scope detail",
+                            "options": [{"label": "SafeOpt"}],
+                        },
+                    },
+                    "views": {
+                        "s_out": {
+                            "id": "v-out",
+                            "title": "Out-of-scope view",
+                            "view": {"type": "submit", "label": "LeakButton"},
+                        },
+                        "s_in": {
+                            "id": "v-in",
+                            "title": "In-scope view",
+                            "view": {"type": "submit", "label": "SafeButton"},
+                        },
+                    },
+                },
+            )
+
+            def handle_tool(name: str, _args: dict) -> dict:
+                if name == "list_waiting":
+                    return {
+                        "waiting": [
+                            {"kind": "question", "bot": "Coder", "question": "Deploy?"}
+                        ]
+                    }
+                if name == "list_bots":
+                    return {"bots": [{"id": "b_in", "name": "Coder", "main": False}]}
+                return {}
+
+            srv, mcp_url = self._start_fake_mcp(handle_tool)
+            try:
+                items = collect_local_waiting_items(mcp_url, "tok", dsbot_home=dsbot_home)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+            self.assertEqual(len(items), 2)
+            by_kind = {item["kind"]: item for item in items}
+            self.assertEqual(by_kind["question"]["id"], "q-in")
+            self.assertEqual(by_kind["question"]["detail"], "In-scope detail")
+            self.assertEqual(by_kind["question"]["options"], ["SafeOpt"])
+            self.assertEqual(by_kind["view"]["id"], "v-in")
+            self.assertEqual(by_kind["view"]["title"], "In-scope view")
+            self.assertEqual(by_kind["view"]["options"], ["SafeButton"])
+            self.assertNotIn("v-out", [i.get("id") for i in items])
 
 
 if __name__ == "__main__":

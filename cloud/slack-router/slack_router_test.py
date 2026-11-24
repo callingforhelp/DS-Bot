@@ -20,6 +20,8 @@ sys.path.insert(0, _BROKER_DIR)
 
 from broker import BrokerStore, ThreadingHTTPServer, make_handler
 from slack_router import (
+    BrokerError,
+    BrokerHttpClient,
     BrokerProducerClient,
     RouterConfig,
     RouterStore,
@@ -342,6 +344,393 @@ class SlackRouterTest(unittest.TestCase):
         self.assertEqual(self.ec2.calls, [])
         posts = [b["text"] for m, b in self.slack_calls if m == "chat.postMessage"]
         self.assertTrue(any("lease_lost" in t for t in posts))
+
+    def test_parse_decision_commands(self) -> None:
+        d1 = parse_incoming_command("/decisions", self_user_id="U_BOT")
+        self.assertEqual(d1.action, "decisions")
+        d2 = parse_incoming_command("<@U_BOT> /waiting", self_user_id="U_BOT")
+        self.assertEqual(d2.action, "decisions")
+
+        c_num = parse_incoming_command("<@U_BOT> /decide dec_abc 2 | ship it", self_user_id="U_BOT")
+        self.assertEqual(c_num.action, "decide")
+        self.assertEqual(c_num.decision_id, "dec_abc")
+        self.assertEqual(c_num.choice, "2")
+        self.assertEqual(c_num.note, "ship it")
+
+        c_text = parse_incoming_command("/decide dec_xyz Use Postgres | safer ACID", self_user_id="U_BOT")
+        self.assertEqual(c_text.action, "decide")
+        self.assertEqual(c_text.decision_id, "dec_xyz")
+        self.assertEqual(c_text.choice, "Use Postgres")
+        self.assertEqual(c_text.note, "safer ACID")
+
+        c_missing = parse_incoming_command("/decide dec_only", self_user_id="U_BOT")
+        self.assertEqual(c_missing.action, "decide")
+        self.assertEqual(c_missing.decision_id, "dec_only")
+        self.assertEqual(c_missing.choice, "")
+
+        c_empty = parse_incoming_command("/decide", self_user_id="U_BOT")
+        self.assertEqual(c_empty.action, "decide")
+        self.assertEqual(c_empty.decision_id, "")
+        self.assertEqual(c_empty.choice, "")
+
+        a_default = parse_incoming_command("<@U_BOT> /approve dec_app | looks good", self_user_id="U_BOT")
+        self.assertEqual(a_default.action, "decide")
+        self.assertEqual(a_default.decision_id, "dec_app")
+        self.assertEqual(a_default.choice, "1")
+        self.assertEqual(a_default.note, "looks good")
+
+        a_choice = parse_incoming_command("/approve dec_app 3", self_user_id="U_BOT")
+        self.assertEqual(a_choice.action, "decide")
+        self.assertEqual(a_choice.decision_id, "dec_app")
+        self.assertEqual(a_choice.choice, "3")
+        self.assertEqual(a_choice.note, "")
+
+        a_empty = parse_incoming_command("/approve", self_user_id="U_BOT")
+        self.assertEqual(a_empty.action, "decide")
+        self.assertEqual(a_empty.decision_id, "")
+
+    def test_router_config_alert_channel_from_env(self) -> None:
+        saved = {
+            k: os.environ.get(k)
+            for k in ("SLACK_ALERT_CHANNEL", "SLACK_CHANNEL_MAP")
+        }
+        try:
+            os.environ.pop("SLACK_ALERT_CHANNEL", None)
+            os.environ["SLACK_CHANNEL_MAP"] = "C111=Chief,D222=Coder"
+            cfg1 = RouterConfig.from_env()
+            self.assertEqual(cfg1.alert_channel, "C111")
+
+            os.environ["SLACK_ALERT_CHANNEL"] = "C999"
+            cfg2 = RouterConfig.from_env()
+            self.assertEqual(cfg2.alert_channel, "C999")
+
+            os.environ.pop("SLACK_ALERT_CHANNEL", None)
+            os.environ["SLACK_CHANNEL_MAP"] = ""
+            cfg3 = RouterConfig.from_env()
+            self.assertEqual(cfg3.alert_channel, "")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_broker_client_decisions_and_status_errors(self) -> None:
+        self.assertIs(BrokerHttpClient, BrokerProducerClient)
+        self.assertIsNone(self.broker.get_decision("dec_missing"))
+
+        with self.assertRaises(BrokerError) as ctx_404:
+            self.broker.resolve_decision("dec_missing", choice="1")
+        self.assertEqual(ctx_404.exception.status_code, 404)
+
+        dec_q, _ = self.broker_store.create_decision(
+            {
+                "title": "Select deploy region",
+                "context": "Need low-latency region",
+                "options": ["us-east-1", "us-west-2"],
+                "kind": "question",
+                "source_env": "mac_waiting",
+                "source_bot": "Chief",
+            }
+        )
+        got = self.broker.get_decision(dec_q["decision_id"])
+        self.assertIsNotNone(got)
+        self.assertEqual(got["title"], "Select deploy region")
+        listed = self.broker.list_decisions(status="pending", limit=20)
+        self.assertEqual([d["decision_id"] for d in listed], [dec_q["decision_id"]])
+
+    def test_watch_pending_decisions_once_dedup_question_and_approval(self) -> None:
+        d_q, _ = self.broker_store.create_decision(
+            {
+                "title": "Pick storage engine",
+                "context": "Ledger needs transactions for multi-row updates.",
+                "options": ["SQLite", "Postgres"],
+                "kind": "question",
+                "card_id": "card_q_1",
+                "source_env": "mac_waiting",
+                "source_bot": "Coder",
+                "idempotency_key": "dsbot_q:card_q_1",
+            }
+        )
+        time.sleep(0.01)
+        d_app, _ = self.broker_store.create_decision(
+            {
+                "title": "Approve bash tool",
+                "context": "Run git status in repo",
+                "options": [],
+                "kind": "approval",
+                "card_id": "card_a_1",
+                "source_env": "mac_waiting",
+                "source_bot": "Devin Manager",
+                "idempotency_key": "dsbot_a:card_a_1",
+            }
+        )
+
+        # Disabled when alert_channel is empty
+        self.assertEqual(self.router.watch_pending_decisions_once(), 0)
+        self.assertEqual(self.slack_calls, [])
+
+        self.router.config.alert_channel = "C0CKX41QVRQ"
+        posted_count = self.router.watch_pending_decisions_once()
+        self.assertEqual(posted_count, 2)
+
+        posts = [b for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(len(posts), 2)
+        for p in posts:
+            self.assertEqual(p["channel"], "C0CKX41QVRQ")
+            self.assertNotIn("thread_ts", p)
+
+        # Oldest-first order: question then approval
+        self.assertIn(d_q["decision_id"], posts[0]["text"])
+        self.assertIn("[question]", posts[0]["text"])
+        self.assertIn("Coder", posts[0]["text"])
+        self.assertIn("Pick storage engine", posts[0]["text"])
+        self.assertIn("Ledger needs transactions", posts[0]["text"])
+        self.assertIn("1. SQLite", posts[0]["text"])
+        self.assertIn("2. Postgres", posts[0]["text"])
+        self.assertIn(f"/decide {d_q['decision_id']} 1", posts[0]["text"])
+
+        self.assertIn(d_app["decision_id"], posts[1]["text"])
+        self.assertIn("[approval]", posts[1]["text"])
+        self.assertIn("Devin Manager", posts[1]["text"])
+        self.assertIn("Approve bash tool", posts[1]["text"])
+        self.assertIn(":lock: Approve in DS Bot.app on Mac", posts[1]["text"])
+        self.assertNotIn("/decide", posts[1]["text"])
+
+        # Deduplication: second poll posts nothing
+        self.slack_calls.clear()
+        self.assertEqual(self.router.watch_pending_decisions_once(), 0)
+        self.assertEqual(self.slack_calls, [])
+
+    def test_decisions_list_and_decide_resume_closed_loop(self) -> None:
+        self.broker_store.touch_worker("mac-mini", "mini", ["dsbot"])
+        d_q, _ = self.broker_store.create_decision(
+            {
+                "title": "Which DB should we use?",
+                "context": "Need concurrent writes",
+                "options": ["SQLite", "Postgres"],
+                "kind": "question",
+                "card_id": "card_db_1",
+                "source_env": "mac_waiting",
+                "source_bot": "Coder",
+                "idempotency_key": "dsbot_q:card_db_1",
+            }
+        )
+
+        # /decisions lists pending card cleanly
+        self.router.dispatch_envelope(
+            {
+                "envelope_id": "e_dec_list",
+                "type": "events_api",
+                "payload": {
+                    "event_id": "EvDecList",
+                    "event": {
+                        "type": "message",
+                        "channel_type": "im",
+                        "channel": "D0CKFEVJF0X",
+                        "user": "U0C2NC6ARAQ",
+                        "text": "/decisions",
+                        "ts": "400.1",
+                    },
+                },
+            },
+            async_work=False,
+        )
+        posts = [b for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(len(posts), 1)
+        self.assertIn(d_q["decision_id"], posts[0]["text"])
+        self.assertIn("[question]", posts[0]["text"])
+        self.assertIn("Coder", posts[0]["text"])
+        self.assertIn("1. SQLite", posts[0]["text"])
+        self.assertIn("2. Postgres", posts[0]["text"])
+        self.assertIn(f"/decide {d_q['decision_id']} 1", posts[0]["text"])
+
+        # Incomplete /decide prints usage
+        self.slack_calls.clear()
+        self.router.dispatch_envelope(
+            {
+                "envelope_id": "e_dec_usage",
+                "type": "events_api",
+                "payload": {
+                    "event_id": "EvDecUsage",
+                    "event": {
+                        "type": "message",
+                        "channel_type": "im",
+                        "channel": "D0CKFEVJF0X",
+                        "user": "U0C2NC6ARAQ",
+                        "text": f"/decide {d_q['decision_id']}",
+                        "ts": "400.2",
+                    },
+                },
+            },
+            async_work=False,
+        )
+        usage_posts = [b["text"] for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(
+            usage_posts,
+            ["Usage: `/decide <decision_id> <choice_or_number> [| optional note]`"],
+        )
+
+        # Unknown decision returns 404 warning
+        self.slack_calls.clear()
+        self.router.dispatch_envelope(
+            {
+                "envelope_id": "e_dec_404",
+                "type": "events_api",
+                "payload": {
+                    "event_id": "EvDec404",
+                    "event": {
+                        "type": "message",
+                        "channel_type": "im",
+                        "channel": "D0CKFEVJF0X",
+                        "user": "U0C2NC6ARAQ",
+                        "text": "/decide dec_nope 1",
+                        "ts": "400.3",
+                    },
+                },
+            },
+            async_work=False,
+        )
+        miss_posts = [b["text"] for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(miss_posts, [":warning: Decision `dec_nope` was not found."])
+
+        # /decide <id> 2 | ship it resolves, tracks resume_job_id, and delivers Mac resume reply
+        self.slack_calls.clear()
+        self.router.dispatch_envelope(
+            {
+                "envelope_id": "e_dec_resolve",
+                "type": "events_api",
+                "payload": {
+                    "event_id": "EvDecResolve",
+                    "event": {
+                        "type": "message",
+                        "channel_type": "im",
+                        "channel": "D0CKFEVJF0X",
+                        "user": "U0C2NC6ARAQ",
+                        "text": f"/decide {d_q['decision_id']} 2 | ship it",
+                        "ts": "400.4",
+                        "thread_ts": "400.1",
+                    },
+                },
+            },
+            async_work=False,
+        )
+        resolved = self.broker_store.get_decision(d_q["decision_id"])
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertEqual(resolved["choice"], "Postgres")
+        self.assertEqual(resolved["note"], "ship it")
+        self.assertEqual(resolved["resolved_by"], "slack:U0C2NC6ARAQ")
+        resume_job_id = resolved["resume_job_id"]
+        self.assertTrue(resume_job_id)
+
+        tracked = self.store.get_tracked_job(resume_job_id)
+        self.assertIsNotNone(tracked)
+        self.assertEqual(tracked["thread_ts"], "400.1")
+        self.assertEqual(tracked["local_only"], 1)
+        self.assertEqual(tracked["bot_name"], "Coder")
+
+        ack_posts = [b for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(len(ack_posts), 1)
+        self.assertEqual(ack_posts[0]["thread_ts"], "400.1")
+        self.assertIn("Postgres", ack_posts[0]["text"])
+        self.assertIn(resume_job_id, ack_posts[0]["text"])
+
+        # Worker executes decision_resume job and completes it
+        claimed = self.broker_store.claim_next_job("mac-mini")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["job_id"], resume_job_id)
+        self.assertEqual(claimed["role"], "decision_resume")
+        self.assertEqual(claimed["bot"], "Coder")
+        self.assertIn("Postgres", claimed["task"])
+        self.assertIn("ship it", claimed["task"])
+
+        self.broker_store.complete_job(
+            {
+                "job_id": resume_job_id,
+                "worker_id": "mac-mini",
+                "status": "succeeded",
+                "result_summary": "RESUMED_WITH_POSTGRES_OK",
+            }
+        )
+        self.slack_calls.clear()
+        done = self.router.watch_tracked_jobs_once()
+        self.assertEqual(done, 1)
+        final_posts = [b for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(len(final_posts), 1)
+        self.assertEqual(final_posts[0]["thread_ts"], "400.1")
+        self.assertIn("RESUMED_WITH_POSTGRES_OK", final_posts[0]["text"])
+
+    def test_decide_approval_returns_lock_409(self) -> None:
+        d_app, _ = self.broker_store.create_decision(
+            {
+                "title": "Allow run_command",
+                "context": "Needs host shell access",
+                "options": [],
+                "kind": "approval",
+                "card_id": "card_lock_1",
+                "source_env": "mac_waiting",
+                "source_bot": "Devin Manager",
+                "idempotency_key": "dsbot_a:card_lock_1",
+            }
+        )
+        with self.assertRaises(BrokerError) as ctx_409:
+            self.broker.resolve_decision(d_app["decision_id"], choice="1")
+        self.assertEqual(ctx_409.exception.status_code, 409)
+
+        self.router.dispatch_envelope(
+            {
+                "envelope_id": "e_app_409",
+                "type": "events_api",
+                "payload": {
+                    "event_id": "EvApp409",
+                    "event": {
+                        "type": "message",
+                        "channel_type": "im",
+                        "channel": "D0CKFEVJF0X",
+                        "user": "U0C2NC6ARAQ",
+                        "text": f"/decide {d_app['decision_id']} 1",
+                        "ts": "500.1",
+                    },
+                },
+            },
+            async_work=False,
+        )
+        posts = [b["text"] for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(
+            posts,
+            [
+                f":lock: Cannot resolve `{d_app['decision_id']}` from Slack — host tool approvals must be approved directly in *DS Bot.app* on your Mac."
+            ],
+        )
+        self.assertEqual(self.broker_store.get_decision(d_app["decision_id"])["status"], "pending")
+
+        # /approve on approval also hits 409 lock message
+        self.slack_calls.clear()
+        self.router.dispatch_envelope(
+            {
+                "envelope_id": "e_app_409_b",
+                "type": "events_api",
+                "payload": {
+                    "event_id": "EvApp409B",
+                    "event": {
+                        "type": "message",
+                        "channel_type": "im",
+                        "channel": "D0CKFEVJF0X",
+                        "user": "U0C2NC6ARAQ",
+                        "text": f"/approve {d_app['decision_id']}",
+                        "ts": "500.2",
+                    },
+                },
+            },
+            async_work=False,
+        )
+        posts2 = [b["text"] for m, b in self.slack_calls if m == "chat.postMessage"]
+        self.assertEqual(
+            posts2,
+            [
+                f":lock: Cannot resolve `{d_app['decision_id']}` from Slack — host tool approvals must be approved directly in *DS Bot.app* on your Mac."
+            ],
+        )
 
 
 if __name__ == "__main__":

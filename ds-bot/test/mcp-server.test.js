@@ -336,3 +336,88 @@ test('a bad entry in mcp.json does not lock out the other clients, and last use 
   await rpc(url, token, { jsonrpc: '2.0', id: 3, method: 'ping' })
   assert.ok(lastUsed() >= before)
 })
+
+test('list_waiting exposes enriched question fields, in-scope views, approval ids, and keeps the 7-tool surface', async () => {
+  assert.deepEqual(
+    MCP_TOOLS.map(tool => tool.name),
+    ['list_bots', 'list_groups', 'send_to_bot', 'send_to_group', 'wait_for_reply', 'read_chat', 'list_waiting'],
+  )
+
+  const rt = fakeRuntime()
+  rt.state.bots.s4 = { id: 's4', sessionId: 's4', name: 'Ops', role: 'Ops', instructions: '', createdAt: 4 }
+  const baseSelfOf = rt.selfOf
+  rt.selfOf = id => (id === 'part-b2' ? 'b2' : id === 'issue-m1' ? 'm1' : baseSelfOf(id))
+  rt.approvalsView = () => [
+    { id: 'a1', botId: 'm1', tool: 'bash', reason: 'Run the tests' },
+    { botId: 'b2', roomId: 'r1', tool: 'write', reason: 'Edit the plan' },
+  ]
+  rt.state.questions = {
+    m1: {
+      id: 'q1',
+      question: 'Deploy target?',
+      detail: 'Pick environments to promote.',
+      options: [
+        { label: 'Staging', description: 'Pre-prod' },
+        'Production',
+        { label: '' },
+        null,
+      ],
+      multiSelect: true,
+      allowCustom: false,
+    },
+    'part-b2': {
+      question: 'Confirm rollback?',
+      detail: '   ',
+      allowCustom: true,
+    },
+    s4: { id: 'q-out', question: 'Out of scope?' },
+    p3: { id: 'q-priv', question: 'Private question?' },
+  }
+  rt.state.views = {
+    m1: { id: 'v1', title: 'Review checklist', view: { type: 'form' } },
+    b2: { title: 'Draft preview', view: { type: 'text' } },
+    'part-b2': { id: 'v2' },
+    'issue-m1': { id: 'v-issue', title: 'Report issue', issueDraft: { title: 'Bug' } },
+    s4: { id: 'v-out', title: 'Out of scope view' },
+    p3: { id: 'v-priv', title: 'Private diary view' },
+  }
+
+  const call = clientTools(rt, { id: 'c1', name: 'Cursor', bots: ['m1', 'b2', 'p3'], rooms: ['r1'] })
+  await assert.rejects(call('answer_question', { questionId: 'q1', answer: 'Staging' }), /Unknown tool/)
+
+  const res = await call('list_waiting')
+  assert.equal(res.answerIn, 'DS Bot on this computer')
+  assert.deepEqual(res.waiting, [
+    { kind: 'approval', id: 'a1', bot: 'Chief', tool: 'bash', reason: 'Run the tests' },
+    { kind: 'approval', bot: 'Scout', group: 'Launch', tool: 'write', reason: 'Edit the plan' },
+    {
+      kind: 'question',
+      id: 'q1',
+      bot: 'Chief',
+      question: 'Deploy target?',
+      detail: 'Pick environments to promote.',
+      options: ['Staging', 'Production'],
+      multiSelect: true,
+      allowCustom: false,
+    },
+    {
+      kind: 'question',
+      bot: 'Scout',
+      question: 'Confirm rollback?',
+      options: [],
+      multiSelect: false,
+      allowCustom: true,
+    },
+    { kind: 'view', id: 'v1', bot: 'Chief', title: 'Review checklist' },
+    { kind: 'view', bot: 'Scout', title: 'Draft preview' },
+    { kind: 'view', id: 'v2', bot: 'Scout', title: '' },
+  ])
+
+  // Verify allowCustom defaults to true when omitted.
+  rt.state.questions = { m1: { question: 'Default custom?' } }
+  rt.state.views = {}
+  rt.approvalsView = () => []
+  assert.deepEqual((await call('list_waiting')).waiting, [
+    { kind: 'question', bot: 'Chief', question: 'Default custom?', options: [], multiSelect: false, allowCustom: true },
+  ])
+})
