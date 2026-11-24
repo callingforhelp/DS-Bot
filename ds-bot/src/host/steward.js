@@ -151,20 +151,23 @@ export function scoreKevDecision(
   response,
   { midTurn = false, switchThreshold = 0.38, lowMargin = 0.14, highMargin = 0.24 } = {},
 ) {
-  if (!response || response.truncated === true) return { action: undefined, pSwitch: undefined, confident: false }
+  if (!response || response.truncated === true) {
+    return { action: undefined, pSwitch: undefined, confident: false, factors: undefined }
+  }
   const answers = response.answers
   const pAction = answers?.action?.probabilities?.switch
   const pSkip = answers?.skipped_or_unfinished_subtask?.noul
   const pWait = answers?.has_unanswered_question_or_wait?.noul
   const pNext = answers?.has_pending_next_step?.noul
   if (![pAction, pSkip, pWait, pNext].every(v => typeof v === 'number' && Number.isFinite(v))) {
-    return { action: undefined, pSwitch: undefined, confident: false }
+    return { action: undefined, pSwitch: undefined, confident: false, factors: undefined }
   }
+  const factors = { pAction, pSkip, pWait, pNext }
   let pSwitch = pAction * (1 - 0.7 * pSkip) * (1 - 0.55 * pWait) * (1 - 0.55 * pNext)
   if (midTurn) pSwitch *= 0.1
-  if (pSwitch >= switchThreshold + highMargin) return { action: 'switch', pSwitch, confident: true }
-  if (pSwitch <= switchThreshold - lowMargin) return { action: 'compact', pSwitch, confident: true }
-  return { action: undefined, pSwitch, confident: false }
+  if (pSwitch >= switchThreshold + highMargin) return { action: 'switch', pSwitch, confident: true, factors }
+  if (pSwitch <= switchThreshold - lowMargin) return { action: 'compact', pSwitch, confident: true, factors }
+  return { action: undefined, pSwitch, confident: false, factors }
 }
 
 /**

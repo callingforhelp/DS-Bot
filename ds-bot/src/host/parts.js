@@ -22,6 +22,8 @@ import { HANDOFF_ACK, HISTORY_SCAN_PAGES, HISTORY_TIMEOUT_MS, REPLY_KIND, SOURCE
 import { assembleLlmStream } from './models.js'
 import { compressedRelayPreview, parseReplies, relayRange, stackReplies } from '../shared/group-replies.js'
 import { CHECKPOINT_PROMPT, DEFAULT_KEV_URL, STEWARD_SYSTEM, askKevSteward, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest } from './steward.js'
+import { buildGroupTrace, collectPairRecords, saveGroupTrace } from './group-trace.js'
+import { openTasksOf } from './tasks.js'
 import { RESUME_DELAY_MS } from './resume.js'
 import { clip, createClock, escapeRegExp, estimateTokens, reminderPrompts, splitRef, textOf } from './text.js'
 import { pageThinkingMs } from './thinking.js'
@@ -193,6 +195,31 @@ export function install(rt) {
   // only after a wait that grows with each failure in a row.
   const NOTE_COOLDOWN_MS = [60_000, 300_000, 900_000]
   const SWITCH_ATTEMPTS = 5
+  const lastKevDecisions = new Map()
+
+  function isRoomBusy(room, { excludeSessionId } = {}) {
+    if (!room) return false
+    if (openTasksOf(room).length > 0) return true
+    for (const round of rt.roomProgress?.values?.() ?? []) {
+      if (round?.roomId === room.id) return true
+    }
+    const waiting = rt.waitingView?.()
+    if (waiting?.[room.id] !== undefined) return true
+    const sessionIds = [
+      room.sessionId,
+      ...(room.members ?? []).map(memberId => {
+        if (waiting?.[memberId] !== undefined) return '__WAITING__'
+        return room.sessions?.[memberId]
+      }),
+    ]
+    for (const sid of sessionIds) {
+      if (sid === '__WAITING__') return true
+      if (!sid || sid === excludeSessionId) continue
+      if (rt.live?.get(sid)?.turn !== undefined) return true
+      if (state.questions?.[sid] !== undefined || state.views?.[sid] !== undefined) return true
+    }
+    return false
+  }
   const OVERFLOW = 'CONTEXT_WINDOW_EXCEEDED'
   // A gateway or compatible endpoint that turns a request down for its size, without
   // DSH's own overflow code (#1716).
@@ -761,7 +788,10 @@ export function install(rt) {
     const local = localPart(session)
     const own = session.requestHeader()?.config
     if (!own?.provider || !own?.model) return undefined
-    const group = placeOf(agent.id)?.roomId !== undefined
+    const place = placeOf(agent.id)
+    const room = place?.roomId !== undefined ? rt.roomOf(place.roomId) : undefined
+    const group = room !== undefined
+    const effectiveMidTurn = Boolean(midTurn) || (room !== undefined && isRoomBusy(room, { excludeSessionId: agent.id }))
     const lines = []
     // Two pages is already more than STEWARD_LINES asks for; the default limit would
     // scan thousands of messages, and each decide then allocated gigabytes.
@@ -773,10 +803,10 @@ export function install(rt) {
     const checkpoints = local ? rt.localAgentContext?.(agent.id)?.compactions ?? 0 : checkpointCount(session.deriveMessages())
     const kevUrl = rt.config?.kevUrl ?? process.env.DSBOT_KEV_URL ?? (process.env.NODE_TEST_CONTEXT ? undefined : DEFAULT_KEV_URL)
     const kevResult = typeof rt.kevSteward === 'function'
-      ? await rt.kevSteward({ lines, midTurn, checkpoints, group, signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS) }).catch(() => undefined)
+      ? await rt.kevSteward({ lines, midTurn: effectiveMidTurn, checkpoints, group, signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS) }).catch(() => undefined)
       : await askKevSteward({
           lines,
-          midTurn,
+          midTurn: effectiveMidTurn,
           checkpoints,
           group,
           url: kevUrl,
@@ -784,8 +814,9 @@ export function install(rt) {
           apiKey: rt.config?.kevApiKey ?? process.env.KEV_API_KEY,
           signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS),
         })
+    if (kevResult !== undefined) lastKevDecisions.set(agent.id, kevResult)
     if (kevResult?.action === 'switch' || kevResult?.action === 'compact') return kevResult.action
-    const request = stewardRequest({ lines, midTurn, checkpoints, group })
+    const request = stewardRequest({ lines, midTurn: effectiveMidTurn, checkpoints, group })
     // A part on a local agent CLI asks its own CLI and model, in a one-off session.
     if (local) return parseDecision(await rt.localAgentAsk(agent.id, { system: STEWARD_SYSTEM, prompt: request, signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS) }))
     const route = own
@@ -1182,11 +1213,12 @@ export function install(rt) {
   // `cutoff`: the part kept being cut off at the output limit, so it moves on without
   // asking the model for a note at the same size.
   // `engine`: because the Bot now runs on something else (see engineMoved).
-  function startSwitch(agent, { resume = false, carry = [], info, joined, overflow = false, failed, bare = false, folder = false, cutoff = false, engine = false, hard = overflow || folder || engine || cutoff } = {}) {
+  function startSwitch(agent, { resume = false, carry = [], info, joined, overflow = false, failed, bare = false, folder = false, cutoff = false, engine = false, hard = overflow || folder || engine || cutoff, reason } = {}) {
     const place = placeOf(agent.id)
     if (place === undefined || switches.has(agent.id) || readOnly()) return
     const resumeOrigin = resume || place.botId === undefined ? rt.holdImOrigin?.(agent.id) : undefined
-    const job = { ...place, taskContext: rt.live.get(agent.id)?.taskContext, carry: [...carry], info, joined, resume, resumeOrigin, overflow, failed, bare, folder, engine, hard, cutoff, since: Date.now() }
+    const resolvedReason = reason ?? (overflow ? 'overflow' : cutoff ? 'cutoff' : engine ? 'engine' : folder ? 'folder' : failed !== undefined ? 'failure' : 'steward')
+    const job = { ...place, taskContext: rt.live.get(agent.id)?.taskContext, carry: [...carry], info, joined, resume, resumeOrigin, overflow, failed, bare, folder, engine, hard, cutoff, reason: resolvedReason, since: Date.now() }
     switches.set(agent.id, job)
     const done = runSwitch(agent, job)
       .catch(error => {
@@ -1441,6 +1473,37 @@ export function install(rt) {
         state.views[freshId] = pending.callId && !pending.callSessionId ? { ...pending, callSessionId: agent.id } : pending
         delete state.views[agent.id]
       }
+    }
+    const kevDecision = lastKevDecisions.get(agent.id)
+    lastKevDecisions.delete(agent.id)
+    if (effectiveRoom !== undefined && typeof rt.home === 'string' && rt.home !== '' && rt.readOnly?.() === undefined) {
+      const partStartedAt = Number(previous?.endedAt ?? effectiveRoom.createdAt ?? 0)
+      const groupRows = typeof rt.groupRows === 'function' ? rt.groupRows(effectiveRoom.id) : []
+      const pairRecords = rt.ledger?.records
+        ? collectPairRecords({
+            members: effectiveRoom.members ?? [],
+            readBook: book => rt.ledger.records(book),
+            sinceAt: partStartedAt,
+            untilAt: segment.endedAt,
+          })
+        : []
+      const trace = buildGroupTrace({
+        room: effectiveRoom,
+        bot,
+        agentId: agent.id,
+        reason: job.reason ?? 'steward',
+        tokens,
+        note: written?.note ?? noted.note,
+        kevDecision,
+        workDir: dir,
+        groupRows,
+        pairRecords,
+        startedAt: partStartedAt,
+        endedAt: segment.endedAt,
+        botNameOf: id => rt.botOf?.(id)?.name ?? String(id ?? ''),
+      })
+      await saveGroupTrace({ home: rt.home, trace })
+        .catch(error => rt.warn('ds-bot: group trace save for %s failed: %s', effectiveRoom.name, error))
     }
     await rt.save()
     // A model the user picked until now went to the earlier part, which was still the
@@ -1824,6 +1887,10 @@ export function install(rt) {
       if (place === undefined) continue
       if (switches.has(agent.id) || checking.has(agent.id)) continue
       if (rt.live?.get(agent.id)?.turn !== undefined) continue
+      if (place.roomId !== undefined) {
+        const room = rt.roomOf(place.roomId)
+        if (room === undefined || isRoomBusy(room)) continue
+      }
       const placeKey = place.botId ?? place.roomId
       if (placeKey !== undefined && rt.waitingView?.()[placeKey] !== undefined) continue
       if (state.questions?.[agent.id] !== undefined || state.views?.[agent.id] !== undefined) continue
@@ -1858,9 +1925,10 @@ export function install(rt) {
               apiKey: rt.config?.kevApiKey ?? process.env.KEV_API_KEY,
               signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS),
             })
+        if (kevResult !== undefined) lastKevDecisions.set(agent.id, kevResult)
         if (kevResult?.action !== 'switch') continue
         if (!dryRun && !switches.has(agent.id) && await canMakeRoom(agent)) {
-          startSwitch(agent, { hard: false })
+          startSwitch(agent, { hard: place.botId === undefined, reason: 'daily-sweep' })
         }
         results.push({ id: agent.id, action: 'switch', pSwitch: kevResult.pSwitch, dryRun })
       } finally {
@@ -2427,5 +2495,5 @@ export function install(rt) {
     }
   }
 
-  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, agentPage, taskPage, displayItems, applySteps, followFolder, followEngine, heldBack, openTaskPart, forkForegroundPart, sweepIdleParts, isSwitchingPart: id => switches.has(id), sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, partsOfThread, historyEntry, partLines, noteText, earlierPage, chatPage, agentPage, taskPage, displayItems, applySteps, followFolder, followEngine, heldBack, openTaskPart, forkForegroundPart, isRoomBusy, sweepIdleParts, isSwitchingPart: id => switches.has(id), sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }

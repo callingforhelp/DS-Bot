@@ -157,10 +157,12 @@ test('scoreKevDecision blends probabilities, gates midTurn, and defers on ambigu
   const sw = scoreKevDecision(makeResp(0.95, 0.05, 0.05, 0.05), { midTurn: false })
   assert.equal(sw.action, 'switch')
   assert.equal(sw.confident, true)
+  assert.deepEqual(sw.factors, { pAction: 0.95, pSkip: 0.05, pWait: 0.05, pNext: 0.05 })
 
   const cp = scoreKevDecision(makeResp(0.20, 0.80, 0.10, 0.10), { midTurn: false })
   assert.equal(cp.action, 'compact')
   assert.equal(cp.confident, true)
+  assert.deepEqual(cp.factors, { pAction: 0.2, pSkip: 0.8, pWait: 0.1, pNext: 0.1 })
 
   // midTurn forces compact even if text looked finished
   const mid = scoreKevDecision(makeResp(0.95, 0.05, 0.05, 0.05), { midTurn: true })
@@ -176,6 +178,7 @@ test('scoreKevDecision blends probabilities, gates midTurn, and defers on ambigu
   const trunc = scoreKevDecision(makeResp(0.99, 0.01, 0.01, 0.01, { truncated: true }), { midTurn: false })
   assert.equal(trunc.action, undefined)
   assert.equal(trunc.confident, false)
+  assert.equal(trunc.factors, undefined)
 })
 
 test('askKevSteward handles disabled URLs, network failures, and calibrated responses', async () => {
