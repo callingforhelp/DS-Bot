@@ -34,6 +34,7 @@
     "plugin.js",
     "index.js",
     "src/host/",
+    "src/mem-cli/",
     "src/shared/",
     "src/office/",
     "client.js",

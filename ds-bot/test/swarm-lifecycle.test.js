@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import { install as installLedger } from '../src/host/ledger.js'
 import { install as installSwarm } from '../src/host/swarm.js'
 import { install as installSwarmTools } from '../src/host/swarm-tools.js'
+import { isQuotaWorker, swarmCounts, swarmsForSession, workersOf } from '../src/client/swarm-model.js'
 
 const host = (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-swarm-lc-'))
@@ -18,6 +19,7 @@ const host = (t) => {
     readOnly: () => undefined,
     warn: () => {},
     state: {},
+    teamTools: [],
     cachedCatalog: () => [
       { provider: 'deepseek', model: 'deepseek-chat', name: 'DeepSeek Chat' },
       { provider: 'deepseek', model: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
@@ -130,4 +132,60 @@ test('swarm lifecycle: create, add workers, post, and ring doorbells', async () 
   assert.equal(closeRes.decisions, 1)
   assert.equal(closeRes.shas, 1)
   assert.equal(swarm.closed, true)
+})
+
+test('swarm bot bootstrap, channel/MCP endpoints, and client model contract work end-to-end', async t => {
+  const { rt, deliveries } = host(t)
+  rt.chatOwners = new Map([['bot-s1', 'b1']])
+  rt.selfOf = id => (id === 'bot-s1' ? 'b1' : undefined)
+
+  // Normal Bot session gets `swarm` from rt.teamTools and unlocks all 4 swarm tools on bootstrap.
+  assert.equal(rt.swarmToolsForSession('bot-s1').length, 0)
+  const swarmDef = rt.teamTools.find(d => d.name === 'swarm')
+  assert.ok(swarmDef)
+  const addOut = await swarmDef.execute(
+    { action: 'add', name: 'helper', title: 'Alpha Swarm', brief: 'Inspect module' },
+    { agent: { session: { id: 'bot-s1' } } },
+  )
+  assert.equal(addOut, 'Added helper')
+  assert.equal(rt.swarmToolsForSession('bot-s1').length, 4)
+
+  // Map-keyed swarmsView + statusView compatibility with client swarm-model helpers.
+  const viewMap = rt.swarmsView()
+  const swIds = Object.keys(viewMap)
+  assert.equal(swIds.length, 1)
+  const swId = swIds[0]
+  const forSession = swarmsForSession(viewMap, 'bot-s1')
+  assert.equal(forSession.length, 1)
+  assert.equal(forSession[0].ownerBotId, 'b1')
+  // Initial intro doorbell transitions helper to working alongside coordinator.
+  assert.equal(swarmCounts(forSession[0]).working, 2)
+  assert.equal(swarmCounts(forSession[0]).waiting, 0)
+
+  // Turn hooks mark working -> waiting -> stopped/quota and expose quota cleanly to client helpers.
+  const helperSession = rt.swarm.memberOf(rt.swarm.swarmOf(swId), 'helper').sessionId
+  rt.swarmHooks.turnStart(helperSession)
+  rt.swarmHooks.turnEnd(helperSession)
+  assert.equal(swarmCounts(rt.swarmsView()[swId]).waiting, 1)
+  assert.equal(swarmCounts(rt.swarmsView()[swId]).working, 1)
+  rt.swarmHooks.turnFailure(helperSession, { code: '429', message: 'Quota' })
+  assert.equal(isQuotaWorker(workersOf(rt.swarmsView()[swId]).find(w => w.name === 'helper')), true)
+  assert.equal(swarmCounts(rt.swarmsView()[swId]).quota, 1)
+
+  // swarmEndpoint supports all channel/MCP endpoint names, external mcp poster, and "provider/model" string switch.
+  const epCreate = await rt.swarmEndpoint('swarm-create', { sessionId: 'bot-s2', ownerBotId: 'b2', title: 'Second' })
+  assert.ok(epCreate.swarm?.id)
+  const postRes = await rt.swarmEndpoint('swarm-post', { swarmId: swId, from: 'mcp:agy', text: '@helper check status' })
+  assert.ok(postRes.post?.seq >= 1)
+  const readRes = await rt.swarmEndpoint('swarm-read', { swarmId: swId, since: 0 })
+  assert.ok(readRes.messages.some(m => m.agent === 'mcp:agy'))
+  const modelsRes = await rt.swarmEndpoint('swarm-models', { swarmId: swId })
+  assert.equal(modelsRes.models[0].id, 'deepseek/deepseek-chat')
+  const switchRes = await rt.swarmEndpoint('swarm-switch-model', { swarmId: swId, name: 'helper', model: 'deepseek/deepseek-reasoner' })
+  assert.equal(switchRes.member.model.model, 'deepseek-reasoner')
+  assert.ok(deliveries.length >= 1)
+  const closeRes = await rt.swarmEndpoint('swarm-close', { swarmId: swId })
+  assert.equal(rt.swarmsView()[swId].status, 'closed')
+  assert.equal(rt.swarmsView()[swId].closed, true)
+  assert.equal(closeRes.closed, undefined)
 })

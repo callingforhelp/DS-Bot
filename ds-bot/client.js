@@ -17304,6 +17304,7 @@ function teamActions({ call: call2, after, partFor, roster, ui, live, cards, hel
     memoryTakeover: (id, source) => after(call2("memory-takeover", { ...memoryOf(id), ...source })),
     artifactSave: (artifact) => after(call2("artifact-save", artifact)),
     artifactDelete: (id) => after(call2("artifact-delete", { id })),
+    swarmCreate: (payload) => after(call2("swarm-create", payload)),
     swarmRead: (swarmId, flags = {}) => call2("swarm-read", { swarmId, ...flags }),
     swarmPost: (swarmId, post) => after(call2("swarm-post", { swarmId, ...post })),
     swarmModels: (swarmId) => call2("swarm-models", { swarmId }),
@@ -46171,18 +46172,19 @@ var MEMBER_CSS = `
 // src/client/swarm-model.js
 var WORKER_STATES = /* @__PURE__ */ new Set(["working", "waiting", "stopped", "killed"]);
 var BOARD_POLL_MS = 2500;
-var isQuotaWorker = (worker) => worker?.quota === true || worker?.state === "quota";
-var workersOf = (swarm) => (swarm?.workers ?? swarm?.members ?? []).filter((worker) => worker && worker.state !== "killed");
+var isQuotaWorker = (worker) => worker?.quota === true || typeof worker?.quota === "object" && worker.quota !== null || worker?.state === "quota";
+var workersOf = (swarm) => (swarm?.workers ?? swarm?.members ?? []).filter((worker) => worker && worker.state !== "killed" && worker.status !== "killed");
 function swarmCounts(swarm) {
   const counts2 = { working: 0, waiting: 0, quota: 0 };
   for (const worker of workersOf(swarm)) {
+    const state = worker.state ?? worker.status;
     if (isQuotaWorker(worker)) counts2.quota += 1;
-    else if (worker.state === "working") counts2.working += 1;
-    else if (worker.state === "waiting") counts2.waiting += 1;
+    else if (state === "working") counts2.working += 1;
+    else if (state === "waiting") counts2.waiting += 1;
   }
   return counts2;
 }
-var isLiveSwarm = (swarm) => swarm !== void 0 && swarm !== null && swarm.status !== "closed";
+var isLiveSwarm = (swarm) => swarm !== void 0 && swarm !== null && swarm.status !== "closed" && swarm.closed !== true;
 function swarmsForSession(swarms, sessionId) {
   return Object.values(swarms ?? {}).filter((swarm) => isLiveSwarm(swarm) && (sessionId === void 0 || swarm.ownerSessionId === sessionId || swarm.sessionId === sessionId || swarm.ownerBotId === sessionId)).sort((a, b) => (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0));
 }
@@ -46219,8 +46221,13 @@ function mergePosts(known, page) {
 // src/client/swarm-panel.js
 var import_react64 = require("react");
 var BADGES = { done: "Done", stall: "Stalled", quota: "Quota" };
-var stateOf2 = (worker) => isQuotaWorker(worker) ? "quota" : worker.state ?? "waiting";
+var stateOf2 = (worker) => isQuotaWorker(worker) ? "quota" : worker.state ?? worker.status ?? "waiting";
 var stateLabel = (state) => state === "working" ? t("Working") : state === "quota" ? t("Quota") : state === "stopped" ? t("Stopped") : t("Waiting");
+var modelText = (model) => {
+  if (!model) return "";
+  if (typeof model === "string") return model;
+  return model.model ? `${model.provider ? `${model.provider}/` : ""}${model.model}` : "";
+};
 function SwarmIslandPod({ swarms = [], targetId, actions }) {
   const box = (0, import_react64.useRef)(null);
   const live = swarms.filter(isLiveSwarm);
@@ -46287,9 +46294,10 @@ function ModelSwitcher({ swarm, worker, actions }) {
       { className: "bt-swarm-select", value: "", disabled: busy || models === null, onChange: choose, "aria-label": t("Switch model") },
       (0, import_react64.createElement)("option", { value: "" }, models === null ? t("Loading…") : t("Choose a model")),
       (models ?? []).map((model) => {
-        const id = typeof model === "string" ? model : model.id;
-        const limited = typeof model === "object" && model.quota === true;
-        return (0, import_react64.createElement)("option", { key: id, value: id, disabled: limited }, limited ? `${model.name ?? id} · ${t("Quota")}` : model.name ?? id);
+        const id = typeof model === "string" ? model : model.id ?? `${model.provider}/${model.model}`;
+        const limited = typeof model === "object" && (model.quota === true || model.quota === "limited" || model.limited === true);
+        const label = typeof model === "object" ? model.name ?? model.label ?? id : id;
+        return (0, import_react64.createElement)("option", { key: id, value: id, disabled: limited }, limited ? `${label} · ${t("Quota")}` : label);
       })
     ),
     error ? (0, import_react64.createElement)("span", { className: "bt-swarm-error", role: "alert" }, error) : null
@@ -46299,6 +46307,7 @@ function Roster({ swarm, selected, onSelect }) {
   const workers = workersOf(swarm);
   return (0, import_react64.createElement)("div", { className: "bt-swarm-roster", role: "tablist", "aria-label": t("Swarm members") }, workers.map((worker) => {
     const state = stateOf2(worker);
+    const label = modelText(worker.model);
     return (0, import_react64.createElement)(
       "button",
       {
@@ -46313,7 +46322,7 @@ function Roster({ swarm, selected, onSelect }) {
       },
       (0, import_react64.createElement)("span", { className: "bt-swarm-dot", "data-state": state, "aria-hidden": true }),
       (0, import_react64.createElement)("span", { className: "bt-swarm-member-name" }, worker.name),
-      worker.model ? (0, import_react64.createElement)("span", { className: "bt-chip bt-swarm-model" }, worker.model) : null
+      label ? (0, import_react64.createElement)("span", { className: "bt-chip bt-swarm-model" }, label) : null
     );
   }));
 }
@@ -46384,7 +46393,7 @@ function SwarmBoardPanel({ swarmId, roster, actions }) {
     setTimeout(() => setFlash((current2) => current2 === seq ? null : current2), 1400);
   }, []);
   if (!swarm) return (0, import_react64.createElement)("div", { className: "bt-swarm-empty" }, t("This swarm is gone."));
-  const closed = swarm.status === "closed";
+  const closed = swarm.status === "closed" || swarm.closed === true;
   const send = async () => {
     const text = draft.trim();
     if (text === "" || busy) return;
@@ -51595,7 +51604,7 @@ function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, roster, a
           onSave: (instructions) => run2(actions.updateBot(bot.id, { instructions }))
         }),
         roster.memory === false ? null : (0, import_react78.createElement)(MemoryRow, { key: "memory", owner: { id: bot.id, sessionId: bot.sessionId ?? sessionId, name: bot.name }, actions }),
-        swarmsForSession(roster.swarms, sessionId).length > 0 ? (0, import_react78.createElement)(
+        swarmsForSession(roster.swarms, sessionId).length > 0 || !roster.readOnly ? (0, import_react78.createElement)(
           "div",
           { key: "swarms" },
           (0, import_react78.createElement)("div", { className: "bt-section-title" }, t("Swarms")),
@@ -51604,7 +51613,15 @@ function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, roster, a
             type: "button",
             className: "bt-kv bt-drawer-swarm-row",
             onClick: () => actions.openSwarm?.(sessionId, swarm.id)
-          }, (0, import_react78.createElement)("span", null, swarm.title ?? t("Swarm")), (0, import_react78.createElement)("span", { className: "bt-chip" }, t("Open"))))
+          }, (0, import_react78.createElement)("span", null, swarm.title ?? t("Swarm")), (0, import_react78.createElement)("span", { className: "bt-chip" }, t("Open")))),
+          !roster.readOnly && swarmsForSession(roster.swarms, sessionId).length === 0 ? (0, import_react78.createElement)("button", {
+            key: "swarm-start",
+            type: "button",
+            className: "bt-kv bt-drawer-swarm-row",
+            onClick: () => void Promise.resolve(actions.swarmCreate?.({ sessionId, ownerBotId: bot.id, title: bot.name })).then((res) => {
+              if (res?.swarm?.id) actions.openSwarm?.(sessionId, res.swarm.id);
+            })
+          }, (0, import_react78.createElement)("span", null, t("Swarm")), (0, import_react78.createElement)("span", { className: "bt-chip" }, t("Start"))) : null
         ) : null,
         usage ? (0, import_react78.createElement)(
           "div",

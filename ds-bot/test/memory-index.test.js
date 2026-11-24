@@ -157,3 +157,45 @@ test('memory-index hybrid search incorporates embedding vectors', async t => {
   assert.ok(res.hits[0].score > 0)
   assert.equal(res.mode, 'hybrid')
 })
+
+test('cross-bot hybrid search returns shared team and public bot docs while hiding private bot docs', async t => {
+  const rt = createTestRuntime(t)
+  rt.botOf = id => ({
+    b1: { id: 'b1', name: 'Reader', private: false },
+    b2: { id: 'b2', name: 'Coder', private: false },
+    b3: { id: 'b3', name: 'SecretBot', private: true },
+  }[id])
+
+  rt.memoryIndexUpsert({
+    id: 'mem:team-1',
+    kind: 'memory',
+    scopeKey: 'team',
+    title: 'Deploy target',
+    body: 'Production deploy uses staging blue-green rollout',
+  })
+  rt.memoryIndexUpsert({
+    id: 'mem:b2-1',
+    kind: 'memory',
+    scopeKey: 'bot:b2',
+    botId: 'b2',
+    title: 'Coder note',
+    body: 'Coder verified blue-green rollout health checks',
+  })
+  rt.memoryIndexUpsert({
+    id: 'mem:b3-1',
+    kind: 'memory',
+    scopeKey: 'bot:b3',
+    botId: 'b3',
+    title: 'Private note',
+    body: 'Private blue-green rollout secret key note',
+    isPrivate: true,
+  })
+
+  // Other Bot b1 sees team + non-private b2, never private b3.
+  const forB1 = await rt.hybridSearch('blue-green rollout', { allowPrivateBotId: 'b1' })
+  assert.deepEqual(forB1.hits.map(h => h.id).sort(), ['mem:b2-1', 'mem:team-1'])
+
+  // Private Bot b3 itself can see its own private doc alongside team + b2.
+  const forB3 = await rt.hybridSearch('blue-green rollout', { allowPrivateBotId: 'b3' })
+  assert.deepEqual(forB3.hits.map(h => h.id).sort(), ['mem:b2-1', 'mem:b3-1', 'mem:team-1'])
+})

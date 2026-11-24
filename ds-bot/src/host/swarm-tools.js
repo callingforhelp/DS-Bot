@@ -40,9 +40,9 @@ export function install(rt) {
   // ── tools ───────────────────────────────────────────────────────────────────
   const swarmTool = defineTool({
     name: 'swarm',
-    description: 'Manage the swarm: view status and models, spawn helpers, switch models on quota limits, kill helpers you own, manage channels, or set the swarm title.',
+    description: 'Manage the swarm: start a swarm, view status and models, spawn helpers, switch models on quota limits, kill helpers you own, manage channels, or set the swarm title.',
     parameters: {
-      action: { type: 'string', required: true, enum: ['status', 'models', 'add', 'model', 'kill', 'title', 'channel'], description: 'What to do: status, models, add, model, kill, title, channel' },
+      action: { type: 'string', required: true, enum: ['start', 'status', 'models', 'add', 'model', 'kill', 'title', 'channel'], description: 'What to do: start, status, models, add, model, kill, title, channel' },
       name: { type: 'string', description: 'Member or channel name (short, lowercase, no spaces)' },
       brief: { type: 'string', description: 'For add: the worker assignment (what it owns, what done looks like)' },
       model: { type: 'object', additionalProperties: true, description: 'For add and model: { provider, model, reasoningEffort }' },
@@ -51,7 +51,7 @@ export function install(rt) {
       fork: { type: 'string', description: 'For add: member name to fork conversation history from ("coordinator" or worker name)' },
       workspace: { type: 'string', enum: ['inherit', 'share', 'branch'], description: 'For add: inherit (default), share (git worktree), branch (isolated clone)' },
       all: { type: 'boolean', description: 'For models: list every model including hidden' },
-      title: { type: 'string', description: 'For title: new swarm title' },
+      title: { type: 'string', description: 'For start or title: swarm title' },
       op: { type: 'string', enum: ['create', 'join', 'leave', 'drop'], description: 'For channel: channel operation' },
       member: { type: 'string', description: 'For channel: target member for join/leave' },
       members: { type: 'array', items: { type: 'string' }, description: 'For channel: initial members for create' },
@@ -59,9 +59,24 @@ export function install(rt) {
     },
     output,
     async execute(args, exec) {
-      const { swarmId, memberName } = own(exec)
+      const sessionId = exec.agent?.session?.id ?? exec.agent?.id
       const action = String(args.action ?? '').toLowerCase()
+      let held = rt.swarmOwners?.get(sessionId)
+      if (held === undefined && (action === 'start' || action === 'add')) {
+        const created = rt.swarm.createSwarm({
+          coordinatorSessionId: sessionId,
+          ownerBotId: rt.selfOf?.(sessionId),
+          title: args.title || args.name || 'Swarm',
+        })
+        if (action === 'start') {
+          return JSON.stringify(rt.swarm.statusView(created.id, 'coordinator'), null, 2)
+        }
+        held = rt.swarmOwners?.get(sessionId)
+      }
+      if (held === undefined) throw new Error('This Session is not a member of any swarm')
+      const { swarmId, memberName } = held
       switch (action) {
+        case 'start':
         case 'status': {
           const view = rt.swarm.statusView(swarmId, memberName)
           return JSON.stringify(view, null, 2)
@@ -155,6 +170,9 @@ export function install(rt) {
   })
 
   const tools = [swarmTool, postMessageTool, readBoardTool, swarmWaitTool]
+  if (Array.isArray(rt.teamTools) && !rt.teamTools.some(d => d.name === 'swarm')) {
+    rt.teamTools.push(swarmTool)
+  }
 
   // System prompt injection for swarm members
   if (ctx?.systemPrompt?.section !== undefined) {

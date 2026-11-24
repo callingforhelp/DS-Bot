@@ -359,6 +359,7 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     memoryTakeover: (id, source) => after(call('memory-takeover', { ...memoryOf(id), ...source })),
     artifactSave: (artifact) => after(call('artifact-save', artifact)),
     artifactDelete: (id) => after(call('artifact-delete', { id })),
+    swarmCreate: (payload) => after(call('swarm-create', payload)),
     swarmRead: (swarmId, flags = {}) => call('swarm-read', { swarmId, ...flags }),
     swarmPost: (swarmId, post) => after(call('swarm-post', { swarmId, ...post })),
     swarmModels: swarmId => call('swarm-models', { swarmId }),

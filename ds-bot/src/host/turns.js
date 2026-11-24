@@ -1086,6 +1086,7 @@ export function install(rt) {
         break
       case 'turn/start':
         setActivity(id, 'thinking')
+        rt.swarmHooks?.turnStart?.(id)
         entry.turn = event.data.turn
         entry.since = event.time ?? Date.now()
         entry.taskContext = newTaskContext()
@@ -1460,6 +1461,7 @@ export function install(rt) {
           if (watched) rememberFailure(id, turn, failure, session)
           if (blockBot(id, session, failure) && owner !== undefined && info?.role === 'kickoff') rt.holdKickoffAgain(owner)
           if (groupOwner !== undefined) rt.blockTasks?.(groupOwner.roomId, groupOwner.botId, { cause: 'failed', code: failure.code, ...(failure.status ? { status: failure.status } : {}) })
+          rt.swarmHooks?.turnFailure?.(id, failure)
         } else if (reason?.kind === 'completed') {
           forgetFailure(id)
           unblockBot(rt.selfOf(id))
@@ -1468,6 +1470,7 @@ export function install(rt) {
           else if (groupOwner !== undefined) rt.unblockTasks?.(groupOwner.roomId, groupOwner.botId)
           // A turn the user opened, or the Retry that answers the user.
           if (owner !== undefined && !rt.taskOwners?.has(id) && (info === undefined || info.role === 'continue')) rt.userAnswered(owner)
+          rt.swarmHooks?.turnEnd?.(id)
         }
         // A model that writes its tool call as text ends the turn as if it were done,
         // though nothing ran. It gets one more turn on the same trigger, so a waiting

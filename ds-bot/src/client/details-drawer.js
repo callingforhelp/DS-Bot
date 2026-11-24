@@ -379,12 +379,16 @@ export function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, ro
               onSave: instructions => run(actions.updateBot(bot.id, { instructions })),
             }),
         roster.memory === false ? null : h(MemoryRow, { key: 'memory', owner: { id: bot.id, sessionId: bot.sessionId ?? sessionId, name: bot.name }, actions }),
-        swarmsForSession(roster.swarms, sessionId).length > 0 ? h('div', { key: 'swarms' },
+        (swarmsForSession(roster.swarms, sessionId).length > 0 || !roster.readOnly) ? h('div', { key: 'swarms' },
           h('div', { className: 'bt-section-title' }, t('Swarms')),
           swarmsForSession(roster.swarms, sessionId).map(swarm => h('button', {
             key: swarm.id, type: 'button', className: 'bt-kv bt-drawer-swarm-row',
             onClick: () => actions.openSwarm?.(sessionId, swarm.id),
-          }, h('span', null, swarm.title ?? t('Swarm')), h('span', { className: 'bt-chip' }, t('Open'))))) : null,
+          }, h('span', null, swarm.title ?? t('Swarm')), h('span', { className: 'bt-chip' }, t('Open')))),
+          !roster.readOnly && swarmsForSession(roster.swarms, sessionId).length === 0 ? h('button', {
+            key: 'swarm-start', type: 'button', className: 'bt-kv bt-drawer-swarm-row',
+            onClick: () => void Promise.resolve(actions.swarmCreate?.({ sessionId, ownerBotId: bot.id, title: bot.name })).then(res => { if (res?.swarm?.id) actions.openSwarm?.(sessionId, res.swarm.id) }),
+          }, h('span', null, t('Swarm')), h('span', { className: 'bt-chip' }, t('Start'))) : null) : null,
         usage ? h('div', { key: 'usage' }, h('div', { className: 'bt-section-title' }, t('Usage')),
           h('div', { className: 'bt-kv' }, h('span', null, bot.name), h('span', null, usage))) : null,
         h(ScheduleSummary, { key: 'routines', bot, actions }),

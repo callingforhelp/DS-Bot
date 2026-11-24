@@ -1380,10 +1380,45 @@ export function install(rt) {
       const hits = (every.length > 0 ? every : scored).sort((a, b) => b.count - a.count || (scores.get(b.entry) ?? 0) - (scores.get(a.entry) ?? 0)).slice(0, RECALL_MAX)
       const names = loaded.map(item => item.label)
       const labels = names.length > 2 ? `${names.slice(0, -1).join(', ')}, and ${names.at(-1)}` : names.join(' and ')
-      if (hits.length === 0) return `Nothing in ${labels} mentions "${query}". read_own_chat searches what was said.`
+      const hybridLines = []
+      if (typeof rt.hybridSearch === 'function' && hits.length === 0) {
+        try {
+          const scopeOpts = scopes.length === 1 && scopes[0].kind === 'team'
+            ? { scopeKey: 'team' }
+            : scopes.length === 1 && scopes[0].kind === 'bot'
+              ? { botId: scopes[0].botId }
+              : scopes.length === 1 && scopes[0].kind === 'group'
+                ? { roomId: scopes[0].roomId }
+                : {}
+          const hybrid = await rt.hybridSearch(query, { limit: RECALL_MAX, allowPrivateBotId: self, ...scopeOpts })
+          const allowedKeys = new Set(scopes.map(s => (s.kind === 'team' ? 'team' : s.kind === 'group' ? `group:${s.roomId}` : `bot:${s.botId}`)))
+          const seen = new Set(hits.map(({ entry }) => squash(entry.text)))
+          for (const hit of hybrid?.hits ?? []) {
+            if (hits.length + hybridLines.length >= RECALL_MAX) break
+            if (String(hit.id ?? '').startsWith('md:')) continue
+            if (hit.botId && hit.botId !== self && rt.isPrivate?.(hit.botId)) continue
+            const inScope = allowedKeys.has(hit.scopeKey)
+              || (hit.botId && scopes.some(s => s.kind === 'bot' && s.botId === hit.botId))
+              || (hit.roomId && scopes.some(s => s.kind === 'group' && s.roomId === hit.roomId))
+              || ((!hit.scopeKey || hit.scopeKey === 'team') && scopes.some(s => s.kind === 'team'))
+            if (!inScope) continue
+            const rawText = String(hit.body ?? hit.snippet ?? hit.title ?? '').replace(/\s+/g, ' ').trim()
+            if (!rawText) continue
+            const norm = squash(rawText)
+            if (seen.has(norm)) continue
+            seen.add(norm)
+            hybridLines.push(`[hybrid · ${hit.scopeKey ?? 'team'}] ${rawText.slice(0, 220)}`)
+          }
+        } catch { /* hybrid supplement falls back cleanly to markdown recall */ }
+      }
+      if (hits.length === 0 && hybridLines.length === 0) return `Nothing in ${labels} mentions "${query}". read_own_chat searches what was said.`
+      const header = hits.length === 0
+        ? `Hybrid matches for "${query}" in ${labels}:`
+        : every.length > 0 ? `Entries with "${query}" in ${labels}:` : `No entry has all of "${query}"; entries with the most of these words:`
       return [
-        every.length > 0 ? `Entries with "${query}" in ${labels}:` : `No entry has all of "${query}"; entries with the most of these words:`,
+        header,
         ...hits.map(({ entry, tag }) => `[${where(tag, entry.file)}] ${formatEntry(entry.text, entry.meta).slice(2)}`),
+        ...hybridLines,
       ].join('\n')
     },
   }))

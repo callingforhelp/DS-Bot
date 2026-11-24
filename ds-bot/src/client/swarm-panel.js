@@ -46,8 +46,13 @@ export {
 
 const BADGES = { done: 'Done', stall: 'Stalled', quota: 'Quota' }
 
-const stateOf = worker => (isQuotaWorker(worker) ? 'quota' : worker.state ?? 'waiting')
+const stateOf = worker => (isQuotaWorker(worker) ? 'quota' : (worker.state ?? worker.status ?? 'waiting'))
 const stateLabel = state => (state === 'working' ? t('Working') : state === 'quota' ? t('Quota') : state === 'stopped' ? t('Stopped') : t('Waiting'))
+const modelText = (model) => {
+  if (!model) return ''
+  if (typeof model === 'string') return model
+  return model.model ? `${model.provider ? `${model.provider}/` : ''}${model.model}` : ''
+}
 
 export function SwarmIslandPod({ swarms = [], targetId, actions }) {
   const box = useRef(null)
@@ -106,9 +111,10 @@ function ModelSwitcher({ swarm, worker, actions }) {
     h('select', { className: 'bt-swarm-select', value: '', disabled: busy || models === null, onChange: choose, 'aria-label': t('Switch model') },
       h('option', { value: '' }, models === null ? t('Loading…') : t('Choose a model')),
       (models ?? []).map(model => {
-        const id = typeof model === 'string' ? model : model.id
-        const limited = typeof model === 'object' && model.quota === true
-        return h('option', { key: id, value: id, disabled: limited }, limited ? `${model.name ?? id} · ${t('Quota')}` : model.name ?? id)
+        const id = typeof model === 'string' ? model : (model.id ?? `${model.provider}/${model.model}`)
+        const limited = typeof model === 'object' && (model.quota === true || model.quota === 'limited' || model.limited === true)
+        const label = typeof model === 'object' ? (model.name ?? model.label ?? id) : id
+        return h('option', { key: id, value: id, disabled: limited }, limited ? `${label} · ${t('Quota')}` : label)
       })),
     error ? h('span', { className: 'bt-swarm-error', role: 'alert' }, error) : null)
 }
@@ -117,13 +123,14 @@ function Roster({ swarm, selected, onSelect }) {
   const workers = workersOf(swarm)
   return h('div', { className: 'bt-swarm-roster', role: 'tablist', 'aria-label': t('Swarm members') }, workers.map(worker => {
     const state = stateOf(worker)
+    const label = modelText(worker.model)
     return h('button', {
       key: worker.name, type: 'button', role: 'tab', 'aria-selected': selected === worker.name, className: 'bt-swarm-member',
       'data-state': state, title: `${worker.name} · ${stateLabel(state)}`, onClick: () => onSelect(selected === worker.name ? null : worker.name),
     },
     h('span', { className: 'bt-swarm-dot', 'data-state': state, 'aria-hidden': true }),
     h('span', { className: 'bt-swarm-member-name' }, worker.name),
-    worker.model ? h('span', { className: 'bt-chip bt-swarm-model' }, worker.model) : null)
+    label ? h('span', { className: 'bt-chip bt-swarm-model' }, label) : null)
   }))
 }
 
@@ -192,7 +199,7 @@ export function SwarmBoardPanel({ swarmId, roster, actions }) {
 
   if (!swarm) return h('div', { className: 'bt-swarm-empty' }, t('This swarm is gone.'))
 
-  const closed = swarm.status === 'closed'
+  const closed = swarm.status === 'closed' || swarm.closed === true
   const send = async () => {
     const text = draft.trim()
     if (text === '' || busy) return

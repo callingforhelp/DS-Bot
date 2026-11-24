@@ -110,7 +110,8 @@ export function install(rt) {
   /** A post on the board, by a member (or `user`), with its doorbells rung. */
   async function post(swarmId, { agent, text, channel }) {
     const swarm = swarmOf(swarmId)
-    if (agent !== 'user' && agent !== 'monitor') memberOf(swarm, agent)
+    const external = agent === 'user' || agent === 'monitor' || (typeof agent === 'string' && agent.startsWith('mcp:'))
+    if (!external) memberOf(swarm, agent)
     if (swarm.closed) throw new Error(`Swarm "${swarm.title}" is closed`)
     if (agent === 'user') { swarm.hops = 0; swarm.halted = false; swarm.dormant = false; swarm.idleTicks = 0 }
     const kind = agent === 'user' ? 'user' : agent === 'monitor' ? 'system' : 'post'
@@ -244,9 +245,14 @@ export function install(rt) {
     const board = boardOf(swarmId)
     return {
       id: swarm.id, title: swarm.title, head: board.lastSeq(), channels: board.channelNames(),
+      status: swarm.closed === true ? 'closed' : 'active',
       closed: swarm.closed === true, dormant: swarm.dormant === true, halted: swarm.halted === true, hops: swarm.hops ?? 0,
+      ownerSessionId: swarm.coordinatorSessionId,
+      ownerBotId: swarm.ownerBotId ?? null,
+      createdAt: swarm.createdAt,
+      updatedAt: swarm.lastPostAt ?? swarm.createdAt,
       members: Object.values(swarm.members).map(member => ({
-        name: member.name, role: member.role, status: member.status, model: member.model, addedBy: member.addedBy,
+        name: member.name, role: member.role, status: member.status, state: member.status, model: member.model, addedBy: member.addedBy,
         lastPostSeq: member.lastPostSeq ?? 0, workspace: member.workspace, ...(member.worktree === undefined ? {} : { worktree: member.worktree }),
         ...(member.failure === undefined ? {} : { failure: member.failure }),
         ...(member.quota === undefined ? {} : { quota: member.quota }),
@@ -268,7 +274,8 @@ export function install(rt) {
       if (!all && entry.hidden === true) continue
       const at = quotaMap.get(`${provider}/${model}`)
       const limited = at !== undefined && now() - at < QUOTA_TTL_MS
-      rows.push({ provider, model, label: entry.name ?? entry.label ?? model, quota: limited ? 'limited' : 'ok', ...(limited ? { limitedAt: at } : {}) })
+      const label = entry.name ?? entry.label ?? model
+      rows.push({ id: `${provider}/${model}`, name: label, provider, model, label, limited, quota: limited ? 'limited' : 'ok', ...(limited ? { limitedAt: at } : {}) })
     }
     return rows
   }
@@ -411,23 +418,64 @@ export function install(rt) {
   }
 
   // ── views and endpoint for the MCP server and the channel ───────────────────
-  const swarmsView = () => Object.values(state.swarms).map(swarm => statusView(swarm.id))
-  const swarmsLiveView = () => Object.values(state.swarms).map(swarm => ({
+  const swarmsView = () => Object.fromEntries(Object.values(state.swarms).map(swarm => [swarm.id, statusView(swarm.id)]))
+  const swarmsLiveView = () => Object.fromEntries(Object.values(state.swarms).map(swarm => [swarm.id, {
     ...statusView(swarm.id),
     lastPostAt: swarm.lastPostAt, idleTicks: swarm.idleTicks ?? 0, stalls: swarm.stalls ?? 0,
-  }))
+  }]))
+
+  const parseModelArg = (value) => {
+    if (value && typeof value === 'object') return value
+    const raw = String(value ?? '').trim()
+    const slash = raw.indexOf('/')
+    if (slash > 0 && slash < raw.length - 1) return { provider: raw.slice(0, slash), model: raw.slice(slash + 1) }
+    return value
+  }
 
   async function swarmEndpoint(endpoint, body = {}) {
     try {
       switch (endpoint) {
-        case 'list': return { swarms: swarmsView() }
-        case 'live': return { swarms: swarmsLiveView() }
-        case 'status': return statusView(body.swarmId)
-        case 'board': return boardOf(swarmOf(body.swarmId).id).readBoard({ since: body.since, limit: body.limit, seqs: body.seqs, channel: body.channel, viewer: body.viewer, coordinator: COORDINATOR })
-        case 'post': return { post: await post(body.swarmId, { agent: body.agent ?? 'user', text: body.text, channel: body.channel }) }
-        case 'models': return { models: listModelsWithQuota(body) }
-        case 'close': return await closeSwarm(body.swarmId, body.agent ?? 'user')
-        case 'kill': return await killMember(body.swarmId, body.agent ?? COORDINATOR, body.name, { removeWorkspace: body.removeWorkspace === true })
+        case 'list':
+        case 'swarm-list':
+          return { swarms: swarmsView() }
+        case 'live':
+          return { swarms: swarmsLiveView() }
+        case 'status':
+        case 'swarm-status':
+          return body.swarmId ? statusView(body.swarmId) : { swarms: swarmsView() }
+        case 'board':
+        case 'swarm-read':
+          return boardOf(swarmOf(body.swarmId).id).readBoard({ since: body.since, limit: body.limit, seqs: body.seqs, channel: body.channel, viewer: body.viewer, coordinator: COORDINATOR })
+        case 'post':
+        case 'swarm-post':
+          return { post: await post(body.swarmId, { agent: body.agent ?? body.from ?? 'user', text: body.text, channel: body.channel }) }
+        case 'models':
+        case 'swarm-models':
+          return { models: listModelsWithQuota(body) }
+        case 'create':
+        case 'swarm-create': {
+          const created = createSwarm({
+            coordinatorSessionId: body.coordinatorSessionId ?? body.sessionId,
+            ownerBotId: body.ownerBotId,
+            title: body.title,
+            name: body.name,
+          })
+          return { swarm: statusView(created.id) }
+        }
+        case 'add':
+        case 'swarm-add':
+          return { added: await addMembers(body.swarmId, body.agent ?? COORDINATOR, body) }
+        case 'switch-model':
+        case 'swarm-switch-model': {
+          const updated = await switchMemberModel(body.swarmId, body.agent ?? COORDINATOR, body.name, parseModelArg(body.model))
+          return { member: updated }
+        }
+        case 'close':
+        case 'swarm-close':
+          return await closeSwarm(body.swarmId, body.agent ?? 'user')
+        case 'kill':
+        case 'swarm-kill':
+          return await killMember(body.swarmId, body.agent ?? COORDINATOR, body.name, { removeWorkspace: body.removeWorkspace === true })
         default: return { error: `Unknown swarm endpoint "${endpoint}"` }
       }
     } catch (error) {

@@ -50,6 +50,8 @@ export function defaultRuntime() {
     macSyncJobId: null,
     scope: 'branch',
     lastSyncedAt: null,
+    memorySyncCursor: 0,
+    lastMemorySyncedAt: null,
     lastTransition: null,
     dismissedTransitionId: null,
     history: [],
@@ -649,6 +651,115 @@ export function install(rt) {
     }
   }
 
+  async function syncMemoryToCloud({ targetId }) {
+    if (typeof rt.hybridSearch !== 'function') return { pushed: 0, contextBlock: null }
+    const recent = await rt.hybridSearch('', { limit: 40 })
+    const hits = (recent?.hits ?? []).filter((hit) => {
+      if (!hit) return false
+      if (hit.botId && (rt.isPrivate?.(hit.botId) === true || rt.botOf?.(hit.botId)?.private === true)) return false
+      return true
+    })
+    const ops = []
+    for (const hit of hits) {
+      const full = rt.memoryIndexGet?.(hit.id)
+      const body = String(full?.body ?? hit.body ?? hit.snippet ?? '').slice(0, 4000).trim()
+      if (!body) continue
+      const updatedMs = Number(hit.updatedAt) || Date.now()
+      const scope = hit.scopeKey === 'team' ? 'team' : hit.roomId ? 'group' : hit.botId ? 'bot' : 'project'
+      ops.push({
+        op_id: createHash('sha256').update(`${hit.id}:${updatedMs}`).digest('hex').slice(0, 40),
+        entity: 'memory',
+        id: String(hit.id),
+        op: 'upsert',
+        updated_at_ms: updatedMs,
+        data: {
+          project_id: projectId,
+          bot_id: hit.botId ?? null,
+          scope,
+          title: String(hit.title ?? hit.topic ?? '').slice(0, 200),
+          body,
+          tags: hit.topic ? [String(hit.topic)] : [],
+        },
+      })
+    }
+    let pushed = 0
+    if (ops.length > 0) {
+      const res = await controllerCall('POST', '/v1/memory/sync/push', {
+        device_id: `dsbot-${projectId}`,
+        ops: ops.slice(0, 100),
+      }).catch(() => ({ ok: false }))
+      if (res?.ok) {
+        pushed = Array.isArray(res.body?.results)
+          ? res.body.results.filter(r => r.status === 'applied' || r.status === 'duplicate').length
+          : ops.length
+      }
+    }
+    const relevant = hits
+      .filter(h => h.scopeKey === 'team' || h.botId === targetId || h.roomId === targetId)
+      .slice(0, 10)
+    const contextLines = []
+    let chars = 0
+    for (const h of relevant) {
+      const text = String(rt.memoryIndexGet?.(h.id)?.body ?? h.body ?? h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 240)
+      if (!text) continue
+      const line = `- [${h.scopeKey ?? 'team'}${h.topic ? `/${h.topic}` : ''}] ${text}`
+      if (chars + line.length + 1 > 1800) break
+      contextLines.push(line)
+      chars += line.length + 1
+    }
+    const contextBlock = contextLines.length > 0
+      ? `Carried Memory Context:\n${contextLines.join('\n')}`
+      : null
+    return { pushed, contextBlock }
+  }
+
+  async function pullMemoryFromCloud(entry) {
+    const prevCursor = Number.isInteger(entry.memorySyncCursor) ? entry.memorySyncCursor : 0
+    if (!liveMeta.controllerOnline || typeof rt.memoryIndexUpsert !== 'function') {
+      return { pulled: 0, cursor: prevCursor }
+    }
+    const res = await controllerCall('POST', '/v1/memory/sync/pull', {
+      device_id: `dsbot-${projectId}`,
+      cursor: prevCursor,
+      limit: 100,
+    }).catch(() => ({ ok: false }))
+    if (!res?.ok || !Array.isArray(res.body?.ops)) {
+      return { pulled: 0, cursor: prevCursor }
+    }
+    let pulled = 0
+    for (const row of res.body.ops) {
+      if (!row || row.op !== 'upsert') continue
+      const data = row.payload?.data ?? {}
+      if (row.entity === 'memory' && typeof data.body === 'string' && data.body.trim() !== '') {
+        rt.memoryIndexUpsert({
+          id: `cloud:${row.entity_id}`,
+          kind: 'memory',
+          scopeKey: data.scope === 'team' ? 'team' : data.bot_id ? `bot:${data.bot_id}` : 'team',
+          botId: data.bot_id ?? null,
+          title: String(data.title ?? ''),
+          body: data.body,
+          meta: { source: 'cloud-sync', originDevice: row.origin_device_id },
+          isPrivate: false,
+        })
+        pulled += 1
+      } else if (row.entity === 'observation' && typeof data.text === 'string' && data.text.trim() !== '' && typeof rt.insertObservationRow === 'function') {
+        rt.insertObservationRow({
+          id: `cloud:${row.entity_id}`,
+          idempotencyKey: `cloud:${row.origin_device_id}:${row.origin_op_id}`,
+          sessionId: data.session_id ?? null,
+          agentSource: 'cloud',
+          botId: data.bot_id ?? null,
+          kind: data.kind ?? 'note',
+          summary: data.text,
+          isPrivate: false,
+        })
+        pulled += 1
+      }
+    }
+    const cursor = Number.isInteger(res.body.cursor) ? res.body.cursor : prevCursor
+    return { pulled, cursor }
+  }
+
   async function handoffToCloud({ sessionId = '', scope = 'auto', pushWip = false, machineId = null, note = '', repo = '', createRepoIfMissing = false }) {
     const targetId = resolveTargetId(sessionId)
     const effectiveSessionId = sessionId || targetId
@@ -748,6 +859,7 @@ export function install(rt) {
       const voiceSummary = voiceRecent.length > 0
         ? `Recent voice context:\n${voiceRecent.map(v => `- ${v.role === 'assistant' ? 'Assistant' : 'User'}: ${String(v.text ?? '').slice(0, 240)}`).join('\n')}`
         : null
+      const memSync = await syncMemoryToCloud({ targetId, sessionId: effectiveSessionId }).catch(() => ({ pushed: 0, contextBlock: null }))
       const pendingRepoDir = (!cloudRepoDir && effectiveScope === 'branch' && remoteUrl)
         ? `/workspace/${deriveRepoName(repoName || remoteUrl, 'repo').replace(/[^A-Za-z0-9._-]+/g, '-')}`
         : cloudRepoDir
@@ -761,6 +873,7 @@ export function install(rt) {
         pre.workDir ? `Workspace: ${pre.workDir}` : null,
         String(note ?? '').trim() ? `Note: ${String(note).trim()}` : null,
         voiceSummary,
+        memSync.contextBlock,
       ].filter(Boolean)
 
       const syncPromise = (effectiveScope === 'branch' && remoteUrl)
@@ -788,6 +901,7 @@ export function install(rt) {
         summary: String(note ?? '').trim() || `Handed off ${name} to ${chosen.name ?? chosen.id}`,
         prUrl: null,
       }
+      const nowIso = new Date().toISOString()
       const next = {
         ...entry,
         location: 'cloud',
@@ -802,7 +916,8 @@ export function install(rt) {
         cloudRepoDir: cloudRepoDir ?? null,
         macSyncJobId,
         scope: effectiveScope,
-        lastSyncedAt: new Date().toISOString(),
+        lastSyncedAt: nowIso,
+        lastMemorySyncedAt: memSync.pushed > 0 ? nowIso : (entry.lastMemorySyncedAt ?? null),
         lastTransition: transition,
         dismissedTransitionId: null,
         history: [...(entry.history ?? []), transition].slice(-MAX_HISTORY),
@@ -855,8 +970,9 @@ export function install(rt) {
       const pushPromise = shouldReverseSync
         ? syncFromDaytonaWorkspace(entry.machineId, { repoName: syncRepoName, branch: syncBranch, createIfMissing: true }).catch(() => null)
         : Promise.resolve(null)
+      const memPullPromise = pullMemoryFromCloud(entry).catch(() => ({ pulled: 0, cursor: entry.memorySyncCursor ?? 0 }))
 
-      const [threadRes, cloudPush] = await Promise.all([threadPromise, pushPromise])
+      const [threadRes, cloudPush, memPull] = await Promise.all([threadPromise, pushPromise, memPullPromise])
       const pulledSummary = (threadRes.ok && threadRes.body?.thread?.summary) ? String(threadRes.body.thread.summary) : ''
       if (cloudPush && !cloudPush.empty) {
         syncBranch = cloudPush.branch ?? syncBranch
@@ -907,6 +1023,7 @@ export function install(rt) {
         summary: pulledSummary || (liveMeta.controllerOnline ? 'Returned control to Local (Mac)' : 'Continued locally from offline cache'),
         prUrl: null,
       }
+      const nowIso = new Date().toISOString()
       const next = {
         ...entry,
         location: 'local',
@@ -915,7 +1032,9 @@ export function install(rt) {
         repoName: syncRepoName,
         remoteUrl: syncRemoteUrl,
         macSyncJobId: macPullJobId,
-        lastSyncedAt: new Date().toISOString(),
+        lastSyncedAt: nowIso,
+        memorySyncCursor: memPull.cursor,
+        lastMemorySyncedAt: memPull.pulled > 0 ? nowIso : (entry.lastMemorySyncedAt ?? null),
         lastTransition: transition,
         dismissedTransitionId: null,
         history: [...(entry.history ?? []), transition].slice(-MAX_HISTORY),

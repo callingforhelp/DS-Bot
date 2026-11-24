@@ -486,3 +486,145 @@ test('5-part git sync: aheadCount auto-push, missing-origin gh bootstrap, Dayton
   assert.equal(syncRes.cloudPush.branch, 'wip/cloud-999')
   assert.equal(syncRes.macPullJob.job_id, 'mac_2')
 })
+
+test('cloud handoff pushes non-private memories on handoffToCloud and pulls cloud updates on handoffToLocal', async t => {
+  const pushedPayloads = []
+  const pullOps = [
+    {
+      server_seq: 42,
+      origin_device_id: 'daytona-m1',
+      origin_op_id: 'op-cloud-1',
+      entity: 'memory',
+      entity_id: 'cloud-mem-1',
+      op: 'upsert',
+      payload: {
+        data: {
+          bot_id: 'a',
+          scope: 'team',
+          title: 'Cloud finding',
+          body: 'Cloud sandbox verified database migration script',
+        },
+      },
+    },
+    {
+      server_seq: 43,
+      origin_device_id: 'daytona-m1',
+      origin_op_id: 'op-cloud-obs-1',
+      entity: 'observation',
+      entity_id: 'cloud-obs-1',
+      op: 'upsert',
+      payload: {
+        data: {
+          session_id: 'a',
+          bot_id: 'a',
+          kind: 'note',
+          text: 'Cloud observation from Daytona run',
+        },
+      },
+    },
+  ]
+  const upserts = []
+  const observations = []
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-cloud-mem-'))
+  writeFileSync(join(home, 'state.json'), JSON.stringify({
+    ...seed(),
+    bots: {
+      a: { id: 'a', name: 'Chief', role: 'Boss', sessionId: 'a', workDir: '/tmp/ws-a', createdAt: 1, private: false },
+      p: { id: 'p', name: 'Secret', role: 'Private', sessionId: 'p', workDir: '/tmp/ws-a', createdAt: 2, private: true },
+    },
+  }))
+  const operatorFile = join(home, 'operator.json')
+  const cacheFile = join(home, 'cloud-cache', 'latest.json')
+  const secret = 'test-secret-123'
+  writeFileSync(operatorFile, JSON.stringify({ id: 'operator', tenant: 'dsbot-cloud', secret }))
+
+  let memorySyncStatus = 200
+  const messages = []
+  const cloudFetch = async (url, init = {}) => {
+    const u = new URL(url)
+    const method = init.method ?? 'GET'
+    const raw = init.body ?? ''
+    verifyHmac(init.headers ?? {}, method, `${u.pathname}${u.search}`, raw, secret)
+    const json = raw ? JSON.parse(raw) : {}
+    const respond = (status, body) => ({ status, json: async () => body })
+    if (method === 'GET' && u.pathname === '/v1/machines') return respond(200, { machines: [{ id: 'm-1', name: 'ds-worker-1', status: 'running', snapshot: 'ds-bot-dsh' }] })
+    if (method === 'GET' && u.pathname === '/v1/authorizations') return respond(200, { items: [] })
+    if (method === 'POST' && u.pathname === '/v1/memory/sync/push') {
+      if (memorySyncStatus !== 200) return respond(memorySyncStatus, { error: 'not implemented' })
+      pushedPayloads.push(json)
+      return respond(200, { device_id: json.device_id, results: json.ops.map(o => ({ op_id: o.op_id, status: 'applied' })) })
+    }
+    if (method === 'POST' && u.pathname === '/v1/memory/sync/pull') {
+      if (memorySyncStatus !== 200) return respond(memorySyncStatus, { error: 'not implemented' })
+      return respond(200, { ops: pullOps, cursor: 43, has_more: false })
+    }
+    if (method === 'POST' && u.pathname === '/v1/machines/m-1/message') {
+      messages.push(json)
+      return respond(200, { result: { delivered: true } })
+    }
+    if (method === 'GET' && u.pathname.startsWith('/v1/machines/m-1/threads/')) {
+      return respond(200, { thread: { id: 'a', summary: 'Cloud thread summary' } })
+    }
+    return respond(404, { error: `unexpected ${method} ${u.pathname}` })
+  }
+
+  const ctx = fakeContext()
+  const { install: installCloudHandoff } = await import('../src/host/cloud-handoff.js')
+  const state = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
+  const rt = {
+    ctx,
+    home,
+    dshHome: home,
+    state,
+    config: {
+      cloudOperatorFile: operatorFile,
+      cloudCacheFile: cacheFile,
+      cloudFetch,
+      cloudGitRunner: async () => ({ exitCode: 1, stdout: '', stderr: '' }),
+    },
+    botOf: id => state.bots[id],
+    isPrivate: id => state.bots[id]?.private === true,
+    roomOf: () => undefined,
+    selfOf: id => (state.bots[id] ? id : undefined),
+    hybridSearch: async () => ({
+      hits: [
+        { id: 'mem:team-1', scopeKey: 'team', topic: 'deploy', title: 'Deploy', snippet: 'Use blue-green deploy', updatedAt: 1000 },
+        { id: 'mem:bot-p', scopeKey: 'bot:p', botId: 'p', title: 'Private', snippet: 'Must not push to cloud', updatedAt: 1001 },
+      ],
+    }),
+    memoryIndexGet: id => (id === 'mem:team-1' ? { id, body: 'Use blue-green deploy across staging' } : null),
+    memoryIndexUpsert: row => upserts.push(row),
+    insertObservationRow: row => observations.push(row),
+    save: async () => {},
+    load: async () => {},
+    teamTools: [],
+  }
+  installCloudHandoff(rt)
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5 }))
+
+  const toCloud = await rt.cloudEndpoint('cloud-handoff-to-cloud', { sessionId: 'a', scope: 'summary' })
+  assert.equal(toCloud.runtime.location, 'cloud')
+  assert.ok(toCloud.runtime.lastMemorySyncedAt)
+  assert.equal(pushedPayloads.length, 1)
+  assert.equal(pushedPayloads[0].ops.length, 1)
+  assert.equal(pushedPayloads[0].ops[0].id, 'mem:team-1')
+  assert.match(pushedPayloads[0].ops[0].data.body, /blue-green deploy/)
+  assert.match(messages[0].text, /Carried Memory Context:/)
+  assert.match(messages[0].text, /blue-green deploy/)
+  assert.doesNotMatch(messages[0].text, /Must not push to cloud/)
+
+  const backLocal = await rt.cloudEndpoint('cloud-handoff-to-local', { sessionId: 'a' })
+  assert.equal(backLocal.runtime.location, 'local')
+  assert.equal(backLocal.runtime.memorySyncCursor, 43)
+  assert.equal(upserts.length, 1)
+  assert.equal(upserts[0].id, 'cloud:cloud-mem-1')
+  assert.equal(observations.length, 1)
+  assert.equal(observations[0].id, 'cloud:cloud-obs-1')
+
+  // Degrades gracefully when controller returns 501/404 for /v1/memory/sync/*
+  memorySyncStatus = 501
+  const degradedCloud = await rt.cloudEndpoint('cloud-handoff-to-cloud', { sessionId: 'a', scope: 'summary' })
+  assert.equal(degradedCloud.runtime.location, 'cloud')
+  const degradedLocal = await rt.cloudEndpoint('cloud-handoff-to-local', { sessionId: 'a' })
+  assert.equal(degradedLocal.runtime.location, 'local')
+})

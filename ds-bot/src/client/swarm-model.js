@@ -5,20 +5,21 @@ export const WORKER_STATES = new Set(['working', 'waiting', 'stopped', 'killed']
 export const BOARD_POLL_MS = 2500
 
 // A worker waiting on a model quota counts under `quota`, not under its state.
-export const isQuotaWorker = worker => worker?.quota === true || worker?.state === 'quota'
-export const workersOf = swarm => (swarm?.workers ?? swarm?.members ?? []).filter(worker => worker && worker.state !== 'killed')
+export const isQuotaWorker = worker => worker?.quota === true || (typeof worker?.quota === 'object' && worker.quota !== null) || worker?.state === 'quota'
+export const workersOf = swarm => (swarm?.workers ?? swarm?.members ?? []).filter(worker => worker && worker.state !== 'killed' && worker.status !== 'killed')
 
 export function swarmCounts(swarm) {
   const counts = { working: 0, waiting: 0, quota: 0 }
   for (const worker of workersOf(swarm)) {
+    const state = worker.state ?? worker.status
     if (isQuotaWorker(worker)) counts.quota += 1
-    else if (worker.state === 'working') counts.working += 1
-    else if (worker.state === 'waiting') counts.waiting += 1
+    else if (state === 'working') counts.working += 1
+    else if (state === 'waiting') counts.waiting += 1
   }
   return counts
 }
 
-export const isLiveSwarm = swarm => swarm !== undefined && swarm !== null && swarm.status !== 'closed'
+export const isLiveSwarm = swarm => swarm !== undefined && swarm !== null && swarm.status !== 'closed' && swarm.closed !== true
 
 export function swarmsForSession(swarms, sessionId) {
   return Object.values(swarms ?? {})

@@ -80,7 +80,7 @@ export const TEAM_TOOLS = [
   'list_capabilities', 'save_capability', 'delete_capability',
   'attach_capability', 'detach_capability', 'use_pack', 'drop_pack', 'group_goal', 'group_task', 'list_connectors', 'request_connector',
   'task_start', 'task_send', 'task_stop', 'task_list', 'task_read',
-  'bot_code_search', 'bot_artifact', 'bot_takeover',
+  'bot_code_search', 'bot_artifact', 'bot_takeover', 'swarm',
 ]
 // The cloud hand-off tools (cloud-handoff.js). They run real work on the cloud sandbox,
 // so they stay out of TEAM_TOOLS, which groups.js reads as the team's quick tools.
