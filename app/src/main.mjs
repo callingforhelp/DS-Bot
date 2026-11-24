@@ -263,7 +263,13 @@ if (canonical !== undefined) {
     if (stopping) { void (hostStop ?? Promise.resolve()).then(() => { app.quit() }); return }
     void stopHost().then(() => { app.quit() })
   })
-  app.whenReady().then(async () => { shell.install(); await start() }).catch(fail)
+  app.whenReady().then(async () => {
+    shell.install()
+    if (process.platform === 'darwin' && systemPreferences.getMediaAccessStatus('microphone') === 'not-determined') {
+      void systemPreferences.askForMediaAccess('microphone').catch(() => {})
+    }
+    await start()
+  }).catch(fail)
 }
 
 function stopHost() {
