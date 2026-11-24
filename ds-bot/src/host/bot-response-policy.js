@@ -4,10 +4,15 @@
 //   off       bot messages never start new work here
 //   selected  only the Bots in `allow` (stable Bot IDs, never names) may
 //   all       any Bot may, still under the loop safeguards below
+// Group delivery is separate and optional:
+//   mention   allowed (an @ only from an allowed Bot) or anyone (an @ from any member)
+//   unnamed   ignore, selected (a listed Bot with no @), or allowed (any allowed Bot with no @)
+// Missing fields mean mention=allowed and unnamed=ignore, which is the previous rule.
 // No policy at all is the legacy behavior, which allows everything the existing
 // guards allow, so a team saved before this setting behaves as it did until the user
 // picks one. A group-triggered response needs both the recipient's policy and the
-// group's policy to allow the sender.
+// group's policy to allow the sender. Where the two cards disagree, the stricter
+// mention or unnamed rule wins. Off is never overruled by an @.
 //
 // Returning a result and starting a model turn to process it are separate operations.
 // User messages always pass. An automatic continuation counts against the task budget.
@@ -18,6 +23,10 @@
 import { createHash, randomUUID } from 'node:crypto'
 
 export const RESPONSE_MODES = ['off', 'selected', 'all']
+// Group delivery, independent of who is allowed. Missing fields keep today's behavior:
+// an @ is required, and it only works from a Bot the who-rule already allows.
+export const MENTION_VALUES = ['allowed', 'anyone']
+export const UNNAMED_VALUES = ['ignore', 'selected', 'allowed']
 // Automatic fix attempts per structured finding (PR, commit SHA, finding ID).
 export const FINDING_ATTEMPT_LIMIT = 2
 
@@ -83,6 +92,8 @@ export function cleanResponsePolicy(value, live, { selfId, strict = false } = {}
   if (!isObject(value)) return fail('A response policy is an object with a mode')
   if (!RESPONSE_MODES.includes(value.mode)) return fail(`Response mode must be one of ${RESPONSE_MODES.join(', ')}`)
   if (value.allow !== undefined && !Array.isArray(value.allow)) return fail('The allowed Bots are a list of Bot IDs')
+  const mention = optionalEnum(value.mention, 'mention', MENTION_VALUES, fail)
+  const unnamed = optionalEnum(value.unnamed, 'unnamed', UNNAMED_VALUES, fail)
   const ids = []
   for (const id of value.allow ?? []) {
     if (typeof id !== 'string') { fail('The allowed Bots are a list of Bot IDs'); continue }
@@ -90,7 +101,51 @@ export function cleanResponsePolicy(value, live, { selfId, strict = false } = {}
     if (live !== undefined && !live.has(id)) { fail(`Unknown Bot ${id} in the allowed list`); continue }
     ids.push(id)
   }
-  return value.mode === 'selected' ? { mode: 'selected', allow: ids } : { mode: value.mode, ...(ids.length > 0 ? { allow: ids } : {}) }
+  const extra = {
+    ...(mention === undefined ? {} : { mention }),
+    ...(unnamed === undefined ? {} : { unnamed }),
+  }
+  return value.mode === 'selected' ? { mode: 'selected', allow: ids, ...extra } : { mode: value.mode, ...(ids.length > 0 ? { allow: ids } : {}), ...extra }
+}
+
+const optionalEnum = (value, field, options, fail) => {
+  if (value === undefined) return undefined
+  if (!options.includes(value)) {
+    fail(`${field} must be one of ${options.join(', ')}`)
+    return undefined
+  }
+  return value
+}
+
+export const mentionOf = policy => (policy == null ? undefined : policy.mention === 'anyone' ? 'anyone' : 'allowed')
+export const unnamedOf = policy => {
+  if (policy == null) return undefined
+  return policy.unnamed === 'selected' || policy.unnamed === 'allowed' ? policy.unnamed : 'ignore'
+}
+
+// The stricter saved rule wins. A card that was never set does not vote, so a legacy
+// Bot keeps today's behavior until the user picks one.
+export function effectiveMention(recipient, room) {
+  const values = [mentionOf(recipient?.botResponse), mentionOf(room?.botResponse)].filter(Boolean)
+  if (values.length === 0) return 'allowed'
+  return values.includes('allowed') ? 'allowed' : 'anyone'
+}
+
+export function effectiveUnnamed(recipient, room) {
+  const values = [unnamedOf(recipient?.botResponse), unnamedOf(room?.botResponse)].filter(Boolean)
+  if (values.length === 0) return 'ignore'
+  if (values.includes('ignore')) return 'ignore'
+  if (values.includes('selected')) return 'selected'
+  return 'allowed'
+}
+
+// Whether a group message that does not @ this Bot should still start its turn.
+export function hearsWithoutMention(recipient, senderId, room) {
+  if (recipient == null || senderId == null || recipient.id === senderId) return false
+  const unnamed = effectiveUnnamed(recipient, room)
+  if (unnamed === 'ignore') return false
+  if (unnamed === 'selected' && !(recipient.botResponse?.allow ?? []).includes(senderId)) return false
+  return decideBotResponse({ sender: senderId, recipient, room }).allow
 }
 
 // Brings every saved policy up to date: unreadable ones go (back to legacy) and deleted
@@ -212,11 +267,23 @@ export function install(rt) {
   function check({ sender, recipient, room, result = false, named = true, idle = false, chain = [], event, finding, reviewFix = false, category, text, kind = 'message', parent, continuation = false }) {
     const decision = decideBotResponse({ sender, recipient, room })
     let { allow, reason } = decision
+    // A group @ can reach a Bot who did not list the sender, when both cards say
+    // mentions from anyone count. Off still refuses, and so does the stricter card.
+    let baseline = reason
+    if (!allow && room && named && !result && (reason === 'recipient-not-selected' || reason === 'group-not-selected') && effectiveMention(recipient, room) === 'anyone') {
+      const mine = ruleOf(recipient.botResponse, sender)
+      const group = ruleOf(room.botResponse, sender)
+      if (mine.rule !== 'off' && group.rule !== 'off') {
+        allow = true
+        reason = 'allowed-named'
+        baseline = reason
+      }
+    }
     if (allow && sender != null) {
       const key = findingKey(finding)
       const { events, findings, tasks } = safety()
       const prior = findings[key]
-      if (!result && decision.explicit && !named) reason = 'no-designated-recipient'
+      if (!result && decision.explicit && !named && !hearsWithoutMention(recipient, sender, room)) reason = 'no-designated-recipient'
       else if (!result && decision.explicit && idle) reason = 'acknowledgment-or-status'
       else if (!result && decision.explicit && chain.includes(recipient.id)) reason = 'circular-chain'
       else if (event !== undefined && events[eventKey(sender, recipient, room, event)]) reason = 'duplicate-event'
@@ -233,7 +300,7 @@ export function install(rt) {
       else if (key !== undefined && prior?.digest === digest(text)) reason = 'unchanged-finding'
       else if ((parent?.hops ?? 0) + (continuation ? 0 : 1) > BOT_HOP_LIMIT) reason = 'chain-hop-limit'
       else if ((tasks[parent?.task] ?? 0) >= BOT_TURN_LIMIT) reason = 'task-turn-limit'
-      allow = reason === decision.reason
+      allow = reason === baseline
     }
     if (sender != null) {
       record({ allow, reason, kind, from: sender, to: recipient?.id, ...(room ? { room: room.name } : {}), ...(finding ? { finding: findingKey(finding) } : {}) },

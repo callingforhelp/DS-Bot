@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { BOT_ROUTING_KEEP, BotResponseRefusal, cleanResponsePolicy, compactRouting, decideBotResponse, FINDING_ATTEMPT_LIMIT, findingOf, install, newTaskContext, normalizeResponsePolicies, policyPatch, reviewFixOf } from '../src/host/bot-response-policy.js'
+import { BOT_ROUTING_KEEP, BotResponseRefusal, cleanResponsePolicy, compactRouting, decideBotResponse, effectiveMention, effectiveUnnamed, FINDING_ATTEMPT_LIMIT, findingOf, hearsWithoutMention, install, newTaskContext, normalizeResponsePolicies, policyPatch, reviewFixOf } from '../src/host/bot-response-policy.js'
 
 const bot = (id, botResponse) => ({ id, name: id.toUpperCase(), ...(botResponse ? { botResponse } : {}) })
 
@@ -41,6 +41,9 @@ test('policies are validated strictly from the user and read leniently from disk
   assert.throws(() => policyPatch({ mode: 'maybe' }, live), /Response mode must be one of off, selected, all/)
   assert.throws(() => policyPatch({ mode: 'selected', allow: ['zzz'] }, live), /Unknown Bot zzz/)
   assert.throws(() => policyPatch({ mode: 'selected', allow: 'a' }, live), /list of Bot IDs/)
+  assert.throws(() => policyPatch({ mode: 'all', mention: 'sometimes' }, live), /mention must be one of/)
+  assert.deepEqual(policyPatch({ mode: 'selected', allow: ['a'], mention: 'anyone', unnamed: 'selected' }, live, 'b'), { mode: 'selected', allow: ['a'], mention: 'anyone', unnamed: 'selected' })
+  assert.deepEqual(cleanResponsePolicy({ mode: 'all', mention: 'nope', unnamed: 'selected' }, live), { mode: 'all', unnamed: 'selected' })
   assert.equal(cleanResponsePolicy({ mode: 'maybe' }, live), undefined)
   assert.deepEqual(cleanResponsePolicy({ mode: 'selected', allow: ['zzz', 'a', 7] }, live), { mode: 'selected', allow: ['a'] })
 })
@@ -71,6 +74,19 @@ test('under a chosen policy the call must name its recipient and not be thanks o
   assert.equal(check({ sender: 'a', recipient, named: false, text: 'x' }).reason, 'no-designated-recipient')
   assert.equal(check({ sender: 'a', recipient, idle: true, text: 'thanks!' }).reason, 'acknowledgment-or-status')
   assert.equal(check({ sender: 'a', recipient, text: 'please look' }).allow, true)
+  const room = { id: 'r', name: 'R' }
+  const selected = bot('b', { mode: 'selected', allow: ['a'], unnamed: 'selected' })
+  assert.equal(check({ sender: 'a', recipient: selected, room, named: false, text: 'x' }).allow, true, 'a selected sender is heard with no @')
+  assert.equal(check({ sender: 'c', recipient: selected, room, named: false, text: 'x' }).reason, 'recipient-not-selected')
+  assert.equal(check({ sender: 'c', recipient: { ...selected, botResponse: { ...selected.botResponse, mention: 'anyone' } }, room, named: true, text: '@b' }).allow, true, 'an @ from anyone is heard when the card says so')
+  assert.equal(check({ sender: 'c', recipient: selected, room, named: true, text: '@b' }).reason, 'recipient-not-selected', 'an @ still needs to be allowed until the card says anyone')
+  const strictRoom = { id: 'r', name: 'R', botResponse: { mode: 'all', unnamed: 'ignore' } }
+  assert.equal(check({ sender: 'a', recipient: selected, room: strictRoom, named: false, text: 'x' }).reason, 'no-designated-recipient', 'the group ignore rule wins')
+  assert.equal(check({ sender: 'a', recipient: bot('b', { mode: 'off', mention: 'anyone' }), room, named: true, text: '@b' }).reason, 'recipient-off')
+  assert.equal(hearsWithoutMention(selected, 'a', room), true)
+  assert.equal(hearsWithoutMention(selected, 'c', room), false)
+  assert.equal(effectiveMention({ botResponse: { mode: 'all', mention: 'anyone' } }, { botResponse: { mode: 'all', mention: 'allowed' } }), 'allowed')
+  assert.equal(effectiveUnnamed({ botResponse: { mode: 'selected', allow: ['a'], unnamed: 'allowed' } }, { botResponse: { mode: 'all', unnamed: 'selected' } }), 'selected')
   // The legacy default is left to the guards that were always there.
   assert.equal(check({ sender: 'a', recipient: bot('b'), named: false, idle: true, text: 'thanks!' }).allow, true)
 })

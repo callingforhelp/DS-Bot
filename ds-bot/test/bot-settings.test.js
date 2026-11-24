@@ -211,6 +211,20 @@ test('ALL BOTS warns, SELECTED BOTS lists identities to tick, and picking saves 
   assert.ok(textOf(card({ mode: 'selected', allow: [] })).includes('Pick at least one Bot'))
 })
 
+test('the group rules save mention and unnamed without dropping the allowed list', () => {
+  const saved = []
+  const nodes = card({ mode: 'selected', allow: ['a'] }, value => saved.push(value))
+  const press = label => nodes.find(node => node.type === 'button' && node.props.children?.[0] === label)
+  press('Anyone in the group').props.onClick()
+  press('Reply to a Selected Bot').props.onClick()
+  assert.deepEqual(JSON.parse(JSON.stringify(saved)), [
+    { mode: 'selected', allow: ['a'], mention: 'anyone', unnamed: 'ignore' },
+    { mode: 'selected', allow: ['a'], mention: 'allowed', unnamed: 'selected' },
+  ])
+  assert.equal(card(undefined).some(node => node.props?.children?.[0] === 'Anyone in the group'), false)
+  assert.equal(card({ mode: 'off' }).some(node => node.props?.children?.[0] === 'Ignore'), false)
+})
+
 test('reset goes back to the default, and the Bot settings carry the card', () => {
   const saved = []
   const reset = card({ mode: 'off' }, value => saved.push(value)).find(node => node.type === 'button' && node.props.className === 'bt-mini')
