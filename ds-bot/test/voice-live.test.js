@@ -42,6 +42,7 @@ runInNewContext(clientBundle.outputFiles[0].text, {
   String,
   Number,
   Array,
+  Uint8Array,
 })
 const { openLiveVoiceSession, formatCommentary, createCommentaryEvent } = clientMod.exports
 
@@ -488,4 +489,163 @@ test('voice-transcript-append persists non-delegated voice context across Local 
   assert.match(cloudPost.body.instructions, /Cloud machine "aws-voice-55"/)
   assert.match(cloudPost.body.instructions, /User: Run checks on AWS box\./)
   assert.match(cloudPost.body.instructions, /Assistant: All checks passed on AWS\./)
+})
+
+async function openMockLiveSession(extra = {}) {
+  const track = { enabled: true, stopped: false, stop() { this.stopped = true } }
+  const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+  let createdChannel = null
+  let createdPc = null
+
+  class MockPeerConnection {
+    constructor() {
+      this.iceGatheringState = 'complete'
+      this.connectionState = 'connected'
+      this._listeners = new Map()
+      this.ontrack = null
+      createdPc = this
+    }
+    addEventListener(name, fn) {
+      if (!this._listeners.has(name)) this._listeners.set(name, new Set())
+      this._listeners.get(name).add(fn)
+    }
+    removeEventListener(name, fn) { this._listeners.get(name)?.delete(fn) }
+    addTrack() {}
+    createDataChannel(label) {
+      createdChannel = { label, readyState: 'open', onmessage: null, send() {}, close() { this.readyState = 'closed' } }
+      return createdChannel
+    }
+    async createOffer() { return { type: 'offer', sdp: VALID_OFFER_SDP } }
+    async setLocalDescription(desc) { this.localDescription = desc }
+    async setRemoteDescription(desc) { this.remoteDescription = desc }
+    close() {}
+  }
+
+  const phases = []
+  const transcripts = []
+  const committed = []
+  const delegations = []
+  const levels = []
+
+  const session = await openLiveVoiceSession({
+    sessionId: 'a',
+    createSession: async () => ({ liveSessionId: 'live_mock', sdp: VALID_ANSWER_SDP, model: 'gpt-live-1.1', voice: 'marin' }),
+    closeSession: async () => {},
+    onPhase: p => phases.push(p),
+    onTranscript: tr => transcripts.push(tr),
+    onTranscriptCommit: c => committed.push(c),
+    onDelegation: d => delegations.push(d),
+    onLevel: v => levels.push(v),
+    mediaDevices: { getUserMedia: async () => stream },
+    PeerConnection: MockPeerConnection,
+    createAudioElement: () => ({ autoplay: false, playsInline: false, srcObject: null, play: async () => {}, pause() {}, remove() {} }),
+    AudioContextImpl: undefined,
+    ...extra,
+  })
+
+  return {
+    session,
+    phases,
+    transcripts,
+    committed,
+    delegations,
+    levels,
+    pc: createdPc,
+    emit: obj => createdChannel.onmessage({ data: JSON.stringify(obj) }),
+  }
+}
+
+test('gpt-live-1.1 delta-only multi-turn flow debounces back to listening, resets turns, and handles barge-in/standby', async () => {
+  const { session, phases, transcripts, committed, delegations, emit } = await openMockLiveSession({ speakIdleMs: 40 })
+
+  emit({ type: 'session.started' })
+  assert.equal(phases.at(-1), 'listening')
+
+  // Turn 1 without speech_started or response.done
+  emit({ type: 'session.input_transcript.delta', delta: 'Hello' })
+  emit({ type: 'session.output_transcript.delta', delta: 'Hi there!' })
+  assert.equal(phases.at(-1), 'speaking')
+  assert.deepEqual(committed.map(c => ({ role: c.role, text: c.text })), [{ role: 'user', text: 'Hello' }])
+
+  // Speaking idle debounce transitions back to listening and commits assistant output
+  await new Promise(resolve => setTimeout(resolve, 80))
+  assert.equal(phases.at(-1), 'listening')
+  assert.deepEqual(committed.map(c => ({ role: c.role, text: c.text })), [
+    { role: 'user', text: 'Hello' },
+    { role: 'assistant', text: 'Hi there!' },
+  ])
+
+  // Turn 2 without speech_started starts cleanly without concatenating Turn 1 input
+  emit({ type: 'session.input_transcript.delta', delta: 'Check git status' })
+  assert.equal(transcripts.at(-1).role, 'user')
+  assert.equal(transcripts.at(-1).text, 'Check git status')
+  assert.equal(phases.at(-1), 'listening')
+
+  emit({ type: 'session.delegation.created', delegation: { id: 'del_2', type: 'client' } })
+  assert.equal(delegations.length, 1)
+  assert.equal(delegations[0].delegationId, 'del_2')
+  assert.equal(delegations[0].query, 'Check git status')
+
+  // Barge-in during speaking commits partial assistant output and returns to listening immediately
+  emit({ type: 'session.output_transcript.delta', delta: 'Checking your repo' })
+  assert.equal(phases.at(-1), 'speaking')
+  // Non-delegated turn 3 starts by speaking over assistant
+  emit({ type: 'session.input_transcript.delta', delta: 'Wait stop' })
+  assert.equal(phases.at(-1), 'listening')
+  assert.equal(transcripts.at(-1).text, 'Wait stop')
+
+  // Standby wake directly via input transcript delta without session.resumed
+  emit({ type: 'session.paused' })
+  assert.equal(phases.at(-1), 'standby')
+  emit({ type: 'session.input_transcript.delta', delta: 'Wake up' })
+  assert.equal(phases.at(-1), 'listening')
+  assert.equal(transcripts.at(-1).text, 'Wake up')
+
+  session.close()
+})
+
+test('openLiveVoiceSession resumes AudioContext and meters remote audio levels during speaking', async () => {
+  let resumeCalls = 0
+  let closedCtx = false
+  const localStream = { getTracks: () => [{ enabled: true, stop() {} }], getAudioTracks: () => [{ enabled: true, stop() {} }] }
+  const remoteStream = { id: 'remote-stream' }
+
+  class MockAudioContext {
+    async resume() { resumeCalls += 1 }
+    async close() { closedCtx = true }
+    createAnalyser() {
+      return {
+        fftSize: 256,
+        frequencyBinCount: 16,
+        _fill: 128,
+        getByteTimeDomainData(buf) { buf.fill(this._fill) },
+      }
+    }
+    createMediaStreamSource(src) {
+      return {
+        connect(analyser) {
+          // Local mic is silent (128); remote stream has strong amplitude (200)
+          analyser._fill = src === remoteStream ? 200 : 128
+        },
+        disconnect() {},
+      }
+    }
+  }
+
+  const { session, levels, pc, emit } = await openMockLiveSession({
+    mediaDevices: { getUserMedia: async () => localStream },
+    AudioContextImpl: MockAudioContext,
+    speakIdleMs: 500,
+  })
+
+  assert.equal(resumeCalls, 1)
+  emit({ type: 'session.started' })
+  pc.ontrack({ streams: [remoteStream] })
+  emit({ type: 'session.output_transcript.delta', delta: 'Speaking aloud' })
+
+  await new Promise(resolve => setTimeout(resolve, 60))
+  assert.ok(levels.some(v => v > 0.1), `expected non-zero remote speaking level, got ${JSON.stringify(levels)}`)
+
+  session.close()
+  assert.equal(closedCtx, true)
 })

@@ -212,7 +212,12 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
       closeSession: actions.voiceSessionClose,
       onPhase: (next) => {
         if (disposed) return
-        setPhase(curr => (curr === 'paused' || curr === 'thinking' ? curr : next))
+        if (next === 'standby') setHeard('')
+        setPhase((curr) => {
+          if (curr === 'paused') return curr
+          if (next === 'listening' && waiting.current !== null) return 'thinking'
+          return next
+        })
       },
       onTranscript: ({ role, text }) => {
         if (disposed) return
@@ -369,7 +374,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
     }
   }, [engine, speech, catalog, listen, cycle])
   useEffect(() => {
-    if (phase !== 'thinking' || running || waiting.current === null) return undefined
+    if ((engine !== 'live' && phase !== 'thinking') || running || waiting.current === null) return undefined
     const count = lastReply.slice(0, lastReply.indexOf('|'))
     const turn = Number(lastReply.slice(lastReply.indexOf('|') + 1))
     if (count === waiting.current) return undefined
@@ -379,7 +384,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
         const delegationId = pendingDelegation.current
         pendingDelegation.current = null
         setHeard('')
-        setPhase('listening')
+        setPhase(curr => (curr === 'paused' ? curr : 'listening'))
         liveRef.current.sendCommentary(delegationId, text)
         return
       }
