@@ -126,6 +126,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   const [said, setSaid] = useState('')
   const [note, setNote] = useState('')
   const [cycle, setCycle] = useState(0)
+  const [liveAttempt, setLiveAttempt] = useState(0)
   const orbRef = useRef(null)
   const waiting = useRef(null)
   const reply = useRef(lastReply)
@@ -201,6 +202,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   useEffect(() => {
     if (engine !== 'live') return undefined
     let disposed = false
+    setNote('')
     setPhase('connecting')
     void openLiveVoiceSession({
       sessionId,
@@ -236,7 +238,9 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
       },
       onError: (msg) => {
         if (disposed) return
-        setNote(typeof msg === 'string' && msg ? msg : t("Couldn't connect voice session"))
+        const text = typeof msg === 'string' && msg ? msg : t("Couldn't connect voice session")
+        void actions.diagnostics?.({ level: 'error', source: 'voice-live', text }).catch?.(() => {})
+        setNote(text)
         setPhase('paused')
       },
     }).then((session) => {
@@ -250,6 +254,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
         : error?.kind === 'unavailable'
           ? t(CAPTURE_NOTES.unavailable)
           : (error?.message || t("Couldn't connect voice session"))
+      void actions.diagnostics?.({ level: 'error', source: 'voice-live', text: msg }).catch?.(() => {})
       setNote(msg)
       setPhase('paused')
     })
@@ -260,7 +265,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
       pendingDelegation.current = null
       current?.close()
     }
-  }, [engine, sessionId])
+  }, [engine, sessionId, liveAttempt])
   useEffect(() => {
     if (engine !== 'live') {
       prevLocation.current = runtime.location
@@ -278,10 +283,10 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
     })
   }, [engine, runtime.location, runtime.machineId, runtime.machineName])
   useEffect(() => {
-    if (!note) return undefined
+    if (!note || (engine === 'live' && phase === 'paused' && !liveRef.current)) return undefined
     const timer = setTimeout(() => setNote(''), 2600)
     return () => clearTimeout(timer)
-  }, [note])
+  }, [note, engine, phase])
   useEffect(() => {
     if (engine !== 'legacy' || !speech) return undefined
     let live = true
@@ -447,7 +452,11 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
   const togglePause = () => {
     if (engine === 'live') {
       if (phase === 'paused') {
-        liveRef.current?.setMuted(false)
+        if (!liveRef.current) {
+          setLiveAttempt(n => n + 1)
+          return
+        }
+        liveRef.current.setMuted(false)
         setPhase('listening')
       } else {
         liveRef.current?.setMuted(true)
