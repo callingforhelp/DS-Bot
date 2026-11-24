@@ -604,13 +604,17 @@ test('gpt-live-1.1 delta-only multi-turn flow debounces back to listening, reset
   session.close()
 })
 
-test('openLiveVoiceSession resumes AudioContext and meters remote audio levels during speaking', async () => {
+test('openLiveVoiceSession resumes AudioContext, routes remote playback via destination, and meters remote audio levels during speaking', async () => {
   let resumeCalls = 0
   let closedCtx = false
+  let connectedToDestination = false
+  const fakeDest = { id: 'audio-dest' }
+  const audioEl = { autoplay: false, playsInline: false, muted: false, srcObject: null, play: async () => {}, pause() {}, remove() {} }
   const localStream = { getTracks: () => [{ enabled: true, stop() {} }], getAudioTracks: () => [{ enabled: true, stop() {} }] }
   const remoteStream = { id: 'remote-stream' }
 
   class MockAudioContext {
+    constructor() { this.destination = fakeDest }
     async resume() { resumeCalls += 1 }
     async close() { closedCtx = true }
     createAnalyser() {
@@ -623,9 +627,13 @@ test('openLiveVoiceSession resumes AudioContext and meters remote audio levels d
     }
     createMediaStreamSource(src) {
       return {
-        connect(analyser) {
+        connect(target) {
+          if (target === fakeDest) {
+            if (src === remoteStream) connectedToDestination = true
+            return
+          }
           // Local mic is silent (128); remote stream has strong amplitude (200)
-          analyser._fill = src === remoteStream ? 200 : 128
+          target._fill = src === remoteStream ? 200 : 128
         },
         disconnect() {},
       }
@@ -635,12 +643,16 @@ test('openLiveVoiceSession resumes AudioContext and meters remote audio levels d
   const { session, levels, pc, emit } = await openMockLiveSession({
     mediaDevices: { getUserMedia: async () => localStream },
     AudioContextImpl: MockAudioContext,
+    createAudioElement: () => audioEl,
     speakIdleMs: 500,
   })
 
   assert.equal(resumeCalls, 1)
   emit({ type: 'session.started' })
   pc.ontrack({ streams: [remoteStream] })
+  assert.equal(connectedToDestination, true)
+  assert.equal(audioEl.muted, true)
+  assert.equal(resumeCalls, 2)
   emit({ type: 'session.output_transcript.delta', delta: 'Speaking aloud' })
 
   await new Promise(resolve => setTimeout(resolve, 60))

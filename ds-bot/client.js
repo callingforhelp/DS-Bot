@@ -48842,19 +48842,15 @@ async function openLiveVoiceSession({
           document.body?.appendChild?.(audioEl);
         }
       }
-      if (audioEl) {
-        audioEl.autoplay = true;
-        audioEl.playsInline = true;
-        audioEl.srcObject = remoteStream;
-        void Promise.resolve(audioEl.play?.()).catch(() => {
-        });
-      }
+      let routedViaAudioCtx = false;
       if (audioCtx && typeof audioCtx.createMediaStreamSource === "function") {
         try {
           try {
             remoteSource?.disconnect?.();
           } catch {
           }
+          void Promise.resolve(audioCtx.resume?.()).catch(() => {
+          });
           if (!remoteAnalyser) {
             remoteAnalyser = audioCtx.createAnalyser();
             remoteAnalyser.fftSize = 256;
@@ -48862,8 +48858,20 @@ async function openLiveVoiceSession({
           }
           remoteSource = audioCtx.createMediaStreamSource(remoteStream);
           remoteSource.connect(remoteAnalyser);
+          if (audioCtx.destination) {
+            remoteSource.connect(audioCtx.destination);
+            routedViaAudioCtx = true;
+          }
         } catch {
         }
+      }
+      if (audioEl) {
+        audioEl.autoplay = true;
+        audioEl.playsInline = true;
+        audioEl.muted = routedViaAudioCtx;
+        audioEl.srcObject = remoteStream;
+        void Promise.resolve(audioEl.play?.()).catch(() => {
+        });
       }
     };
     pc.onconnectionstatechange = () => {
