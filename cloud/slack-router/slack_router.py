@@ -822,28 +822,41 @@ class SlackRouter:
             )
 
     def _handle_message_event(self, event: dict[str, Any], event_id: str) -> None:
-        if event.get("bot_id") is not None:
-            return
+        ev_type = str(event.get("type") or "")
         subtype = event.get("subtype")
-        if subtype is not None and subtype != "file_share":
-            return
         channel = str(event.get("channel") or "").strip()
         channel_type = str(event.get("channel_type") or "").strip()
         user_id = str(event.get("user") or "").strip()
+        if event.get("bot_id") is not None:
+            return
+        if subtype is not None and subtype != "file_share":
+            sys.stderr.write(f"[slack-router] ignored subtype={subtype} type={ev_type} ch={channel}\n")
+            return
         msg_ts = str(event.get("ts") or "").strip()
         thread_ts = str(event.get("thread_ts") or msg_ts).strip()
-        ev_type = str(event.get("type") or "")
 
         is_direct = ev_type == "message" and channel_type == "im"
         is_mention = ev_type == "app_mention"
         if not (is_direct or is_mention):
+            sys.stderr.write(
+                f"[slack-router] ignored type={ev_type} ch={channel} ({channel_type}) user={user_id}: not dm or app_mention\n"
+            )
             return
         if not channel or not msg_ts:
             return
         if self.config.allowed_users and user_id not in self.config.allowed_users:
+            sys.stderr.write(
+                f"[slack-router] ignored user={user_id} ch={channel}: not in SLACK_ALLOWED_USERS\n"
+            )
             return
         if self.config.channel_map and channel not in self.config.channel_map and not is_direct:
+            sys.stderr.write(
+                f"[slack-router] ignored ch={channel} user={user_id}: channel not in SLACK_CHANNEL_MAP\n"
+            )
             return
+        sys.stderr.write(
+            f"[slack-router] accepted type={ev_type} ch={channel} ({channel_type}) user={user_id} ts={msg_ts}\n"
+        )
 
         dedup_key = event_id or f"{channel}:{msg_ts}"
         if not self.store.mark_seen_if_new(dedup_key):
