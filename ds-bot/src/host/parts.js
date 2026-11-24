@@ -21,7 +21,7 @@ import { openTurnAt } from './btw.js'
 import { HANDOFF_ACK, HISTORY_SCAN_PAGES, HISTORY_TIMEOUT_MS, REPLY_KIND, SOURCE_KIND } from './constants.js'
 import { assembleLlmStream } from './models.js'
 import { compressedRelayPreview, parseReplies, relayRange, stackReplies } from '../shared/group-replies.js'
-import { CHECKPOINT_PROMPT, STEWARD_SYSTEM, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest } from './steward.js'
+import { CHECKPOINT_PROMPT, DEFAULT_KEV_URL, STEWARD_SYSTEM, askKevSteward, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest } from './steward.js'
 import { RESUME_DELAY_MS } from './resume.js'
 import { clip, createClock, escapeRegExp, estimateTokens, reminderPrompts, splitRef, textOf } from './text.js'
 import { pageThinkingMs } from './thinking.js'
@@ -771,6 +771,20 @@ export function install(rt) {
     }
     // A CLI's own compactions are this part's checkpoints.
     const checkpoints = local ? rt.localAgentContext?.(agent.id)?.compactions ?? 0 : checkpointCount(session.deriveMessages())
+    const kevUrl = rt.config?.kevUrl ?? process.env.DSBOT_KEV_URL ?? (process.env.NODE_TEST_CONTEXT ? undefined : DEFAULT_KEV_URL)
+    const kevResult = typeof rt.kevSteward === 'function'
+      ? await rt.kevSteward({ lines, midTurn, checkpoints, group, signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS) }).catch(() => undefined)
+      : await askKevSteward({
+          lines,
+          midTurn,
+          checkpoints,
+          group,
+          url: kevUrl,
+          model: rt.config?.kevModel ?? process.env.DSBOT_KEV_MODEL,
+          apiKey: rt.config?.kevApiKey ?? process.env.KEV_API_KEY,
+          signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS),
+        })
+    if (kevResult?.action === 'switch' || kevResult?.action === 'compact') return kevResult.action
     const request = stewardRequest({ lines, midTurn, checkpoints, group })
     // A part on a local agent CLI asks its own CLI and model, in a one-off session.
     if (local) return parseDecision(await rt.localAgentAsk(agent.id, { system: STEWARD_SYSTEM, prompt: request, signal: AbortSignal.timeout(STEWARD_TIMEOUT_MS) }))

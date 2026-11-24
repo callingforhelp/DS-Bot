@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { CHECKPOINT_PROMPT, DEFAULT_WINDOW, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest } from '../src/host/steward.js'
+import { CHECKPOINT_PROMPT, DEFAULT_KEV_URL, DEFAULT_WINDOW, askKevSteward, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, kevStewardRequest, linesFor, parseDecision, scoreKevDecision, stewardRequest } from '../src/host/steward.js'
 
 test('the lines follow the model: its window less the room for its reply', () => {
   assert.deepEqual(linesFor({ window: 500_000, reserve: 0, checkRatio: 0.8 }), { window: 500_000, usable: 500_000, hard: 475_000, check: 380_000 })
@@ -117,4 +117,103 @@ test('the checkpoint also reads the messages the backend keeps after it', () => 
 test('the checkpoint records unanswered requests as remaining, and does not answer them', () => {
   assert.match(CHECKPOINT_PROMPT, /every request not yet answered in your replies above/)
   assert.match(CHECKPOINT_PROMPT, /The user never sees this summary, so do not do any of the remaining work in it/)
+})
+
+test('kevStewardRequest structures conversation oldest-first with 4 single-prefill boundary questions', () => {
+  const req = kevStewardRequest({
+    lines: [
+      { who: 'you', text: 'All 32 tests pass.' },
+      { who: 'user', text: 'Run worker_test.py' },
+    ],
+    midTurn: false,
+    checkpoints: 2,
+    group: true,
+  })
+  assert.equal(req.model, 'kev-latest')
+  assert.equal(req.state.chat_type, 'group')
+  assert.equal(req.state.assistant_still_in_turn, false)
+  assert.equal(req.state.prior_compactions, 2)
+  assert.equal(req.state.initial_user_request, 'Run worker_test.py')
+  assert.equal(req.state.latest_assistant_message, 'All 32 tests pass.')
+  assert.deepEqual(req.state.conversation_oldest_first.map(x => x.speaker), ['user', 'you'])
+  assert.deepEqual(Object.keys(req.questions), [
+    'skipped_or_unfinished_subtask',
+    'has_unanswered_question_or_wait',
+    'has_pending_next_step',
+    'action',
+  ])
+})
+
+test('scoreKevDecision blends probabilities, gates midTurn, and defers on ambiguity or truncation', () => {
+  const makeResp = (pAction, pSkip, pWait, pNext, extra = {}) => ({
+    ...extra,
+    answers: {
+      action: { probabilities: { switch: pAction, compact: 1 - pAction } },
+      skipped_or_unfinished_subtask: { noul: pSkip },
+      has_unanswered_question_or_wait: { noul: pWait },
+      has_pending_next_step: { noul: pNext },
+    },
+  })
+  const sw = scoreKevDecision(makeResp(0.95, 0.05, 0.05, 0.05), { midTurn: false })
+  assert.equal(sw.action, 'switch')
+  assert.equal(sw.confident, true)
+
+  const cp = scoreKevDecision(makeResp(0.20, 0.80, 0.10, 0.10), { midTurn: false })
+  assert.equal(cp.action, 'compact')
+  assert.equal(cp.confident, true)
+
+  // midTurn forces compact even if text looked finished
+  const mid = scoreKevDecision(makeResp(0.95, 0.05, 0.05, 0.05), { midTurn: true })
+  assert.equal(mid.action, 'compact')
+  assert.equal(mid.confident, true)
+
+  // Ambiguous band returns action=undefined so LLM steward handles it
+  const ambig = scoreKevDecision(makeResp(0.55, 0.25, 0.10, 0.10), { midTurn: false })
+  assert.equal(ambig.action, undefined)
+  assert.equal(ambig.confident, false)
+
+  // Truncated response is never trusted
+  const trunc = scoreKevDecision(makeResp(0.99, 0.01, 0.01, 0.01, { truncated: true }), { midTurn: false })
+  assert.equal(trunc.action, undefined)
+  assert.equal(trunc.confident, false)
+})
+
+test('askKevSteward handles disabled URLs, network failures, and calibrated responses', async () => {
+  assert.equal(DEFAULT_KEV_URL, 'http://127.0.0.1:8009/v1/systemone')
+  assert.equal(await askKevSteward({ lines: [], url: 'off' }), undefined)
+  assert.equal(await askKevSteward({ lines: [], url: '' }), undefined)
+  assert.equal(
+    await askKevSteward({
+      lines: [],
+      url: 'http://127.0.0.1:8009/v1/systemone',
+      fetchImpl: async () => { throw new Error('ECONNREFUSED') },
+    }),
+    undefined,
+  )
+  let seenAuth
+  const res = await askKevSteward({
+    lines: [{ who: 'you', text: 'Done.' }, { who: 'user', text: 'Hi' }],
+    midTurn: false,
+    checkpoints: 0,
+    group: false,
+    url: 'http://127.0.0.1:8009/v1/systemone',
+    apiKey: 'test-kev-key',
+    fetchImpl: async (_url, init) => {
+      seenAuth = init.headers.authorization
+      return {
+        ok: true,
+        json: async () => ({
+          answers: {
+            action: { probabilities: { switch: 0.92, compact: 0.08 } },
+            skipped_or_unfinished_subtask: { noul: 0.05 },
+            has_unanswered_question_or_wait: { noul: 0.04 },
+            has_pending_next_step: { noul: 0.03 },
+          },
+        }),
+      }
+    },
+  })
+  assert.equal(seenAuth, 'Bearer test-kev-key')
+  assert.equal(res?.action, 'switch')
+  assert.equal(res?.confident, true)
 })
