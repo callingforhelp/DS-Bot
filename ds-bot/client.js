@@ -49163,6 +49163,7 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
   const [said, setSaid] = (0, import_react74.useState)("");
   const [note, setNote] = (0, import_react74.useState)("");
   const [cycle, setCycle] = (0, import_react74.useState)(0);
+  const [liveAttempt, setLiveAttempt] = (0, import_react74.useState)(0);
   const orbRef = (0, import_react74.useRef)(null);
   const waiting = (0, import_react74.useRef)(null);
   const reply = (0, import_react74.useRef)(lastReply);
@@ -49229,6 +49230,7 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
   (0, import_react74.useEffect)(() => {
     if (engine !== "live") return void 0;
     let disposed = false;
+    setNote("");
     setPhase("connecting");
     void openLiveVoiceSession({
       sessionId,
@@ -49266,7 +49268,10 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
       },
       onError: (msg) => {
         if (disposed) return;
-        setNote(typeof msg === "string" && msg ? msg : t("Couldn't connect voice session"));
+        const text = typeof msg === "string" && msg ? msg : t("Couldn't connect voice session");
+        void actions.diagnostics?.({ level: "error", source: "voice-live", text }).catch?.(() => {
+        });
+        setNote(text);
         setPhase("paused");
       }
     }).then((session) => {
@@ -49279,6 +49284,8 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
     }).catch((error) => {
       if (disposed) return;
       const msg = error?.kind === "blocked" ? t(CAPTURE_NOTES.blocked) : error?.kind === "unavailable" ? t(CAPTURE_NOTES.unavailable) : error?.message || t("Couldn't connect voice session");
+      void actions.diagnostics?.({ level: "error", source: "voice-live", text: msg }).catch?.(() => {
+      });
       setNote(msg);
       setPhase("paused");
     });
@@ -49289,7 +49296,7 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
       pendingDelegation.current = null;
       current2?.close();
     };
-  }, [engine, sessionId]);
+  }, [engine, sessionId, liveAttempt]);
   (0, import_react74.useEffect)(() => {
     if (engine !== "live") {
       prevLocation.current = runtime.location;
@@ -49305,10 +49312,10 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
     });
   }, [engine, runtime.location, runtime.machineId, runtime.machineName]);
   (0, import_react74.useEffect)(() => {
-    if (!note) return void 0;
+    if (!note || engine === "live" && phase === "paused" && !liveRef.current) return void 0;
     const timer = setTimeout(() => setNote(""), 2600);
     return () => clearTimeout(timer);
-  }, [note]);
+  }, [note, engine, phase]);
   (0, import_react74.useEffect)(() => {
     if (engine !== "legacy" || !speech) return void 0;
     let live = true;
@@ -49485,7 +49492,11 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
   const togglePause = () => {
     if (engine === "live") {
       if (phase === "paused") {
-        liveRef.current?.setMuted(false);
+        if (!liveRef.current) {
+          setLiveAttempt((n) => n + 1);
+          return;
+        }
+        liveRef.current.setMuted(false);
         setPhase("listening");
       } else {
         liveRef.current?.setMuted(true);
