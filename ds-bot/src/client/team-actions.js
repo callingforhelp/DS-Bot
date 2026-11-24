@@ -358,6 +358,7 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     voiceSessionCreate: payload => call('voice-session-create', payload),
     voiceSessionClose: liveSessionId => call('voice-session-close', { liveSessionId }).catch(() => ({ closed: false })),
     voiceTranscriptAppend: (sessionId, role, text) => call('voice-transcript-append', { sessionId, role, text }).catch(() => ({ saved: false })),
+    voiceDiag: (sessionId, text, level = 'info') => call('voice-diag', { sessionId, text, level }).catch(() => ({ logged: false })),
     // A failed action away from any form (a menu, the palette) shows as a toast.
     reportError: (error, where = 'action') => {
       noteClientError(where, error)

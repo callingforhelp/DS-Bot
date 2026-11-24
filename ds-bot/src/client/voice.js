@@ -236,10 +236,11 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
         pendingDelegation.current = delegationId ?? null
         submit(query)
       },
+      onDiag: text => void actions.voiceDiag?.(sessionId, text, 'info'),
       onError: (msg) => {
         if (disposed) return
         const text = typeof msg === 'string' && msg ? msg : t("Couldn't connect voice session")
-        void actions.diagnostics?.({ level: 'error', source: 'voice-live', text }).catch?.(() => {})
+        void actions.voiceDiag?.(sessionId, text, 'error')
         setNote(text)
         setPhase('paused')
       },
@@ -254,7 +255,7 @@ export function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, u
         : error?.kind === 'unavailable'
           ? t(CAPTURE_NOTES.unavailable)
           : (error?.message || t("Couldn't connect voice session"))
-      void actions.diagnostics?.({ level: 'error', source: 'voice-live', text: msg }).catch?.(() => {})
+      void actions.voiceDiag?.(sessionId, msg, 'error')
       setNote(msg)
       setPhase('paused')
     })

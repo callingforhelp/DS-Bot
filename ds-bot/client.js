@@ -17015,6 +17015,7 @@ function teamActions({ call: call2, after, partFor, roster, ui, live, cards, hel
     voiceSessionCreate: (payload) => call2("voice-session-create", payload),
     voiceSessionClose: (liveSessionId) => call2("voice-session-close", { liveSessionId }).catch(() => ({ closed: false })),
     voiceTranscriptAppend: (sessionId, role, text) => call2("voice-transcript-append", { sessionId, role, text }).catch(() => ({ saved: false })),
+    voiceDiag: (sessionId, text, level = "info") => call2("voice-diag", { sessionId, text, level }).catch(() => ({ logged: false })),
     // A failed action away from any form (a menu, the palette) shows as a toast.
     reportError: (error, where = "action") => {
       noteClientError(where, error);
@@ -48664,6 +48665,7 @@ async function openLiveVoiceSession({
   onLevel,
   onDelegation,
   onError,
+  onDiag,
   mediaDevices = typeof navigator !== "undefined" ? navigator.mediaDevices : void 0,
   PeerConnection = globalThis.RTCPeerConnection,
   createAudioElement,
@@ -48694,7 +48696,10 @@ async function openLiveVoiceSession({
   let committedInput = false;
   let committedOutput = false;
   let speakingTimer = null;
+  let diagTimer = null;
   let muted = false;
+  let maxLocalLevel = 0;
+  let lastLoggedEvent = "";
   let rafId = 0;
   let audioEl = null;
   let audioCtx = null;
@@ -48760,6 +48765,10 @@ async function openLiveVoiceSession({
     if (closed) return;
     closed = true;
     clearSpeakingTimer();
+    if (diagTimer) {
+      clearTimeout(diagTimer);
+      diagTimer = null;
+    }
     if (rafId) {
       cancelFrame(rafId);
       rafId = 0;
@@ -48828,7 +48837,16 @@ async function openLiveVoiceSession({
     for (const track of stream.getTracks()) {
       pc.addTrack(track, stream);
     }
+    const micTrack = stream.getAudioTracks?.()[0] ?? stream.getTracks?.()[0];
+    const micSettings = micTrack?.getSettings?.() ?? {};
+    onDiag?.(`mic: label=${micTrack?.label ?? "?"} muted=${Boolean(micTrack?.muted)} ready=${micTrack?.readyState ?? "?"} sr=${micSettings.sampleRate ?? "?"} ctxRate=${audioCtx?.sampleRate ?? "?"} ctxState=${audioCtx?.state ?? "?"}`);
     dc = pc.createDataChannel("oai-events");
+    dc.onopen = () => {
+      if (!closed) onDiag?.("dc: open");
+    };
+    dc.onclose = () => {
+      if (!closed) onDiag?.("dc: close");
+    };
     pc.ontrack = (event) => {
       if (closed) return;
       const remoteStream = event.streams?.[0] ?? (typeof MediaStream === "function" && event.track ? new MediaStream([event.track]) : null);
@@ -48876,9 +48894,14 @@ async function openLiveVoiceSession({
     };
     pc.onconnectionstatechange = () => {
       if (closed) return;
+      onDiag?.(`pc: conn=${pc.connectionState} ice=${pc.iceConnectionState ?? "?"}`);
       if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
         onError?.("Voice connection lost");
       }
+    };
+    pc.oniceconnectionstatechange = () => {
+      if (closed) return;
+      onDiag?.(`ice: ${pc.iceConnectionState}`);
     };
     dc.onmessage = (message) => {
       if (closed) return;
@@ -48890,6 +48913,10 @@ async function openLiveVoiceSession({
       }
       if (!event || typeof event !== "object") return;
       onEvent?.(event);
+      if (!event.type?.endsWith(".delta") || lastLoggedEvent !== event.type) {
+        lastLoggedEvent = String(event.type ?? "");
+        onDiag?.(`event: ${lastLoggedEvent}`);
+      }
       switch (event.type) {
         case "session.started":
           setPhase("listening");
@@ -48979,6 +49006,7 @@ async function openLiveVoiceSession({
         const tick = () => {
           if (closed) return;
           const localLevel = !muted && localAnalyser && localData ? measure(localAnalyser, localData) : 0;
+          if (localLevel > maxLocalLevel) maxLocalLevel = localLevel;
           const remoteLevel = remoteAnalyser && remoteData ? measure(remoteAnalyser, remoteData) : 0;
           if (currentPhase === "speaking" && remoteLevel > 0.03) {
             scheduleFinishOutput();
@@ -49012,6 +49040,24 @@ async function openLiveVoiceSession({
     }
     liveSessionId = meta.liveSessionId;
     await pc.setRemoteDescription({ type: "answer", sdp: meta.sdp });
+    onDiag?.(`session: id=${liveSessionId} via=${meta.via ?? "?"} model=${meta.model ?? "?"}`);
+    if (typeof pc.getStats === "function" && typeof onDiag === "function") {
+      diagTimer = setTimeout(async () => {
+        diagTimer = null;
+        if (closed) return;
+        try {
+          let out = null, inp = null, src = null, pair = null;
+          for (const [, s] of await pc.getStats()) {
+            if (s.type === "outbound-rtp") out = `${s.packetsSent ?? 0}pkt/${s.bytesSent ?? 0}B`;
+            else if (s.type === "inbound-rtp") inp = `${s.packetsReceived ?? 0}pkt/${s.bytesReceived ?? 0}B`;
+            else if (s.type === "media-source") src = `lvl=${Number(s.audioLevel ?? 0).toFixed(4)},energy=${Number(s.totalAudioEnergy ?? 0).toFixed(4)}`;
+            else if (s.type === "candidate-pair" && s.nominated) pair = s.state;
+          }
+          onDiag(`stats(3s): pair=${pair ?? "?"} out=${out ?? "?"} in=${inp ?? "?"} src=${src ?? "?"} maxLocal=${maxLocalLevel.toFixed(3)}`);
+        } catch {
+        }
+      }, 3e3);
+    }
     if (closed) {
       cleanup({ notifyClose: true });
       throw new Error("Voice session closed during setup");
@@ -49266,11 +49312,11 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
         pendingDelegation.current = delegationId ?? null;
         submit(query);
       },
+      onDiag: (text) => void actions.voiceDiag?.(sessionId, text, "info"),
       onError: (msg) => {
         if (disposed) return;
         const text = typeof msg === "string" && msg ? msg : t("Couldn't connect voice session");
-        void actions.diagnostics?.({ level: "error", source: "voice-live", text }).catch?.(() => {
-        });
+        void actions.voiceDiag?.(sessionId, text, "error");
         setNote(text);
         setPhase("paused");
       }
@@ -49284,8 +49330,7 @@ function VoiceMode({ sessionId, paneLeft, roster, actions, useSessions, useSessi
     }).catch((error) => {
       if (disposed) return;
       const msg = error?.kind === "blocked" ? t(CAPTURE_NOTES.blocked) : error?.kind === "unavailable" ? t(CAPTURE_NOTES.unavailable) : error?.message || t("Couldn't connect voice session");
-      void actions.diagnostics?.({ level: "error", source: "voice-live", text: msg }).catch?.(() => {
-      });
+      void actions.voiceDiag?.(sessionId, msg, "error");
       setNote(msg);
       setPhase("paused");
     });

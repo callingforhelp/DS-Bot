@@ -67,6 +67,7 @@ export async function openLiveVoiceSession({
   onLevel,
   onDelegation,
   onError,
+  onDiag,
   mediaDevices = typeof navigator !== 'undefined' ? navigator.mediaDevices : undefined,
   PeerConnection = globalThis.RTCPeerConnection,
   createAudioElement,
@@ -99,7 +100,10 @@ export async function openLiveVoiceSession({
   let committedInput = false
   let committedOutput = false
   let speakingTimer = null
+  let diagTimer = null
   let muted = false
+  let maxLocalLevel = 0
+  let lastLoggedEvent = ''
   let rafId = 0
   let audioEl = null
   let audioCtx = null
@@ -178,6 +182,10 @@ export async function openLiveVoiceSession({
     if (closed) return
     closed = true
     clearSpeakingTimer()
+    if (diagTimer) {
+      clearTimeout(diagTimer)
+      diagTimer = null
+    }
     if (rafId) {
       cancelFrame(rafId)
       rafId = 0
@@ -223,8 +231,13 @@ export async function openLiveVoiceSession({
     for (const track of stream.getTracks()) {
       pc.addTrack(track, stream)
     }
+    const micTrack = stream.getAudioTracks?.()[0] ?? stream.getTracks?.()[0]
+    const micSettings = micTrack?.getSettings?.() ?? {}
+    onDiag?.(`mic: label=${micTrack?.label ?? '?'} muted=${Boolean(micTrack?.muted)} ready=${micTrack?.readyState ?? '?'} sr=${micSettings.sampleRate ?? '?'} ctxRate=${audioCtx?.sampleRate ?? '?'} ctxState=${audioCtx?.state ?? '?'}`)
 
     dc = pc.createDataChannel('oai-events')
+    dc.onopen = () => { if (!closed) onDiag?.('dc: open') }
+    dc.onclose = () => { if (!closed) onDiag?.('dc: close') }
 
     pc.ontrack = (event) => {
       if (closed) return
@@ -268,9 +281,14 @@ export async function openLiveVoiceSession({
 
     pc.onconnectionstatechange = () => {
       if (closed) return
+      onDiag?.(`pc: conn=${pc.connectionState} ice=${pc.iceConnectionState ?? '?'}`)
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
         onError?.('Voice connection lost')
       }
+    }
+    pc.oniceconnectionstatechange = () => {
+      if (closed) return
+      onDiag?.(`ice: ${pc.iceConnectionState}`)
     }
 
     dc.onmessage = (message) => {
@@ -283,6 +301,10 @@ export async function openLiveVoiceSession({
       }
       if (!event || typeof event !== 'object') return
       onEvent?.(event)
+      if (!event.type?.endsWith('.delta') || lastLoggedEvent !== event.type) {
+        lastLoggedEvent = String(event.type ?? '')
+        onDiag?.(`event: ${lastLoggedEvent}`)
+      }
 
       switch (event.type) {
         case 'session.started':
@@ -375,6 +397,7 @@ export async function openLiveVoiceSession({
         const tick = () => {
           if (closed) return
           const localLevel = !muted && localAnalyser && localData ? measure(localAnalyser, localData) : 0
+          if (localLevel > maxLocalLevel) maxLocalLevel = localLevel
           const remoteLevel = remoteAnalyser && remoteData ? measure(remoteAnalyser, remoteData) : 0
           if (currentPhase === 'speaking' && remoteLevel > 0.03) {
             scheduleFinishOutput()
@@ -414,6 +437,23 @@ export async function openLiveVoiceSession({
 
     liveSessionId = meta.liveSessionId
     await pc.setRemoteDescription({ type: 'answer', sdp: meta.sdp })
+    onDiag?.(`session: id=${liveSessionId} via=${meta.via ?? '?'} model=${meta.model ?? '?'}`)
+    if (typeof pc.getStats === 'function' && typeof onDiag === 'function') {
+      diagTimer = setTimeout(async () => {
+        diagTimer = null
+        if (closed) return
+        try {
+          let out = null, inp = null, src = null, pair = null
+          for (const [, s] of await pc.getStats()) {
+            if (s.type === 'outbound-rtp') out = `${s.packetsSent ?? 0}pkt/${s.bytesSent ?? 0}B`
+            else if (s.type === 'inbound-rtp') inp = `${s.packetsReceived ?? 0}pkt/${s.bytesReceived ?? 0}B`
+            else if (s.type === 'media-source') src = `lvl=${Number(s.audioLevel ?? 0).toFixed(4)},energy=${Number(s.totalAudioEnergy ?? 0).toFixed(4)}`
+            else if (s.type === 'candidate-pair' && s.nominated) pair = s.state
+          }
+          onDiag(`stats(3s): pair=${pair ?? '?'} out=${out ?? '?'} in=${inp ?? '?'} src=${src ?? '?'} maxLocal=${maxLocalLevel.toFixed(3)}`)
+        } catch {}
+      }, 3000)
+    }
 
     if (closed) {
       cleanup({ notifyClose: true })

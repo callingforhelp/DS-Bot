@@ -859,6 +859,7 @@ export function install(rt) {
         case 'voice-session-create':
         case 'voice-session-close':
         case 'voice-transcript-append':
+        case 'voice-diag':
           await rt.load()
           return ok(await rt.voiceEndpoint(endpoint, body))
         case 'bot-stop-task': {
