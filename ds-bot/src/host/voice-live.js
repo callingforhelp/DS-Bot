@@ -405,13 +405,15 @@ export function install(rt) {
         }
 
         if (controllerRes) {
-          if (controllerRes.status >= 400 && controllerRes.status < 500) {
+          const endpointMissing = controllerRes.status === 404 || controllerRes.status === 501
+          if (viaMode !== 'controller' && endpointMissing) {
+            // Controller lacks /v1/voice/sessions (404/501); fall through to openai-direct.
+          } else if (controllerRes.status >= 400 && controllerRes.status < 500) {
             throw invalid(
               controllerRes.body?.error ?? `Cloud controller voice rejected request (HTTP ${controllerRes.status})`,
               controllerRes.status === 400 ? 'bot/invalid' : 'bot/refused',
             )
-          }
-          if (viaMode === 'controller' || controllerRes.status !== 501) {
+          } else {
             throw unavailable(
               controllerRes.body?.error ?? `Cloud controller voice failed (HTTP ${controllerRes.status})`,
             )

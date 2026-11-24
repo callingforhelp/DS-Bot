@@ -64,7 +64,7 @@ function seedState({ cloudRuntime } = {}) {
   }
 }
 
-async function setupVoiceHost(t, { cloudRuntime, operator = true, controllerConfigured = true, controllerOnline = true, directKey, credentialsKey, secretKey } = {}) {
+async function setupVoiceHost(t, { cloudRuntime, operator = true, controllerConfigured = true, controllerOnline = true, controllerMissingVoiceRoutes = false, directKey, credentialsKey, secretKey } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-voice-live-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(seedState({ cloudRuntime })))
   const operatorFile = join(home, 'operator.json')
@@ -93,6 +93,9 @@ async function setupVoiceHost(t, { cloudRuntime, operator = true, controllerConf
       verifyHmac(init.headers ?? {}, method, `${u.pathname}${u.search}`, raw, secret)
       controllerCalls.push({ method, path: u.pathname, body: json })
 
+      if (controllerMissingVoiceRoutes) {
+        return { ok: false, status: 404, json: async () => ({ error: 'not found' }) }
+      }
       if (method === 'GET' && u.pathname === '/v1/voice/config') {
         return {
           ok: true,
@@ -286,6 +289,19 @@ test('host falls back to direct OpenAI /v1/live/sessions via credentials or secr
   const secretCreated = await secretHost.call('voice-session-create', { sessionId: 'a', sdp: VALID_OFFER_SDP })
   assert.equal(secretCreated.ok, true)
   assert.equal(secretHost.openaiCalls[0].headers.authorization, `Bearer ${storeSecret}`)
+
+  // 2b. Controller returning 404 {"error":"not found"} on /v1/voice/* falls back to openai-direct
+  const missingRouteHost = await setupVoiceHost(t, {
+    controllerMissingVoiceRoutes: true,
+    secretKey: storeSecret,
+  })
+  const missingRouteStatus = await missingRouteHost.call('voice-status', { sessionId: 'a' })
+  assert.equal(missingRouteStatus.ok, true)
+  assert.equal(missingRouteStatus.value.via, 'openai-direct')
+  const missingRouteCreated = await missingRouteHost.call('voice-session-create', { sessionId: 'a', sdp: VALID_OFFER_SDP })
+  assert.equal(missingRouteCreated.ok, true)
+  assert.equal(missingRouteCreated.value.via, 'openai-direct')
+  assert.equal(missingRouteHost.openaiCalls[0].headers.authorization, `Bearer ${storeSecret}`)
 
   // 3. No controller and no key reports unavailable cleanly
   const unconfiguredHost = await setupVoiceHost(t, { operator: false })
