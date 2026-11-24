@@ -1270,6 +1270,20 @@ body[data-ds-dark-theme] .bt-select{color-scheme:dark}
 .bt-mem-entry-copy{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
 .bt-mem-entry-text{font-size:14px;line-height:20px;overflow-wrap:anywhere}
 .bt-mem-entry-meta{font-size:12px;line-height:16px;color:var(--bt-ink-3);font-variant-numeric:tabular-nums}
+.bt-mem-toolbar{display:flex;align-items:center;gap:8px;padding:8px 20px;border-bottom:.5px solid var(--bt-line);flex:none}
+.bt-mem-search{flex:1;min-width:0;height:32px;padding:0 12px;border:.5px solid var(--bt-line);border-radius:8px;background:var(--bt-card);color:var(--bt-ink);font:inherit;font-size:13px;line-height:20px}
+.bt-mem-search:focus-visible{outline:2px solid var(--bt-accent);outline-offset:-1px}
+.bt-mem-mode{flex:none}
+.bt-seg-btn{height:28px;padding:0 8px;border:0;border-radius:8px;background:transparent;color:var(--bt-ink-2);font:inherit;font-size:12px;line-height:16px;font-weight:500;cursor:pointer;transition:background-color .12s ease,color .12s ease}
+.bt-seg-btn[aria-checked=true]{background:var(--bt-card);color:var(--bt-ink)}
+.bt-mem-import{display:flex;align-items:center;gap:8px;padding:8px 20px;border-bottom:.5px solid var(--bt-line);flex:none}
+.bt-mem-prov-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.bt-mem-prov{cursor:pointer;font-variant-numeric:tabular-nums}
+.bt-mem-prov:hover{background:var(--bt-hover);color:var(--bt-ink)}
+.bt-drawer-swarm-row{width:100%;border:0;background:transparent;cursor:pointer;text-align:left;padding:4px 8px;border-radius:8px}
+.bt-drawer-swarm-row:hover{background:var(--bt-hover)}
+.bt-art-form{display:flex;flex-direction:column;gap:8px;padding:12px}
+.bt-learning-prov{margin-top:4px;font-variant-numeric:tabular-nums}
 .bt-mem-remove{flex:none;height:28px;min-width:28px;border-radius:999px;border:0;background:none;color:var(--bt-ink-3);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:0 6px;font:inherit;font-size:12px;opacity:0;transition:opacity .12s ease,background-color .12s ease,color .12s ease}
 .bt-mem-entry:hover .bt-mem-remove,.bt-mem-remove:focus-visible,.bt-mem-remove[data-confirm]{opacity:1}
 .bt-mem-remove:hover{background:var(--bt-hover);color:var(--bt-ink)}

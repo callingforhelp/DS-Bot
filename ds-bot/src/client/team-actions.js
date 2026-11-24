@@ -52,7 +52,7 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
         const snap = roster.getSnapshot()
         const view = state.view === 'browser' && snap.byId[id] === undefined ? 'details'
           : state.view === 'side' && !(snap.sideChats?.[snap.byId[id]?.id] ?? []).some(chat => chat?.id === state.side) ? 'details'
-            : state.view === 'task' ? 'details'
+            : state.view === 'task' || state.view === 'swarm' ? 'details'
               : state.view
         return { ...state, details: id, view, task: null, renaming: false, tab: null }
       })
@@ -68,8 +68,16 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     closeMemory: () => { ui.set(state => (state.memory ? { ...state, memory: null } : state)) },
     openConnectors: () => { ui.set(state => ({ ...state, settings: { page: 'connectors', id: null }, menu: null, palette: null, newChat: null })) },
     setPanelView: (view) => {
-      if (view !== 'details' && view !== 'browser' && view !== 'side' && view !== 'task') return
+      if (view !== 'details' && view !== 'browser' && view !== 'side' && view !== 'task' && view !== 'swarm') return
       ui.set(state => (state.details && state.view !== view ? { ...state, view, ...(view === 'details' ? { tab: null } : {}), panelYield: yieldTo(state, view) } : state))
+    },
+    // The swarm board in the panel: `view: 'swarm'` names it by id, like a task reader.
+    openSwarm: (sessionId, swarmId) => {
+      if (!sessionId || !swarmId) return
+      ui.set(state => ({ ...state, details: sessionId, view: 'swarm', swarm: swarmId, renaming: false, tab: null, panelYield: yieldTo(state, 'details') }))
+    },
+    closeSwarmView: () => {
+      ui.set(state => (state.details && state.view === 'swarm' ? { ...state, view: 'details', swarm: null, tab: null } : { ...state, swarm: null }))
     },
     openTaskDeck: (targetId, taskId = null) => {
       if (!targetId) return
@@ -109,7 +117,7 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
       ui.set(state => (state.details && state.view === 'side' && state.side === chatId ? { ...state, view: 'details', side: null } : state))
       return after(call('side-close', { chatId }))
     },
-    closePanel: () => { ui.set(state => (state.details ? { ...state, details: null, view: 'details', renaming: false, tab: null, side: null, task: null } : state)) },
+    closePanel: () => { ui.set(state => (state.details ? { ...state, details: null, view: 'details', renaming: false, tab: null, side: null, task: null, swarm: null } : state)) },
     quote: (sessionId, text) => ui.set(state => ({ ...state, quote: { sessionId, text, token: Date.now() } })),
     // A long paste becomes a card; its text stays here until it goes back into the box.
     addPaste: (sessionId, text, name) => {
@@ -344,6 +352,18 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     memoryForget: (id, entry) => call('memory-forget', { ...memoryOf(id), scope: entry.scope, topic: entry.topic, text: entry.text }),
     memoryHistory: (id, before) => call('memory-history', { ...memoryOf(id), ...(before === undefined ? {} : { before }) }),
     memoryRestore: (id, rowId) => call('memory-restore', { ...memoryOf(id), id: rowId }),
+    memorySearch: (id, query, flags = {}) => call('memory-search', { ...memoryOf(id), query, ...flags }),
+    memoryProvenance: (id, ref) => call('memory-provenance', { ...memoryOf(id), ...ref }),
+    setMemoryMode: (sessionId, mode) => after(call('memory-mode', { sessionId, mode })),
+    memoryImport: (id, source) => after(call('memory-import', { ...memoryOf(id), ...source })),
+    memoryTakeover: (id, source) => after(call('memory-takeover', { ...memoryOf(id), ...source })),
+    artifactSave: (artifact) => after(call('artifact-save', artifact)),
+    artifactDelete: (id) => after(call('artifact-delete', { id })),
+    swarmRead: (swarmId, flags = {}) => call('swarm-read', { swarmId, ...flags }),
+    swarmPost: (swarmId, post) => after(call('swarm-post', { swarmId, ...post })),
+    swarmModels: swarmId => call('swarm-models', { swarmId }),
+    swarmSwitchModel: (swarmId, name, model) => after(call('swarm-switch-model', { swarmId, name, model })),
+    closeSwarm: swarmId => after(call('swarm-close', { swarmId })),
     diagnostics: payload => call('diagnostics', payload),
     diagnosticsLog: () => call('diagnostics-log'),
     diagnosticsClear: () => call('diagnostics-clear'),

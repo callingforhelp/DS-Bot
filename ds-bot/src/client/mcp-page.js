@@ -3,7 +3,13 @@ import { Switch } from './bot-settings.js'
 import { writeClipboard } from './dsh-primitives.js'
 import { dateLocale, t } from './i18n.js'
 
-const OFF = { on: false, port: 8797, status: 'off', error: null, url: 'http://127.0.0.1:8797/mcp', clients: [] }
+const OFF = { on: false, port: 8798, status: 'off', error: null, url: 'http://127.0.0.1:8798/mcp', clients: [] }
+const MEMORY_SCOPES = [
+  { id: 'read', label: 'Memory read' },
+  { id: 'write', label: 'Memory write' },
+  { id: 'code', label: 'Code provenance' },
+  { id: 'team', label: 'Team memory' },
+]
 
 function statusText(mcp) {
   if (mcp.error) return mcp.error
@@ -11,16 +17,25 @@ function statusText(mcp) {
   return mcp.status === 'on' ? t('On. Agents with a token can reach DS Bot at {url}', { url: mcp.url }) : t('Connecting…')
 }
 
-// Which Bots and groups one client may reach. Private Bots are never offered.
+// Which Bots, groups, memory scopes, and swarm tools one client may reach. Private Bots are never offered.
 function ScopePicker({ client, bots, rooms, busy, onChange }) {
   const toggle = (key, id) => {
-    const list = client[key].includes(id) ? client[key].filter(entry => entry !== id) : [...client[key], id]
+    const current = client[key] ?? []
+    const list = current.includes(id) ? current.filter(entry => entry !== id) : [...current, id]
     onChange({ [key]: list })
   }
   const box = (key, entry) => h('label', { key: `${key}:${entry.id}`, className: 'bt-mcp-scope' },
-    h('input', { type: 'checkbox', checked: client[key].includes(entry.id), disabled: busy, onChange: () => toggle(key, entry.id) }),
+    h('input', { type: 'checkbox', checked: (client[key] ?? []).includes(entry.id), disabled: busy, onChange: () => toggle(key, entry.id) }),
     h('span', null, entry.name))
-  return h('div', { className: 'bt-mcp-scopes' }, ...bots.map(entry => box('bots', entry)), ...rooms.map(entry => box('rooms', entry)))
+  return h('div', { className: 'bt-mcp-scopes' },
+    ...bots.map(entry => box('bots', entry)),
+    ...rooms.map(entry => box('rooms', entry)),
+    ...MEMORY_SCOPES.map(scope => h('label', { key: `mem:${scope.id}`, className: 'bt-mcp-scope' },
+      h('input', { type: 'checkbox', checked: (client.memoryScopes ?? []).includes(scope.id), disabled: busy, onChange: () => toggle('memoryScopes', scope.id) }),
+      h('span', null, t(scope.label)))),
+    h('label', { key: 'swarm', className: 'bt-mcp-scope' },
+      h('input', { type: 'checkbox', checked: client.swarmAccess === true, disabled: busy, onChange: () => onChange({ swarmAccess: !client.swarmAccess }) }),
+      h('span', null, t('Swarm access'))))
 }
 
 // Settings → MCP access: other agents on this computer call the Bot team through MCP.
@@ -30,8 +45,22 @@ export function McpPage({ roster, actions, Section, Row }) {
   const [name, setName] = useState('')
   const [token, setToken] = useState(null)
   const [copied, setCopied] = useState(false)
+  const [cliStatus, setCliStatus] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  const installCli = () => {
+    const fn = window?.dsbotDesktop?.installCliShim ?? actions.installCliShim
+    if (typeof fn === 'function') {
+      void run(Promise.resolve(fn()).then((res) => {
+        setCliStatus(res?.path ? t('Installed at {path}', { path: res.path }) : t('CLI installed'))
+      }))
+      return
+    }
+    void run(writeClipboard(`npx -p ds-bot dsbot-mem mcp --url ${mcp.url}`).then((ok) => {
+      if (!ok) throw new Error(t('Clipboard is not available'))
+      setCliStatus(t('Command copied'))
+    }))
+  }
   const bots = (roster.bots ?? []).filter(bot => bot.private !== true)
   const rooms = roster.rooms ?? []
   const run = task => {
@@ -61,7 +90,9 @@ export function McpPage({ roster, actions, Section, Row }) {
         h(Switch, { on: mcp.on, label: t('MCP access'), disabled: busy, onChange: on => void run(actions.mcpSet({ on })) })),
       h(Row, { label: t('Port'), hint: t('Only programs on this computer can connect.') },
         h('input', { className: 'bt-input bt-set-number', value: port, inputMode: 'numeric', 'aria-label': t('Port'), onChange: event => setPort(event.target.value) }),
-        h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy || port === String(mcp.port), onClick: () => void run(actions.mcpSet({ port: Number(port) })) }, t('Save')))),
+        h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy || port === String(mcp.port), onClick: () => void run(actions.mcpSet({ port: Number(port) })) }, t('Save'))),
+      h(Row, { label: t('Memory CLI'), hint: cliStatus || `dsbot-mem mcp --url ${mcp.url}` },
+        h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: installCli }, t('Install dsbot-mem CLI')))),
     h(Section, { title: t('Add a client'), tour: 'mcp-add' },
       h(Row, { label: t('Name') },
         h('input', { className: 'bt-input', value: name, placeholder: 'Claude Desktop', 'aria-label': t('Name'), onChange: event => setName(event.target.value), onKeyDown: event => { if (event.key === 'Enter') add() } }),
@@ -70,7 +101,7 @@ export function McpPage({ roster, actions, Section, Row }) {
         h('span', { className: 'bt-set-hint' }, t('Copy the token for {name} now. It is shown once.', { name: token.name })),
         h('code', null, token.value),
         h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: copy }, copied ? t('Copied') : t('Copy')),
-        h('span', { className: 'bt-set-hint' }, t('Clients that start a command use: {command}', { command: `DSBOT_MCP_TOKEN=… npx -p ds-bot ds-bot-mcp --url ${mcp.url}` })))
+        h('span', { className: 'bt-set-hint' }, t('Clients that start a command use: {command}', { command: `DSBOT_MCP_TOKEN=… dsbot-mem mcp --url ${mcp.url}` })))
         : null),
     h(Section, { title: t('Clients') }, mcp.clients.length === 0
       ? h('div', { className: 'bt-set-row' }, h('span', { className: 'bt-set-hint' }, t('No clients yet')))

@@ -116,7 +116,10 @@ function CapabilityRow({ item, onEdit, onDelete, onApprove, confirming }) {
 
 export function CapabilitiesPage({ roster, actions, run }) {
   const items = [...(roster.capabilities ?? [])].sort((a, b) => a.name.localeCompare(b.name))
+  const artifacts = Object.values(roster.artifacts ?? {}).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+  const [tab, setTab] = useState('capabilities')
   const [draft, setDraft] = useState(null)
+  const [artDraft, setArtDraft] = useState(null)
   const [confirming, setConfirming] = useState('')
   useEffect(() => {
     if (!confirming) return undefined
@@ -138,21 +141,56 @@ export function CapabilitiesPage({ roster, actions, run }) {
     setConfirming('')
     void run(actions.deleteCapability(item.name))
   }
+  const saveArtifact = (event) => {
+    event.preventDefault()
+    const title = artDraft?.title?.trim()
+    if (!title) return
+    void run(actions.artifactSave({ title, kind: artDraft.kind || 'note', content: artDraft.content ?? '' }).then(() => setArtDraft(null)))
+  }
+  const removeArtifact = (item) => {
+    if (confirming !== `art:${item.id}`) { setConfirming(`art:${item.id}`); return }
+    setConfirming('')
+    void run(actions.artifactDelete(item.id))
+  }
   return h('section', { className: 'bt-set-section' },
     h('div', { className: 'bt-la-sec-head' },
-      h('h3', null, t('Shared capabilities')),
-      draft ? null : h('button', { type: 'button', className: 'bt-soft bt-soft-sm bt-with-icon', 'data-tour': 'cap-add', onClick: startNew }, h(PlusIcon), t('Add capability'))),
-    draft ? h(CapabilityForm, { draft, setDraft, items, actions, onClose: () => setDraft(null) }) : null,
-    h('div', { className: 'bt-set-card bt-connectors-card' },
-      items.length === 0 ? h('div', { className: 'bt-set-row' }, h('span', { className: 'bt-set-hint' }, t('No capabilities saved')))
-        : items.map(item => h(CapabilityRow, {
-          key: item.name,
-          item,
-          confirming: confirming === item.name,
-          onEdit: () => edit(item),
-          onDelete: () => remove(item),
-          onApprove: () => void run(actions.approveCapability(item.name)),
-        }))))
+      h(Segmented, { label: t('Shared capabilities'), value: tab },
+        [['capabilities', 'Shared capabilities'], ['artifacts', 'Artifacts']].map(([value, label]) => h('button', {
+          key: value, type: 'button', 'aria-pressed': tab === value, onClick: () => setTab(value),
+        }, t(label)))),
+      tab === 'capabilities'
+        ? (draft ? null : h('button', { type: 'button', className: 'bt-soft bt-soft-sm bt-with-icon', 'data-tour': 'cap-add', onClick: startNew }, h(PlusIcon), t('Add capability')))
+        : (artDraft ? null : h('button', { type: 'button', className: 'bt-soft bt-soft-sm bt-with-icon', onClick: () => setArtDraft({ title: '', kind: 'note', content: '' }) }, h(PlusIcon), t('Add artifact')))),
+    tab === 'capabilities'
+      ? [
+        draft ? h(CapabilityForm, { key: 'form', draft, setDraft, items, actions, onClose: () => setDraft(null) }) : null,
+        h('div', { key: 'list', className: 'bt-set-card bt-connectors-card' },
+          items.length === 0 ? h('div', { className: 'bt-set-row' }, h('span', { className: 'bt-set-hint' }, t('No capabilities saved')))
+            : items.map(item => h(CapabilityRow, {
+              key: item.name,
+              item,
+              confirming: confirming === item.name,
+              onEdit: () => edit(item),
+              onDelete: () => remove(item),
+              onApprove: () => void run(actions.approveCapability(item.name)),
+            }))),
+      ]
+      : [
+        artDraft ? h('form', { key: 'art-form', className: 'bt-set-card bt-art-form', onSubmit: saveArtifact },
+          h('input', { className: 'bt-input', value: artDraft.title, placeholder: t('Artifact title'), onChange: event => setArtDraft({ ...artDraft, title: event.target.value }) }),
+          h('textarea', { className: 'bt-input', rows: 3, value: artDraft.content, placeholder: t('Content or reference'), onChange: event => setArtDraft({ ...artDraft, content: event.target.value }) }),
+          h('div', { className: 'bt-connector-actions' },
+            h('button', { type: 'submit', className: 'bt-soft bt-soft-sm' }, t('Save')),
+            h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: () => setArtDraft(null) }, t('Cancel')))) : null,
+        h('div', { key: 'art-list', className: 'bt-set-card bt-connectors-card' },
+          artifacts.length === 0 ? h('div', { className: 'bt-set-row' }, h('span', { className: 'bt-set-hint' }, t('No artifacts saved')))
+            : artifacts.map(item => h('div', { key: item.id, className: 'bt-set-row bt-connector-row' },
+              h('span', { className: 'bt-set-copy' },
+                h('span', { className: 'bt-bs-label' }, item.title ?? item.name ?? item.id),
+                item.kind ? h('span', { className: 'bt-set-hint' }, item.kind) : null),
+              h('span', { className: 'bt-connector-actions' },
+                h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: () => removeArtifact(item) }, confirming === `art:${item.id}` ? t('Click again to delete.') : t('Delete')))))),
+      ])
 }
 
 export function BotCapabilitiesCard({ bot, roster, actions, run, Card }) {

@@ -10,6 +10,7 @@ import { GroupSettingsForm, GroupTodos, ROOM_MODES, roomSubtitle, shownMode } fr
 import { ModelMenu, modelOf } from './model-menu.js'
 import { FolderMenu } from './folder-menu.js'
 import { MemoryRow } from './memory-panel.js'
+import { swarmsForSession } from './swarm-panel.js'
 import { ScheduleSummary } from './schedules.js'
 import { useGlide, useMorph } from './motion.js'
 import { MemberApprovals, MemberState, StopMemberWork, StopRoomWork, useMemberWork, workState } from './member-status.js'
@@ -377,7 +378,13 @@ export function DetailsDrawer({ sessionId, startRenaming, startTab, hasStrip, ro
               key: `about:${bot.id}`, text: bot.instructions ?? '', label: t('Instructions'), placeholder: t('What this Bot is responsible for…'),
               onSave: instructions => run(actions.updateBot(bot.id, { instructions })),
             }),
-        roster.memory === false ? null : h(MemoryRow, { key: 'memory', owner: { id: bot.id, name: bot.name }, actions }),
+        roster.memory === false ? null : h(MemoryRow, { key: 'memory', owner: { id: bot.id, sessionId: bot.sessionId ?? sessionId, name: bot.name }, actions }),
+        swarmsForSession(roster.swarms, sessionId).length > 0 ? h('div', { key: 'swarms' },
+          h('div', { className: 'bt-section-title' }, t('Swarms')),
+          swarmsForSession(roster.swarms, sessionId).map(swarm => h('button', {
+            key: swarm.id, type: 'button', className: 'bt-kv bt-drawer-swarm-row',
+            onClick: () => actions.openSwarm?.(sessionId, swarm.id),
+          }, h('span', null, swarm.title ?? t('Swarm')), h('span', { className: 'bt-chip' }, t('Open'))))) : null,
         usage ? h('div', { key: 'usage' }, h('div', { className: 'bt-section-title' }, t('Usage')),
           h('div', { className: 'bt-kv' }, h('span', null, bot.name), h('span', null, usage))) : null,
         h(ScheduleSummary, { key: 'routines', bot, actions }),

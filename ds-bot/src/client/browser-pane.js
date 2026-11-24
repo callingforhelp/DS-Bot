@@ -15,6 +15,7 @@ import { FLIGHT_ENDS, INTENT_MS, createFlight, flightEnd, flightStart, planFligh
 import { DetailsDrawer } from './details-drawer.js'
 import { SideChatView } from './side-chat.js'
 import { TaskReaderView } from './bot-tasks.js'
+import { SwarmBoardPanel } from './swarm-panel.js'
 import { panelHasStrip, sideChatsOf, stripMenuKeys } from './side-model.js'
 import { DotsIcon, FolderIcon, SideIcon, TerminalIcon } from './icons.js'
 import { t } from './i18n.js'
@@ -165,7 +166,7 @@ const sideTitle = chat => chat?.entries?.[0]?.question?.trim() || t('Side chat')
 // The strip across the panel's top: the Bot's own tab first (the details view,
 // collapsed), then one tab per browser page, one per side chat, then `···` and
 // close.
-export function PanelStrip({ bot, roomSubject, subject, view, ids, active, sides, side, task, canBrowse, reading, onView, actions, useBrowserPages }) {
+export function PanelStrip({ bot, roomSubject, subject, view, ids, active, sides, side, task, swarm, canBrowse, reading, onView, actions, useBrowserPages }) {
   const pages = useBrowserPages(map => map)
   const wrap = useRef(null)
   const ind = useRef(null)
@@ -178,6 +179,7 @@ export function PanelStrip({ bot, roomSubject, subject, view, ids, active, sides
     ids.map(tabId => `${tabId}:${tabLabel(pages[tabId] ?? EMPTY_PAGE)}`).join('\0'),
     sides.map(chat => `${chat.id}:${sideTitle(chat)}`).join('\0'),
     task ? `${task.id}:${task.title}` : '',
+    swarm ? `${swarm.id}:${swarm.title ?? ''}` : '',
   ].join('\u0001')
   const syncObserved = () => {
     const observer = watcher.current
@@ -202,7 +204,9 @@ export function PanelStrip({ bot, roomSubject, subject, view, ids, active, sides
         ? box.querySelector(`[data-side="${side}"]`)
         : view === 'task' && task
           ? box.querySelector(`[data-task="${task.id}"]`)
-          : box.querySelector(`[data-tab="${active}"]`)
+          : view === 'swarm' && swarm
+            ? box.querySelector(`[data-swarm="${swarm.id}"]`)
+            : box.querySelector(`[data-tab="${active}"]`)
     under.current = node
     syncObserved()
     if (!node) { capsule.style.opacity = '0'; spot.current = null; return undefined }
@@ -310,6 +314,23 @@ export function PanelStrip({ bot, roomSubject, subject, view, ids, active, sides
           h('button', {
             type: 'button', className: 'bt-ptab-x', 'aria-label': t('Close'), title: t('Close'),
             onClick: () => { actions.closeTask?.() },
+          }, '×'))
+        : null,
+      swarm
+        ? h('div', {
+            key: `swarm:${swarm.id}`, role: 'presentation', 'data-swarm': swarm.id, 'data-selected': view === 'swarm' || undefined, className: 'bt-ptab-wrap bt-ptab-side',
+          },
+          h('button', {
+            type: 'button', role: 'tab', 'aria-selected': view === 'swarm', className: 'bt-ptab bt-ptab-btn',
+            title: swarm.title ?? t('Swarm'),
+            onClick: () => onView('swarm'),
+            onAuxClick: (event) => { if (event.button === 1) { event.preventDefault(); actions.closeSwarmView?.() } },
+          },
+            h('span', { className: 'bt-swarm-dot', 'data-state': swarm.status === 'closed' ? 'stopped' : 'working', 'aria-hidden': true }),
+            h('span', { className: 'bt-ptab-title' }, swarm.title ?? t('Swarm'))),
+          h('button', {
+            type: 'button', className: 'bt-ptab-x', 'aria-label': t('Close'), title: t('Close'),
+            onClick: () => { actions.closeSwarmView?.() },
           }, '×'))
         : null,
       h('span', { ref: ind, className: 'bt-ptab-ind', 'aria-hidden': true })),
@@ -958,10 +979,12 @@ export function BotPanel({ pane, leaving, room, overlay, roster, actions, useSes
   const sideChat = sideChats.find(chat => chat?.id === pane.side)
   const taskBot = pane.task?.botId ? roster.byId?.[pane.task.botId] : undefined
   const taskEntry = taskBot && pane.task?.taskId ? (taskBot.tasks ?? []).find(item => item?.id === pane.task.taskId) : undefined
+  const swarmEntry = pane.swarm ? roster.swarms?.[pane.swarm] : undefined
   const view = pane.view === 'browser' && canBrowse ? 'browser'
     : pane.view === 'side' && sideChat !== undefined ? 'side'
       : pane.view === 'task' && taskEntry !== undefined ? 'task'
-        : 'details'
+        : pane.view === 'swarm' && swarmEntry !== undefined ? 'swarm'
+          : 'details'
   const tabState = useBrowserTabs(map => (bot ? (map[bot.id] ?? EMPTY_TABS) : EMPTY_TABS))
   const active = tabState.active
   const page = useBrowserPages(pages => (active ? pages[active] : null) ?? EMPTY_PAGE)
@@ -1038,6 +1061,9 @@ export function BotPanel({ pane, leaving, room, overlay, roster, actions, useSes
   useEffect(() => {
     if (pane.view === 'task' && taskEntry === undefined) actions.closeTask?.()
   }, [pane.view, taskEntry])
+  useEffect(() => {
+    if (pane.view === 'swarm' && swarmEntry === undefined) actions.closeSwarmView?.()
+  }, [pane.view, swarmEntry])
   // The guest leaves the screen while the details view is up, and on close.
   useEffect(() => {
     if (view !== 'browser' || leaving) void actions.browserShow?.(null)
@@ -1163,10 +1189,10 @@ export function BotPanel({ pane, leaving, room, overlay, roster, actions, useSes
     for (const name of ends) grip.addEventListener(name, onEnd)
   }
 
-  const hasStrip = panelHasStrip(canBrowse, tabState.ids.length, sideChats.length, taskEntry !== undefined)
+  const hasStrip = panelHasStrip(canBrowse, tabState.ids.length, sideChats.length, taskEntry !== undefined, swarmEntry !== undefined)
   return h('aside', {
     ref: root, className: 'bt-panel', 'data-view': view,
-    'aria-label': view === 'browser' && bot ? t("{name}'s browser", { name: bot.name }) : view === 'side' ? t('Side chat') : view === 'task' && taskEntry ? taskEntry.title : t('Conversation details'),
+    'aria-label': view === 'browser' && bot ? t("{name}'s browser", { name: bot.name }) : view === 'side' ? t('Side chat') : view === 'task' && taskEntry ? taskEntry.title : view === 'swarm' && swarmEntry ? (swarmEntry.title ?? t('Swarm')) : t('Conversation details'),
     'data-leaving': leaving || undefined, 'aria-hidden': leaving || undefined, 'data-settling': settling || undefined,
     'data-instant': instant || undefined, 'data-dragging': dragging || undefined, 'data-overlay': overlay || undefined, style: { '--bt-panel-w': `${panelWidth}px` },
     onAnimationEnd: (event) => { if (event.target === event.currentTarget) setLanded(true) },
@@ -1175,14 +1201,16 @@ export function BotPanel({ pane, leaving, room, overlay, roster, actions, useSes
     // Over the whole window while dragging: the cursor stays a resize cursor and the
     // pages underneath (the chat, the guest) see no pointer.
     dragging ? createPortal(h('div', { className: 'bt-drag-shield', 'aria-hidden': true }), document.body) : null,
-    hasStrip ? h(PanelStrip, { bot, roomSubject, subject: pane.id, view, ids: tabState.ids, active, sides: sideChats, side: pane.side, task: taskEntry, canBrowse, reading, onView: switchView, actions: panelActions, useBrowserPages }) : null,
+    hasStrip ? h(PanelStrip, { bot, roomSubject, subject: pane.id, view, ids: tabState.ids, active, sides: sideChats, side: pane.side, task: taskEntry, swarm: swarmEntry, canBrowse, reading, onView: switchView, actions: panelActions, useBrowserPages }) : null,
     view === 'browser' && bot
       ? h(BrowserView, { key: `browser:${active}`, bot, tabId: active, leaving, landed: landed && !settling, actions, useBrowserPages, hold })
       : view === 'side' && sideChat
         ? h('div', { key: `side:${sideChat.id}`, className: 'bt-panel-view' }, h(SideChatView, { subject: pane.id, chat: sideChat, roster, actions: panelActions }))
         : view === 'task' && taskEntry && taskBot
           ? h('div', { key: `task:${taskEntry.id}`, className: 'bt-panel-view' }, h(TaskReaderView, { bot: taskBot, task: taskEntry, actions: panelActions }))
-          : h('div', { key: `details:${pane.id}:${pane.renaming ? 'rename' : ''}:${pane.tab ?? ''}`, className: 'bt-panel-view' },
+          : view === 'swarm' && swarmEntry
+            ? h('div', { key: `swarm:${swarmEntry.id}`, className: 'bt-panel-view' }, h(SwarmBoardPanel, { swarmId: swarmEntry.id, roster, actions: panelActions }))
+            : h('div', { key: `details:${pane.id}:${pane.renaming ? 'rename' : ''}:${pane.tab ?? ''}`, className: 'bt-panel-view' },
               h(DetailsDrawer, {
                 sessionId: pane.id, startRenaming: pane.renaming, startTab: pane.tab, hasStrip,
                 roster, actions: panelActions, useSessions, useSessionStatus, useActivity, useWork, useBrowserTabs, useBrowserPages, useComputer,

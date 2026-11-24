@@ -90,6 +90,7 @@ function ProposalCard({ proposal, initialError = '', onFailure, onResolved, acti
     : [
       h(FileBox, { key: 'file', name: 'SKILL.md', path: `skills/${proposal.name}`, state: update ? 'Updated' : 'Added', blocks: [rows] }),
       proposal.why ? h('p', { className: 'bt-learning-why', key: 'why' }, proposal.why) : null,
+      (proposal.commitSha ?? proposal.provenance?.commitSha) ? h('span', { key: 'prov', className: 'bt-chip bt-learning-prov' }, String(proposal.commitSha ?? proposal.provenance.commitSha).slice(0, 7)) : null,
     ]
   const kind = t(agents ? 'AGENTS.md update' : update ? 'Skill update' : 'New skill')
   if (outcome) {

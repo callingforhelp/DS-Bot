@@ -274,18 +274,19 @@ function GoalCompose({ room, roster, actions }) {
 // goal bar (or draft form) while closed, the active panel while open. For chats
 // with background tasks only (`taskHoverReveal`), the island stays a compact
 // single-row pill with an inline count chip until hovered or clicked open.
-export function GoalIsland({ room, goal, view, open, composing, approvalPod = null, approvalOpen = false, approvalsCount = 0, taskPod = null, taskOpen = false, taskCount = 0, taskHoverReveal = false, taskBadge = null, roomWork, roster, actions, pill }) {
+export function GoalIsland({ room, goal, view, open, composing, approvalPod = null, approvalOpen = false, approvalsCount = 0, taskPod = null, taskOpen = false, taskCount = 0, taskHoverReveal = false, taskBadge = null, swarmPod = null, roomWork, roster, actions, pill }) {
   const island = useRef(null)
   const leaveTimer = useRef(null)
   const [hovered, setHovered] = useState(false)
   const hasApprovals = approvalPod !== null
   const hasTasks = taskPod !== null
+  const hasSwarm = swarmPod !== null
   const apvExpanded = approvalOpen && hasApprovals
   const taskExpanded = taskOpen && hasTasks && !apvExpanded
   const goalExpanded = open && !apvExpanded && !taskExpanded
   const expanded = goalExpanded || apvExpanded || taskExpanded
   const hasGoalRow = composing || view !== null
-  const compactTasks = taskHoverReveal && hasTasks && !hasGoalRow && !hasApprovals && !expanded && !hovered
+  const compactTasks = taskHoverReveal && hasTasks && !hasSwarm && !hasGoalRow && !hasApprovals && !expanded && !hovered
   const morphKey = apvExpanded ? `apv:${approvalsCount}` : taskExpanded ? `task:${taskCount}` : goalExpanded ? 'goal' : composing ? 'compose' : compactTasks ? 'compact' : 'closed'
   useMorph(island, morphKey, { width: true })
   useEffect(() => () => { if (leaveTimer.current) clearTimeout(leaveTimer.current) }, [])
@@ -325,7 +326,9 @@ export function GoalIsland({ room, goal, view, open, composing, approvalPod = nu
     approvalPod,
     hasApprovals && hasTasks ? h('span', { className: 'bt-island-sep', 'aria-hidden': true }) : null,
     taskPod,
-    (hasApprovals || hasTasks) && hasGoalRow ? h('span', { className: 'bt-island-sep', 'aria-hidden': true }) : null,
+    (hasApprovals || hasTasks) && hasSwarm ? h('span', { className: 'bt-island-sep', 'aria-hidden': true }) : null,
+    swarmPod,
+    (hasApprovals || hasTasks || hasSwarm) && hasGoalRow ? h('span', { className: 'bt-island-sep', 'aria-hidden': true }) : null,
     composing ? h(GoalCompose, { room, roster, actions })
       : view === null ? null
         : h(Fragment, null,

@@ -16,7 +16,18 @@ export function CommandPalette({ start, token, roster, actions, useSessions }) {
   const [query, setQuery] = useState(start ?? '')
   const [cursor, setCursor] = useState(0)
   const [leaving, setLeaving] = useState(false)
+  const [memHits, setMemHits] = useState([])
   const wanted = query.trim().toLowerCase()
+  useEffect(() => {
+    if (wanted.length < 2 || !actions.memorySearch || !roster.mainBotId) { setMemHits([]); return undefined }
+    let cancelled = false
+    const timer = setTimeout(() => {
+      void Promise.resolve(actions.memorySearch(roster.mainBotId, wanted, { limit: 6 }))
+        .then(result => { if (!cancelled) setMemHits(result?.entries ?? result?.results ?? []) })
+        .catch(() => { if (!cancelled) setMemHits([]) })
+    }, 180)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [wanted, roster.mainBotId, actions])
   const close = () => {
     if (leaving) return
     setLeaving(true)
@@ -77,6 +88,14 @@ export function CommandPalette({ start, token, roster, actions, useSessions }) {
     }
   })
   if (messages.length) sections.push([t('Messages'), messages])
+  const memoryRows = memHits.slice(0, 6).map((hit, idx) => ({
+    key: `mem:${hit.id ?? idx}`, icon: h(SearchIcon),
+    title: hit.topic ?? hit.scope ?? t('Memory'),
+    subtitle: String(hit.text ?? hit.snippet ?? '').slice(0, 120),
+    badge: hit.commitSha ? String(hit.commitSha).slice(0, 7) : undefined,
+    run: () => actions.openMemory?.(hit.botId ?? hit.roomId ?? roster.mainBotId),
+  }))
+  if (memoryRows.length) sections.push([t('Memory'), memoryRows])
   const commands = [
     { key: 'cmd:new', icon: h(PlusIcon), title: t('New chat'), run: () => actions.openNewChat('new') },
     { key: 'cmd:bot', icon: h(PlusIcon), title: t('Create Bot'), run: () => actions.openNewChat('create') },

@@ -10,6 +10,7 @@ import { GoalIsland, goalView } from './goal.js'
 import { RuntimeStatusPill } from './runtime-pill.js'
 import { ApprovalIslandPod, roomApprovals } from './member-status.js'
 import { TaskIslandPod, isActiveTask, tasksForChat } from './bot-tasks.js'
+import { SwarmIslandPod, swarmsForSession } from './swarm-panel.js'
 import { viewBottom } from './motion.js'
 import { isComposerSeatMutation, readComposerHeight } from './composer-guards.js'
 import { t } from './i18n.js'
@@ -136,10 +137,12 @@ export function HeaderPill({ sessionId, useRoster, useSessions, useSessionStatus
   const memoryNotice = !away && notice && changed !== null && roster.memory !== false
   const showGoal = room !== undefined && !away && (goal !== undefined || goalCompose)
   const showTasks = approvalTargetId !== undefined && !away && activeTasks.length > 0
+  const chatSwarms = approvalTargetId !== undefined && !away ? swarmsForSession(roster.swarms, approvalTargetId) : []
+  const showSwarm = chatSwarms.length > 0
   // When active background tasks are shown, TaskIslandPod + TaskFocusOverlay already
   // surface every pending approval for this chat in one unified deck (no double bars).
   const showApprovals = approvalTargetId !== undefined && !away && approvals.length > 0 && !showTasks
-  const showIsland = showGoal || showApprovals || showTasks
+  const showIsland = showGoal || showApprovals || showTasks || showSwarm
   // Once the last approval is answered, reset approvalOpen so future approvals
   // appear as a compact bar rather than popping straight into a 560px panel.
   useEffect(() => {
@@ -148,8 +151,8 @@ export function HeaderPill({ sessionId, useRoster, useSessions, useSessionStatus
   useEffect(() => {
     if (taskDeckOpen && !showTasks) actions.closeTaskDeck?.()
   }, [taskDeckOpen, showTasks])
-  const taskHoverReveal = showTasks && !showGoal && !showApprovals
-  const podRows = (showGoal ? 1 : 0) + (showApprovals ? 1 : 0) + (showTasks && !taskHoverReveal ? 1 : 0)
+  const taskHoverReveal = showTasks && !showGoal && !showApprovals && !showSwarm
+  const podRows = (showGoal ? 1 : 0) + (showApprovals ? 1 : 0) + (showTasks && !taskHoverReveal ? 1 : 0) + (showSwarm ? 1 : 0)
   // The island pads the transcript so its pod does not cover the first message.
   useEffect(() => {
     if (podRows > 0) document.body.dataset.btGoal = podRows > 1 ? '2' : ''
@@ -174,6 +177,7 @@ export function HeaderPill({ sessionId, useRoster, useSessions, useSessionStatus
     h('span', { className: 'bt-pill-go', 'aria-hidden': true }, h(GoArrow)))
   const approvalPod = showApprovals ? h(ApprovalIslandPod, { approvals, open: approvalOpen, room, targetId: approvalTargetId, actions }) : null
   const taskPod = showTasks ? h(TaskIslandPod, { bot, room, roster, tasks: chatTasks, approvals, open: taskDeckOpen, focusTaskId: taskDeckState?.taskId ?? null, targetId: approvalTargetId, actions }) : null
+  const swarmPod = showSwarm ? h(SwarmIslandPod, { swarms: chatSwarms, targetId: sessionId, actions }) : null
   const taskWaiting = Math.max(activeTasks.filter(item => item.status === 'waiting_approval').length, approvals.length)
   const taskBadge = taskHoverReveal
     ? h('button', {
@@ -189,7 +193,7 @@ export function HeaderPill({ sessionId, useRoster, useSessions, useSessionStatus
       h('span', null, activeTasks.length))
     : null
   return h('div', { className: 'bt-head' },
-    showIsland ? h(GoalIsland, { room, goal, view, open: goalOpen, composing: goalCompose, approvalPod, approvalOpen, approvalsCount: approvals.length, taskPod, taskOpen: taskDeckOpen, taskCount: activeTasks.length, taskHoverReveal, taskBadge, roomWork, roster, actions, pill }) : pill,
+    showIsland ? h(GoalIsland, { room, goal, view, open: goalOpen, composing: goalCompose, approvalPod, approvalOpen, approvalsCount: approvals.length, taskPod, taskOpen: taskDeckOpen, taskCount: activeTasks.length, taskHoverReveal, taskBadge, swarmPod, roomWork, roster, actions, pill }) : pill,
     (!away && (bot !== undefined || room !== undefined)) ? h(RuntimeStatusPill, { sessionId, useRoster, actions }) : null,
     !away && PendingLearning ? h(PendingLearning, { key: sessionId, sessionId, useRoster, actions }) : null,
     h('span', { className: 'bt-sr', role: 'status' }, memoryNotice ? t('Memory updated') : ''),

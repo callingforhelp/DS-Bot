@@ -273,13 +273,23 @@ function AvatarEditor({ bot, actions, run, onClose, leaving = false }) {
     }) : null)
 }
 
-function MemoryCard({ bot, actions }) {
+function MemoryCard({ bot, actions, save }) {
   const count = useMemoryCount(bot.id, actions)
   const label = count === null ? t('Loading…') : count === 0 ? t('Nothing saved yet') : count === 1 ? t('1 entry') : t('{count} entries', { count })
   return h(Card, { title: t('Memory') },
     h('button', { type: 'button', className: 'bt-set-row bt-bs-row', 'aria-label': t("Manage {name}'s memory", { name: bot.name }), onClick: () => actions.openMemory(bot.id) },
       h('span', { className: 'bt-set-copy' }, h('span', { className: 'bt-bs-label' }, label)),
-      h('span', { className: 'bt-mem-row-go' }, t('Manage'), h(ChevronRightIcon))))
+      h('span', { className: 'bt-mem-row-go' }, t('Manage'), h(ChevronRightIcon))),
+    h('div', { className: 'bt-set-row bt-bs-row' },
+      h('span', { className: 'bt-set-copy' }, h('span', { className: 'bt-bs-label' }, t('Default memory privacy'))),
+      h('select', {
+        className: 'bt-select', value: bot.memoryMode ?? 'on', 'aria-label': t('Default memory privacy'),
+        onChange: event => save({ memoryMode: event.target.value }),
+      },
+      h('option', { value: 'on' }, t('On')),
+      h('option', { value: 'silent' }, t('Silent')),
+      h('option', { value: 'incognito' }, t('Incognito')),
+      h('option', { value: 'off' }, t('Off')))))
 }
 
 // A Bot's settings as grouped cards: who it is (avatar, name, label), what it runs on
@@ -367,7 +377,7 @@ export function BotSettingsForm({ bot, roster, actions, run }) {
         h(InlineText, { label: t('Instructions'), value: bot.instructions, multiline: true, placeholder: t('What this Bot is responsible for…'), onSave: instructions => save({ instructions }) }))),
     h(BotCapabilitiesCard, { bot, roster, actions, run, Card }),
     h(BotComputerCard, { bot, roster, actions, run, Card, Row }),
-    roster.memory === false ? null : h(MemoryCard, { bot, actions }),
+    roster.memory === false ? null : h(MemoryCard, { bot, actions, save }),
     h(BotSchedules, { bot, roster, actions }),
     h(Card, { title: t('Main Bot') },
       onlyMain

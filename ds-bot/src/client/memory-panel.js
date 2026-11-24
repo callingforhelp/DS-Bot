@@ -117,7 +117,29 @@ const groupEntries = entries => entries.reduce((groups, entry) => {
   return groups
 }, [])
 
-function EntryRow({ entry, remove, pin, layer, openMove }) {
+export const MEMORY_MODES = ['on', 'silent', 'incognito', 'off']
+
+export function memoryModeLabel(mode) {
+  switch (mode) {
+    case 'silent': return t('Silent')
+    case 'incognito': return t('Incognito')
+    case 'off': return t('Off')
+    default: return t('On')
+  }
+}
+
+export function provenanceBadges(entry) {
+  const badges = []
+  const sha = entry?.commitSha ?? entry?.provenance?.commitSha
+  if (sha) badges.push({ kind: 'commit', label: String(sha).slice(0, 7), value: String(sha) })
+  const pr = entry?.prNumber ?? entry?.provenance?.prNumber
+  if (pr) badges.push({ kind: 'pr', label: `#${pr}`, value: String(pr) })
+  const file = entry?.filePath ?? entry?.provenance?.filePath
+  if (file && badges.length === 0) badges.push({ kind: 'file', label: String(file).split('/').pop(), value: String(file) })
+  return badges
+}
+
+function EntryRow({ entry, remove, pin, layer, openMove, onProvenance }) {
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
   useEffect(() => {
@@ -128,6 +150,7 @@ function EntryRow({ entry, remove, pin, layer, openMove }) {
   const by = entry.source === 'memory panel' ? t('by you') : entry.by ? t('by {name}', { name: entry.by }) : null
   const until = entry.until ? t(entry.expired ? 'ended {day}' : 'until {day}', { day: entry.until }) : null
   const meta = [entry.added, by, until].filter(Boolean).join(' · ')
+  const badges = provenanceBadges(entry)
   const click = async () => {
     if (!confirming) { setConfirming(true); return }
     setBusy(true)
@@ -136,6 +159,10 @@ function EntryRow({ entry, remove, pin, layer, openMove }) {
   return h('li', { className: 'bt-mem-entry', 'data-busy': busy || undefined },
     h('div', { className: 'bt-mem-entry-copy' },
       h('span', { className: 'bt-mem-entry-text' }, entry.text),
+      badges.length > 0 ? h('span', { className: 'bt-mem-prov-row' }, badges.map(badge => h('button', {
+        key: `${badge.kind}:${badge.value}`, type: 'button', className: 'bt-chip bt-mem-prov',
+        title: badge.value, onClick: () => onProvenance?.(entry, badge),
+      }, badge.label))) : null,
       meta ? h('span', { className: 'bt-mem-entry-meta' }, meta) : null),
     h('button', {
       type: 'button', className: 'bt-mem-remove bt-mem-pin', 'data-on': entry.pinned || undefined, disabled: busy, 'aria-pressed': entry.pinned,
@@ -178,8 +205,11 @@ function TidyNote({ tidy, undo }) {
     h('ul', null, tidy.items.map((item, at) => h('li', { key: at }, item.text))))
 }
 
-function Entries({ owner, view, remove, pin, layer, openMove, undoTidy }) {
-  const groups = groupEntries(view.entries)
+function Entries({ owner, view, remove, pin, layer, openMove, undoTidy, onProvenance, searchHits, searching, searchQuery }) {
+  const filtered = searchQuery.trim() !== '' && Array.isArray(searchHits)
+    ? searchHits
+    : view.entries
+  const groups = groupEntries(filtered)
   const sections = owner.group
     ? [{ scope: 'group', title: t('Group memory'), hint: t('Only its members read it'), size: view.sizes.group }]
     : [
@@ -187,6 +217,7 @@ function Entries({ owner, view, remove, pin, layer, openMove, undoTidy }) {
         { scope: 'team', title: t('Team memory'), hint: t('Every Bot reads it'), size: view.sizes.team },
       ]
   return h('div', { className: 'bt-mem-entries' },
+    searching ? h('div', { className: 'bt-mem-none' }, t('Searching…')) : null,
     view.tidy ? h(TidyNote, { tidy: view.tidy, undo: undoTidy }) : null,
     sections.map(section => h('section', { key: section.scope, className: 'bt-mem-section' },
       h('div', { className: 'bt-mem-section-head' },
@@ -196,8 +227,8 @@ function Entries({ owner, view, remove, pin, layer, openMove, undoTidy }) {
       groups.some(group => group.scope === section.scope)
         ? groups.filter(group => group.scope === section.scope).map(group => h(Fragment, { key: group.key },
             group.topic ? h('div', { className: 'bt-mem-topic' }, group.topic) : null,
-            h('ul', { className: 'bt-mem-list' }, group.entries.map(entry => h(EntryRow, { key: `${entry.topic ?? ''}:${entry.text}`, entry, remove, pin, layer, openMove })))))
-        : h('div', { className: 'bt-mem-none' }, t('Nothing saved yet')))))
+            h('ul', { className: 'bt-mem-list' }, group.entries.map(entry => h(EntryRow, { key: `${entry.topic ?? ''}:${entry.text}`, entry, remove, pin, layer, openMove, onProvenance })))))
+        : h('div', { className: 'bt-mem-none' }, searchQuery.trim() ? t('No matching entries') : t('Nothing saved yet')))))
 }
 
 function changeLine(change) {
@@ -342,6 +373,12 @@ export function MemoryDialog({ owner, actions, leaving = false }) {
   const moveAnchor = useRef(null)
   const [text, setText] = useState('')
   const [answer, setAnswer] = useState(null)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchHits, setSearchHits] = useState(null)
+  const [searching, setSearching] = useState(false)
+  const [mode, setMode] = useState(null)
+  const [importMode, setImportMode] = useState(null)
+  const [importText, setImportText] = useState('')
   const menuRef = useRef(null)
   const dotsRef = useRef(null)
   const inputRef = useRef(null)
@@ -374,7 +411,62 @@ export function MemoryDialog({ owner, actions, leaving = false }) {
   const regenerate = () => { setMenu(false); setPage('summary'); void load({ regenerate: true }) }
   const openEntries = () => { setMenu(false); setPage('entries') }
   const openHistory = () => { setMenu(false); setPage('history') }
-  const backToSummary = () => { setPage('summary'); void load({ summarize: true }) }
+  const openImport = (kind) => { setMenu(false); setImportMode(kind); setImportText('') }
+  const backToSummary = () => { setPage('summary'); setSearchQuery(''); setSearchHits(null); void load({ summarize: true }) }
+  const activeMode = mode ?? view?.mode ?? 'on'
+  const changeMode = async (nextMode) => {
+    setMode(nextMode)
+    try { await actions.setMemoryMode?.(owner.sessionId ?? owner.id, nextMode) } catch (failure) {
+      setAnswer({ asked: memoryModeLabel(nextMode), error: failure?.message ?? String(failure) })
+    }
+  }
+  const onProvenance = async (entry, badge) => {
+    try {
+      const result = await actions.memoryProvenance?.(owner.id, { kind: badge.kind, value: badge.value, text: entry.text })
+      if (result) setAnswer({ asked: `${badge.label}`, reply: result.summary ?? result.message ?? JSON.stringify(result) })
+    } catch (failure) {
+      setAnswer({ asked: badge.label, error: failure?.message ?? String(failure) })
+    }
+  }
+  const submitImport = async (event) => {
+    event.preventDefault()
+    const value = importText.trim()
+    if (!value) return
+    try {
+      if (importMode === 'takeover') await actions.memoryTakeover?.(owner.id, { sourceSessionId: value })
+      else await actions.memoryImport?.(owner.id, { path: value })
+      setImportMode(null)
+      setImportText('')
+      void load({ summarize: page === 'summary' })
+    } catch (failure) {
+      setAnswer({ asked: value, error: failure?.message ?? String(failure) })
+    }
+  }
+  useEffect(() => {
+    const q = searchQuery.trim()
+    if (q === '') { setSearchHits(null); setSearching(false); return undefined }
+    setPage('entries')
+    let cancelled = false
+    setSearching(true)
+    const timer = setTimeout(() => {
+      if (!actions.memorySearch) {
+        const lower = q.toLowerCase()
+        setSearchHits((view?.entries ?? []).filter(entry => String(entry.text ?? '').toLowerCase().includes(lower) || String(entry.topic ?? '').toLowerCase().includes(lower)))
+        setSearching(false)
+        return
+      }
+      void Promise.resolve(actions.memorySearch(owner.id, q))
+        .then(result => { if (!cancelled) setSearchHits(result?.entries ?? result?.results ?? []) })
+        .catch(() => {
+          if (!cancelled) {
+            const lower = q.toLowerCase()
+            setSearchHits((view?.entries ?? []).filter(entry => String(entry.text ?? '').toLowerCase().includes(lower)))
+          }
+        })
+        .finally(() => { if (!cancelled) setSearching(false) })
+    }, 180)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [searchQuery, owner.id])
   const remove = async (entry) => {
     try {
       show(await actions.memoryForget(owner.id, entry))
@@ -463,11 +555,34 @@ export function MemoryDialog({ owner, actions, leaving = false }) {
           h('button', { type: 'button', role: 'menuitem', onClick: openHistory },
             h('span', { className: 'bt-menu-label' }, t('Change history'))),
           h('button', { type: 'button', role: 'menuitem', disabled: count === 0 || view?.summarizing, onClick: regenerate },
-            h('span', { className: 'bt-menu-label' }, t('Regenerate summary')))) : null),
+            h('span', { className: 'bt-menu-label' }, t('Regenerate summary'))),
+          h('button', { type: 'button', role: 'menuitem', onClick: () => openImport('import') },
+            h('span', { className: 'bt-menu-label' }, t('Import transcript'))),
+          h('button', { type: 'button', role: 'menuitem', onClick: () => openImport('takeover') },
+            h('span', { className: 'bt-menu-label' }, t('Session takeover')))) : null),
+      h('div', { className: 'bt-mem-toolbar' },
+        h('input', {
+          type: 'search', className: 'bt-mem-search', value: searchQuery,
+          placeholder: t('Search memory…'), 'aria-label': t('Search memory'),
+          onChange: event => setSearchQuery(event.target.value),
+        }),
+        h('div', { className: 'bt-seg bt-mem-mode', role: 'radiogroup', 'aria-label': t('Memory privacy mode') },
+          MEMORY_MODES.map(item => h('button', {
+            key: item, type: 'button', role: 'radio', 'aria-checked': activeMode === item,
+            className: 'bt-seg-btn', onClick: () => void changeMode(item),
+          }, memoryModeLabel(item))))),
+      importMode ? h('form', { className: 'bt-mem-import', onSubmit: submitImport },
+        h('input', {
+          className: 'bt-mem-search', value: importText, autoFocus: true,
+          placeholder: importMode === 'takeover' ? t('Source session id or path') : t('Transcript file path or JSONL'),
+          onChange: event => setImportText(event.target.value),
+        }),
+        h('button', { type: 'submit', className: 'bt-soft bt-soft-sm' }, importMode === 'takeover' ? t('Take over') : t('Import')),
+        h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: () => setImportMode(null) }, t('Cancel'))) : null,
       h('div', { className: 'bt-mem-body' },
         error ? h('div', { className: 'bt-error', role: 'alert', style: { padding: 0 } }, hostText(error)) : null,
         view === null ? (error ? null : h(Skeleton))
-          : page === 'entries' ? h(Entries, { owner, view, remove, pin, layer, openMove, undoTidy })
+          : page === 'entries' ? h(Entries, { owner, view, remove, pin, layer, openMove, undoTidy, onProvenance, searchHits, searching, searchQuery })
             : page === 'history' ? h(History, { owner, actions, undo, now })
               : h(Summary, { owner, view, regenerate })),
       h('div', { className: 'bt-mem-foot' },
