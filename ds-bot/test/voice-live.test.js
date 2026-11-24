@@ -217,7 +217,7 @@ test('both Local and Cloud bots call the same signed /v1/voice/* controller API 
   const localPost = localHost.controllerCalls.find(c => c.method === 'POST')
   assert.equal(localPost.path, '/v1/voice/sessions')
   assert.equal(localPost.body.model, 'gpt-live-1.1')
-  assert.equal(localPost.body.idleTimeoutS, 15)
+  assert.equal(localPost.body.idleTimeoutS, 5)
   assert.match(localPost.body.instructions, /Active runtime: Local machine/)
   assert.equal(localPost.body.machineId, undefined)
 
@@ -268,7 +268,7 @@ test('host falls back to direct OpenAI /v1/live/sessions via credentials or secr
   assert.equal(credHost.openaiCalls[0].headers.authorization, `Bearer ${credKey}`)
   assert.equal(credHost.openaiCalls[0].body.session.model, 'gpt-live-1.1')
   assert.deepEqual(credHost.openaiCalls[0].body.session.wake_policy, { type: 'speech', vad_threshold: 0.5 })
-  assert.equal(credHost.openaiCalls[0].body.session.idle_timeout_s, 15)
+  assert.equal(credHost.openaiCalls[0].body.session.idle_timeout_s, 5)
   assert.deepEqual(credHost.openaiCalls[0].body.session.delegation, { type: 'client' })
 
   await credHost.call('voice-session-close', { liveSessionId: 'live_direct_1' })

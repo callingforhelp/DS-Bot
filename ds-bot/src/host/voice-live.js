@@ -8,7 +8,7 @@ export const DEFAULT_LIVE_MODEL = 'gpt-live-1.1'
 export const ALLOWED_LIVE_MODELS = ['gpt-live-1.1', 'gpt-live-1']
 export const DEFAULT_LIVE_VOICE = 'marin'
 export const ALLOWED_LIVE_VOICES = ['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse']
-export const DEFAULT_IDLE_TIMEOUT_S = 15
+export const DEFAULT_IDLE_TIMEOUT_S = 5
 export const DEFAULT_VAD_THRESHOLD = 0.5
 export const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1'
 export const LIVE_DATA_CHANNEL = 'oai-events'
@@ -174,7 +174,7 @@ export function buildVoiceInstructions(rt, sessionId, { recentSessionTurns = [] 
   }
 
   lines.push(
-    'Voice mode style: respond naturally, warmly, and concisely for spoken playback. Never read raw markdown syntax, code fences, file paths, or long URLs verbatim; summarize them clearly in plain speech. Reply in the user\'s language.',
+    'Voice mode style: respond naturally, warmly, and concisely for spoken playback (typically 1-3 short sentences unless asked for detail). Avoid rambling or chaining multiple follow-up questions so the conversation has natural pauses. Never read raw markdown syntax, code fences, file paths, or long URLs verbatim; summarize them clearly in plain speech. Reply in the user\'s language.',
     'Delegation policy: answer quick conversational questions and acknowledgements directly. Whenever the user asks you to take action — inspect or edit files, run local or cloud shell commands, search the workspace or web, check memory or schedules, or coordinate other Bots — immediately create a client delegation so the DS Bot backend executes the tools and sends back commentary for you to speak.',
   )
   return lines.join('\n\n')
