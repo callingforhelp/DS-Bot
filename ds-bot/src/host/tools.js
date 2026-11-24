@@ -1183,8 +1183,10 @@ export function install(rt) {
     // loading the plugin again walks the live Agents from the load the memory module
     // starts, and the tools added after it (memory, secrets, connectors) would never
     // join that scope. Register what it is missing, so the next request is whole.
+    const swarmDefs = owns ? (rt.swarmToolsForSession?.(id) ?? []) : []
+    const desiredDefs = [...rt.teamTools, ...(localBot ? (rt.localAgentTools ?? []) : []), ...swarmDefs]
     if (held?.tools === true) {
-      for (const def of [...rt.teamTools, ...(localBot ? (rt.localAgentTools ?? []) : [])]) {
+      for (const def of desiredDefs) {
         if (relayOnly && def.name !== 'group_relay') continue
         if (held.added?.has(def.name) === true) continue
         try {
@@ -1207,7 +1209,7 @@ export function install(rt) {
           rt.warn('ds-bot: team tool %s not added to %s: %s', def.name, id, error)
         }
       }
-      if ([...rt.teamTools, ...(localBot ? (rt.localAgentTools ?? []) : [])].some(def => (!relayOnly || def.name === 'group_relay') && !held.added?.has(def.name))) {
+      if (desiredDefs.some(def => (!relayOnly || def.name === 'group_relay') && !held.added?.has(def.name))) {
         retryBotTools(agent, held)
       } else {
         clearTimeout(held.retryTimer)
@@ -1226,7 +1228,7 @@ export function install(rt) {
     const disposers = []
     const failed = []
     const registered = []
-    for (const def of [...rt.teamTools, ...(localBot ? (rt.localAgentTools ?? []) : [])]) {
+    for (const def of desiredDefs) {
       if (relayOnly && def.name !== 'group_relay') continue
       try {
         const dispose = agent.ctx.tools.register(def)

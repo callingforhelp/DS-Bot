@@ -23,7 +23,7 @@ export function install(rt) {
   const { ctx, home, statePath } = rt
 
   /** @type {{version:1, workspaceId?:string, mainBotIds:string[], bots:Record<string,any>, privateArchives:any[], rooms:Record<string,any>, agents:Record<string,any>, sections:any[], capabilities:{items:Record<string,any>}, exchanges:any[], exchangeTurns:Record<string,number[]>, revision:number}} */
-  const state = { version: 1, mainBotIds: [], bots: {}, privateArchives: [], rooms: {}, agents: {}, sections: [], capabilities: { items: {} }, exchanges: [], exchangeTurns: {}, works: {}, requests: {}, questions: {}, views: {}, closedCards: {}, prefs: {}, switching: {}, cloudRuntimes: {}, revision: 0 }
+  const state = { version: 1, mainBotIds: [], bots: {}, privateArchives: [], rooms: {}, agents: {}, sections: [], capabilities: { items: {} }, artifacts: {}, sessionMemoryModes: {}, swarms: {}, exchanges: [], exchangeTurns: {}, works: {}, requests: {}, questions: {}, views: {}, closedCards: {}, prefs: {}, switching: {}, cloudRuntimes: {}, revision: 0 }
   let loaded = null
   let storeReady = false
   let writing = Promise.resolve()
@@ -134,6 +134,9 @@ export function install(rt) {
     }
     if (state.bots === null || typeof state.bots !== 'object' || Array.isArray(state.bots)) state.bots = {}
     if (state.rooms === null || typeof state.rooms !== 'object' || Array.isArray(state.rooms)) state.rooms = {}
+    if (state.artifacts === null || typeof state.artifacts !== 'object' || Array.isArray(state.artifacts)) state.artifacts = {}
+    if (state.sessionMemoryModes === null || typeof state.sessionMemoryModes !== 'object' || Array.isArray(state.sessionMemoryModes)) state.sessionMemoryModes = {}
+    if (state.swarms === null || typeof state.swarms !== 'object' || Array.isArray(state.swarms)) state.swarms = {}
     for (const [id, bot] of Object.entries(state.bots)) {
       if (!bot || typeof bot !== 'object' || Array.isArray(bot)) {
         delete state.bots[id]
@@ -775,9 +778,9 @@ export function install(rt) {
   }
   // The Bot a Session speaks for: its own chat, one of its group Sessions, or an
   // earlier segment of either.
-  const selfOf = id => chatOwners.get(id) ?? groupOwners.get(id)?.botId ?? pastOwners.get(id)?.botId
+  const selfOf = id => chatOwners.get(id) ?? groupOwners.get(id)?.botId ?? rt.swarmOwners?.get(id)?.ownerBotId ?? pastOwners.get(id)?.botId
   // A Session where the Bot speaks now, as opposed to an archived segment.
-  const isBotSession = id => chatOwners.has(id) || groupOwners.has(id)
+  const isBotSession = id => chatOwners.has(id) || groupOwners.has(id) || rt.swarmOwners?.has(id) === true
   const groupSessionsOf = botId => Object.values(state.rooms).map(room => room.sessions?.[botId]).filter(Boolean)
   const dropGroupSession = (room, botId) => {
     if (room.memberDirs !== undefined) delete room.memberDirs[botId]

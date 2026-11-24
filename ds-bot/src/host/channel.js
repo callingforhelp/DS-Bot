@@ -132,6 +132,8 @@ export function install(rt) {
     im: rt.imView?.() ?? { connections: [], platforms: [] },
     // The computer-use switch, the provider it mounts, and each Bot's level and app grants.
     computer: rt.computerView?.() ?? { enabled: false },
+    artifacts: rt.artifactsView?.() ?? {},
+    swarms: rt.swarmsView?.() ?? {},
     cloudRuntime: rt.cloudRuntimeView?.() ?? { controllerOnline: false, configured: false, syncedAt: null, machines: [], sessions: {} },
   })
   // What changes without a new revision, sent with every state answer. `learning`:
@@ -167,6 +169,7 @@ export function install(rt) {
     // Browser holds (handoffs and takeovers) change without bumping state.revision,
     // so they ride on live() to reconcile unchanged-revision polls.
     browserHolds: rt.browserChannel?.holdSnapshot?.() ?? {},
+    swarmsLive: rt.swarmsLiveView?.() ?? {},
     cloudRuntime: rt.cloudRuntimeView?.() ?? { controllerOnline: false, configured: false, syncedAt: null, machines: [], sessions: {} },
   })
   // The live fields' sources are spread across the host with no single change
@@ -185,7 +188,7 @@ export function install(rt) {
   }
   // What a host that only reads the team may still answer.
   // Updates change the dsh profile, not the team, so a reading host may run them too.
-  const READS = new Set(['secret-store', 'secret-unlock', 'state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'agent-chat', 'bot-task-read', 'run-stats', 'room-progress', 'group-rows', 'group-relay-replies', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image', 'markdown-image', 'file-download', 'changes-check', 'deepseek-services', 'deepseek-synthesize', 'cloud-status', 'cloud-preflight', 'voice-status'])
+  const READS = new Set(['secret-store', 'secret-unlock', 'state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'agent-chat', 'bot-task-read', 'run-stats', 'room-progress', 'group-rows', 'group-relay-replies', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'memory-search', 'memory-provenance', 'artifact-list', 'swarm-read', 'swarm-models', 'swarm-status', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image', 'markdown-image', 'file-download', 'changes-check', 'deepseek-services', 'deepseek-synthesize', 'cloud-status', 'cloud-preflight', 'voice-status'])
 
   async function setPrefs(body) {
     if (body.theme !== undefined) {
@@ -248,6 +251,25 @@ export function install(rt) {
     if (body.memoryAutoRecall !== undefined) {
       if (body.memoryAutoRecall === false) state.prefs.memoryAutoRecall = false
       else delete state.prefs.memoryAutoRecall
+    }
+    if (body.memoryMode !== undefined) {
+      if (['on', 'silent', 'incognito', 'off'].includes(body.memoryMode)) state.prefs.memoryMode = body.memoryMode
+      else if (body.memoryMode === null) delete state.prefs.memoryMode
+      else throw invalid('Unknown memory privacy mode')
+    }
+    if (body.memoryEmbeddings !== undefined) {
+      const cfg = body.memoryEmbeddings
+      if (cfg === null) delete state.prefs.memoryEmbeddings
+      else if (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) {
+        const provider = cfg.provider
+        if (provider !== undefined && !['auto', 'ollama', 'openai-compat', 'none'].includes(provider)) throw invalid('Unknown memory embeddings provider')
+        state.prefs.memoryEmbeddings = {
+          ...(state.prefs.memoryEmbeddings ?? {}),
+          ...(provider !== undefined ? { provider } : {}),
+          ...(typeof cfg.model === 'string' ? { model: cfg.model.trim() } : {}),
+          ...(typeof cfg.baseUrl === 'string' ? { baseUrl: cfg.baseUrl.trim() } : {}),
+        }
+      }
     }
     if (body.memoryLimits !== undefined) {
       const sizes = Object.entries(body.memoryLimits ?? {}).filter(([scope, size]) => MEMORY_LIMIT_SCOPES.has(scope) && Number.isInteger(size) && size >= MEMORY_LIMIT_MIN && size <= MEMORY_LIMIT_MAX)
@@ -659,6 +681,65 @@ export function install(rt) {
         case 'memory-restore':
           await rt.load()
           return ok(await rt.memoryEndpoint(endpoint, body))
+        case 'memory-search': {
+          await rt.load()
+          const results = await (rt.hybridSearch?.(String(body.query ?? ''), {
+            limit: body.limit,
+            scope: body.scope,
+            botId: body.botId,
+            roomId: body.roomId,
+          }) ?? [])
+          return ok({ results, entries: results })
+        }
+        case 'memory-provenance': {
+          await rt.load()
+          const results = await (rt.codeSearch?.({
+            query: body.query ?? body.text,
+            commit: body.kind === 'commit' ? body.value : body.commit,
+            pr: body.kind === 'pr' ? body.value : body.pr,
+            path: body.kind === 'file' ? body.value : body.path,
+            limit: body.limit ?? 10,
+          }) ?? [])
+          return ok({ results })
+        }
+        case 'memory-mode': {
+          await rt.load()
+          const mode = body.mode
+          if (!['on', 'silent', 'incognito', 'off'].includes(mode)) return fail('Unknown memory privacy mode', 'bot/invalid')
+          if (typeof body.sessionId === 'string' && body.sessionId !== '') {
+            rt.setSessionMemoryMode?.(body.sessionId, mode)
+          } else {
+            state.prefs.memoryMode = mode
+          }
+          await rt.save()
+          return ok({ sessionId: body.sessionId ?? null, mode })
+        }
+        case 'memory-import': {
+          await rt.load()
+          return ok(await (rt.importTranscript?.(body) ?? { imported: 0 }))
+        }
+        case 'memory-takeover': {
+          await rt.load()
+          const sourceSessionId = String(body.sourceSessionId ?? body.sessionId ?? '').trim()
+          if (sourceSessionId === '') return fail('sourceSessionId is required', 'bot/invalid')
+          return ok(await (rt.exportTakeoverBundle?.(sourceSessionId) ?? { sessionId: sourceSessionId, entries: [] }))
+        }
+        case 'artifact-save':
+        case 'artifact-delete':
+        case 'artifact-list':
+          await rt.load()
+          return ok(await (rt.artifactEndpoint?.(endpoint, body) ?? { ok: false }))
+        case 'swarm-read':
+        case 'swarm-post':
+        case 'swarm-models':
+        case 'swarm-switch-model':
+        case 'swarm-close':
+        case 'swarm-create':
+        case 'swarm-add':
+        case 'swarm-kill':
+        case 'swarm-status':
+          await rt.load()
+          return ok(await (rt.swarmEndpoint?.(endpoint, body) ?? { ok: false }))
         case 'learning-answer':
           await rt.load()
           return ok(await rt.learningEndpoint(endpoint, body))

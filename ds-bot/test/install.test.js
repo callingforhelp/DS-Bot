@@ -83,6 +83,9 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'on agent/inbox/discarded',
     'on session/event',
     'effect ds-bot: resume interrupted turns',
+    'effect ds-bot: memory index',
+    'on session/event',
+    'effect ds-bot: provenance',
     'effect ds-bot: memory recovery',
     'effect ds-bot: memory section',
     'prompt bot-memory 645',
@@ -107,6 +110,9 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'effect ds-bot: bot-tasks approval bridge',
     'on agent/inbox/inserted',
     'on session/event',
+    // swarm.js + swarm-tools.js: native swarm board and system prompt section.
+    'effect ds-bot: swarm prompt section',
+    'prompt bot-swarm 647',
     // changes.js: the announced workspace/changes turn, remembered for the group row.
     'on session/event',
     'on llm/stream',

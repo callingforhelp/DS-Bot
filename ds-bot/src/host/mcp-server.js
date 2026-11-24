@@ -87,6 +87,127 @@ export const MCP_TOOLS = [
   },
 ]
 
+const VALID_MEMORY_SCOPES = new Set(['read', 'write', 'code', 'team'])
+const VALID_MEMORY_MODES = new Set(['on', 'silent', 'incognito', 'off'])
+
+export const MEMORY_MCP_TOOLS = [
+  {
+    name: 'mem_search',
+    description: 'Hybrid lexical and semantic search across DS Bot memory and observations.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' }, scope: { type: 'string' } }, required: ['query'] },
+    requiredScope: 'read',
+  },
+  {
+    name: 'mem_code_search',
+    description: 'Search commit SHAs, PRs, and file paths linked to past sessions and observations.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, commit: { type: 'string' }, pr: { type: 'string' }, path: { type: 'string' }, limit: { type: 'number' } } },
+    requiredScope: 'code',
+  },
+  {
+    name: 'mem_ingest',
+    description: 'Ingest an observation or turn summary into DS Bot memory (honors privacy mode and redaction).',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' }, topic: { type: 'string' }, sessionId: { type: 'string' }, botId: { type: 'string' }, scope: { type: 'string' } }, required: ['text'] },
+    requiredScope: 'write',
+  },
+  {
+    name: 'mem_context',
+    description: 'Build startup context from relevant memories and recent observations.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, sessionId: { type: 'string' }, botId: { type: 'string' }, limit: { type: 'number' } } },
+    requiredScope: 'read',
+  },
+  {
+    name: 'mem_forget',
+    description: 'Soft-delete a memory entry by id.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    requiredScope: 'write',
+  },
+  {
+    name: 'mem_restore',
+    description: 'Restore a previously soft-deleted memory entry by id.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    requiredScope: 'write',
+  },
+  {
+    name: 'mem_takeover',
+    description: 'Export a lossless session takeover bundle for handoff.',
+    inputSchema: { type: 'object', properties: { sessionId: { type: 'string' } }, required: ['sessionId'] },
+    requiredScope: 'read',
+  },
+  {
+    name: 'mem_import',
+    description: 'Import a transcript or markdown memory directory into DS Bot memory.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, format: { type: 'string' }, botId: { type: 'string' } } },
+    requiredScope: 'write',
+  },
+  {
+    name: 'mem_mode',
+    description: 'Get or set the memory privacy mode (on, silent, incognito, off) for a session.',
+    inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, mode: { type: 'string' } } },
+    requiredScope: 'write',
+  },
+  {
+    name: 'artifact_save',
+    description: 'Create or update a shared team artifact.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, kind: { type: 'string' }, content: { type: 'string' } }, required: ['title'] },
+    requiredScope: 'write',
+  },
+  {
+    name: 'artifact_get',
+    description: 'Read a shared team artifact by id or slug.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    requiredScope: 'read',
+  },
+  {
+    name: 'artifact_list',
+    description: 'List shared team artifacts.',
+    inputSchema: { type: 'object', properties: {} },
+    requiredScope: 'read',
+  },
+  {
+    name: 'artifact_delete',
+    description: 'Delete a shared team artifact by id.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    requiredScope: 'write',
+  },
+]
+
+export const SWARM_MCP_TOOLS = [
+  {
+    name: 'swarm_status',
+    description: 'List active swarms or inspect one swarm roster and state.',
+    inputSchema: { type: 'object', properties: { swarmId: { type: 'string' } } },
+  },
+  {
+    name: 'swarm_post',
+    description: 'Post a message to a swarm board.',
+    inputSchema: { type: 'object', properties: { swarmId: { type: 'string' }, text: { type: 'string' }, channel: { type: 'string' } }, required: ['swarmId', 'text'] },
+  },
+  {
+    name: 'swarm_read',
+    description: 'Read messages from a swarm board.',
+    inputSchema: { type: 'object', properties: { swarmId: { type: 'string' }, since: { type: 'number' }, limit: { type: 'number' }, channel: { type: 'string' } }, required: ['swarmId'] },
+  },
+  {
+    name: 'swarm_switch_model',
+    description: 'Switch a swarm member model preserving history.',
+    inputSchema: { type: 'object', properties: { swarmId: { type: 'string' }, name: { type: 'string' }, model: { type: 'string' } }, required: ['swarmId', 'name', 'model'] },
+  },
+  {
+    name: 'swarm_close',
+    description: 'Close a swarm and ingest its distilled decisions into memory.',
+    inputSchema: { type: 'object', properties: { swarmId: { type: 'string' } }, required: ['swarmId'] },
+  },
+]
+
+const stripScopeMeta = ({ requiredScope: _ignored, ...tool }) => tool
+
+export function toolsForClient(client) {
+  const scopes = new Set(Array.isArray(client?.memoryScopes) ? client.memoryScopes : [])
+  const memoryTools = MEMORY_MCP_TOOLS.filter(tool => scopes.has(tool.requiredScope)).map(stripScopeMeta)
+  const swarmTools = client?.swarmAccess === true ? SWARM_MCP_TOOLS : []
+  return [...MCP_TOOLS, ...memoryTools, ...swarmTools]
+}
+
 // Only what an agent reads: who said it, what, and when. No tool calls or step details.
 function chatItems(items) {
   return (items ?? [])
@@ -109,6 +230,18 @@ export function clientTools(rt, client, { pollMs = POLL_MS, current = () => clie
     if (now === undefined) throw refused('This client was removed')
     return now
   }
+  const requireMemoryScope = (needed) => {
+    const now = scope()
+    const scopes = Array.isArray(now.memoryScopes) ? now.memoryScopes : []
+    if (!scopes.includes(needed)) throw refused(`This client lacks memory scope "${needed}"`)
+    return now
+  }
+  const requireSwarmAccess = () => {
+    const now = scope()
+    if (now.swarmAccess !== true) throw refused('This client does not have swarm access')
+    return now
+  }
+  const clientMode = () => scope().memoryMode ?? 'on'
   const allowedBot = bot => bot !== undefined && bot.private !== true && scope().bots.includes(bot.id)
   const allowedRoom = room => room !== undefined && scope().rooms.includes(room.id)
   const named = (entry, key) => String(entry.name ?? '').toLowerCase() === key.toLowerCase()
@@ -257,6 +390,110 @@ export function clientTools(rt, client, { pollMs = POLL_MS, current = () => clie
       })
       return { waiting: [...approvals, ...questions, ...views], answerIn: 'DS Bot on this computer' }
     },
+    mem_search: async (args) => {
+      requireMemoryScope('read')
+      const mode = clientMode()
+      if (mode === 'silent' || mode === 'off') return { results: [], mode }
+      const results = await (rt.hybridSearch?.(String(args.query ?? ''), { limit: args.limit, scope: args.scope }) ?? [])
+      return { results }
+    },
+    mem_code_search: async (args) => {
+      requireMemoryScope('code')
+      const results = await (rt.codeSearch?.({ query: args.query, commit: args.commit, pr: args.pr, path: args.path, limit: args.limit }) ?? [])
+      return { results }
+    },
+    mem_ingest: async (args) => {
+      requireMemoryScope('write')
+      const mode = clientMode()
+      if (mode === 'incognito' || mode === 'off') return { ingested: false, mode }
+      return (await rt.ingestObservation?.({
+        text: String(args.text ?? ''),
+        topic: args.topic,
+        sessionId: args.sessionId,
+        botId: args.botId,
+        scope: args.scope ?? 'team',
+        source: `mcp:${client.name}`,
+      })) ?? { ingested: false }
+    },
+    mem_context: async (args) => {
+      requireMemoryScope('read')
+      const mode = clientMode()
+      if (mode === 'silent' || mode === 'off') return { context: '', mode }
+      const context = await (rt.buildStartupContext?.({ query: args.query, sessionId: args.sessionId, botId: args.botId, limit: args.limit }) ?? '')
+      return { context }
+    },
+    mem_forget: async (args) => {
+      requireMemoryScope('write')
+      const id = String(args.id ?? '').trim()
+      if (id === '') throw invalid('id is required')
+      return { deleted: Boolean(await rt.memoryIndexDelete?.(id)), id }
+    },
+    mem_restore: async (args) => {
+      requireMemoryScope('write')
+      const id = String(args.id ?? '').trim()
+      if (id === '') throw invalid('id is required')
+      return { restored: Boolean(await rt.memoryIndexRestore?.(id)), id }
+    },
+    mem_takeover: async (args) => {
+      requireMemoryScope('read')
+      const sessionId = String(args.sessionId ?? '').trim()
+      if (sessionId === '') throw invalid('sessionId is required')
+      return (await rt.exportTakeoverBundle?.(sessionId)) ?? { sessionId, entries: [] }
+    },
+    mem_import: async (args) => {
+      requireMemoryScope('write')
+      return (await rt.importTranscript?.(args)) ?? { imported: 0 }
+    },
+    mem_mode: async (args) => {
+      requireMemoryScope('write')
+      const sessionId = String(args.sessionId ?? '').trim()
+      if (args.mode !== undefined) {
+        if (!VALID_MEMORY_MODES.has(args.mode)) throw invalid(`Invalid memory mode: ${args.mode}`)
+        if (sessionId) rt.setSessionMemoryMode?.(sessionId, args.mode)
+        return { sessionId: sessionId || null, mode: args.mode }
+      }
+      return { sessionId: sessionId || null, mode: rt.resolveMemoryMode?.({ sessionId }) ?? clientMode() }
+    },
+    artifact_save: async (args) => {
+      requireMemoryScope('write')
+      return (await rt.artifactEndpoint?.('artifact-save', args)) ?? { ok: false }
+    },
+    artifact_get: async (args) => {
+      requireMemoryScope('read')
+      const artifact = rt.getArtifact?.(String(args.id ?? ''))
+      if (!artifact) throw invalid('Artifact not found')
+      return { artifact }
+    },
+    artifact_list: () => {
+      requireMemoryScope('read')
+      return { artifacts: Object.values(rt.artifactsView?.() ?? {}) }
+    },
+    artifact_delete: async (args) => {
+      requireMemoryScope('write')
+      return (await rt.artifactEndpoint?.('artifact-delete', { id: args.id })) ?? { ok: false }
+    },
+    swarm_status: (args) => {
+      requireSwarmAccess()
+      const swarms = rt.swarmsView?.() ?? {}
+      if (args.swarmId) return { swarm: swarms[args.swarmId] ?? null }
+      return { swarms }
+    },
+    swarm_post: async (args) => {
+      requireSwarmAccess()
+      return (await rt.swarmEndpoint?.('swarm-post', { ...args, from: `mcp:${client.name}` })) ?? { ok: false }
+    },
+    swarm_read: async (args) => {
+      requireSwarmAccess()
+      return (await rt.swarmEndpoint?.('swarm-read', args)) ?? { messages: [] }
+    },
+    swarm_switch_model: async (args) => {
+      requireSwarmAccess()
+      return (await rt.swarmEndpoint?.('swarm-switch-model', args)) ?? { ok: false }
+    },
+    swarm_close: async (args) => {
+      requireSwarmAccess()
+      return (await rt.swarmEndpoint?.('swarm-close', args)) ?? { ok: false }
+    },
   }
   return async (name, args) => {
     const handler = Object.hasOwn(handlers, name) ? handlers[name] : undefined
@@ -286,7 +523,7 @@ export function mcpHttpServer({ authorize, callFor, version = '0' }) {
       case 'ping':
         return {}
       case 'tools/list':
-        return { tools: MCP_TOOLS }
+        return { tools: toolsForClient(client) }
       case 'tools/call': {
         try {
           const result = await callFor(client)(String(params?.name ?? ''), params?.arguments ?? {})
@@ -448,13 +685,24 @@ export function install(rt) {
       status,
       error,
       url: `http://127.0.0.1:${data.port}/mcp`,
-      clients: data.clients.map(({ id, name, bots, rooms, createdAt, lastUsedAt }) => ({ id, name, bots, rooms, createdAt, lastUsedAt: lastUsedAt ?? null })),
+      clients: data.clients.map(({ id, name, bots, rooms, memoryScopes, memoryMode, swarmAccess, createdAt, lastUsedAt }) => ({
+        id, name, bots, rooms,
+        ...(Array.isArray(memoryScopes) && memoryScopes.length > 0 ? { memoryScopes } : {}),
+        ...(memoryMode ? { memoryMode } : {}),
+        ...(swarmAccess === true ? { swarmAccess: true } : {}),
+        createdAt, lastUsedAt: lastUsedAt ?? null,
+      })),
     }
   }
 
   const scope = (body, fallback) => ({
     bots: body.bots === undefined ? fallback.bots : ids(body.bots).filter(id => rt.botOf(id) !== undefined && rt.botOf(id).private !== true),
     rooms: body.rooms === undefined ? fallback.rooms : ids(body.rooms).filter(id => rt.roomOf(id) !== undefined),
+    memoryScopes: body.memoryScopes === undefined ? (fallback.memoryScopes ?? []) : ids(body.memoryScopes).filter(s => VALID_MEMORY_SCOPES.has(s)),
+    ...(body.memoryMode !== undefined
+      ? (VALID_MEMORY_MODES.has(body.memoryMode) ? { memoryMode: body.memoryMode } : {})
+      : (fallback.memoryMode ? { memoryMode: fallback.memoryMode } : {})),
+    swarmAccess: body.swarmAccess === undefined ? fallback.swarmAccess === true : body.swarmAccess === true,
   })
   const clientOf = (id) => {
     const client = data.clients.find(entry => entry.id === String(id ?? ''))

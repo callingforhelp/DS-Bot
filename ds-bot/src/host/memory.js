@@ -1,3 +1,10 @@
+import * as memoryPrivacy from './memory-privacy.js'
+import * as memoryEmbeddings from './memory-embeddings.js'
+import * as memoryIndex from './memory-index.js'
+import * as ingest from './ingest.js'
+import * as provenance from './provenance.js'
+import * as artifacts from './artifacts.js'
+import * as takeover from './takeover.js'
 // Memory: what a Bot keeps across all its conversations, as Markdown in the Agent
 // Memory Repo format (github.com/AgentMemoryRepo/agentmemoryrepo): one entry per
 // bullet line ending in `[key: value; …]` metadata, and a MEMORY.md entry point whose
@@ -88,6 +95,13 @@ const NEWS_TEXT_MAX = 160
 
 export function install(rt) {
   const { ctx, config, home, state } = rt
+  if (typeof rt.resolveMemoryMode !== 'function') memoryPrivacy.install(rt)
+  if (typeof rt.embedText !== 'function') memoryEmbeddings.install(rt)
+  if (typeof rt.memoryIndexUpsert !== 'function') memoryIndex.install(rt)
+  if (typeof rt.ingestObservation !== 'function') ingest.install(rt)
+  if (typeof rt.recordProvenance !== 'function') provenance.install(rt)
+  if (typeof rt.saveArtifact !== 'function') artifacts.install(rt)
+  if (typeof rt.importTranscript !== 'function') takeover.install(rt)
 
   if (config.memory === false) {
     Object.assign(rt, {
@@ -589,8 +603,60 @@ export function install(rt) {
   // header shows it once.
   /** @type {Map<string, {at:number, op:string, text:string}>} */
   const news = new Map()
+  // The entry index mirrors every entry write; a failing index never blocks memory.
+  const indexId = (scope, id) => `memory:${scopeKey(scope)}:${id}`
+  const modeAllows = (kind, ids) => {
+    const fn = kind === 'inject' ? rt.canInjectMemory : rt.canWriteMemory
+    return typeof fn !== 'function' || fn(ids)
+  }
+  function mirrorUpsert(scope, topic, text, id) {
+    if (typeof rt.memoryIndexUpsert !== 'function') return
+    try {
+      rt.memoryIndexUpsert({
+        id: indexId(scope, id),
+        kind: 'memory',
+        scopeKey: scopeKey(scope),
+        botId: scope.kind === 'bot' ? scope.botId : null,
+        roomId: scope.kind === 'group' ? scope.roomId : null,
+        topic: topic ?? '',
+        title: topic ? `[[${topic}]]` : 'MEMORY.md',
+        body: splitMeta(String(text ?? '').replace(/^\s*[-*]\s+/, '')).text,
+        isPrivate: scope.kind === 'bot' && rt.isPrivate(scope.botId) === true,
+      })
+    } catch (error) {
+      rt.warn('ds-bot: memory index not updated: %s', error?.message ?? error)
+    }
+  }
+  function mirrorDelete(scope, id) {
+    if (typeof rt.memoryIndexDelete !== 'function') return
+    try { rt.memoryIndexDelete(indexId(scope, id)) } catch (error) { rt.warn('ds-bot: memory index not updated: %s', error?.message ?? error) }
+  }
+  function memoryExportEntries({ includePrivate = false } = {}) {
+    const scopes = [TEAM, ...Object.keys(state.bots ?? {}).map(ownScope), ...Object.keys(state.rooms ?? {}).map(groupScope)]
+    const out = []
+    for (const scope of scopes) {
+      const isPrivate = scope.kind === 'bot' && rt.isPrivate(scope.botId) === true
+      if (isPrivate && !includePrivate) continue
+      let files
+      try { files = loadScope(scope) } catch { continue }
+      for (const entry of allEntries(files)) {
+        out.push({
+          id: indexId(scope, entryId(entry)),
+          scopeKey: scopeKey(scope),
+          botId: scope.kind === 'bot' ? scope.botId : null,
+          roomId: scope.kind === 'group' ? scope.roomId : null,
+          topic: entry.file.topic ?? '',
+          text: entry.text,
+          meta: entry.meta ?? {},
+          isPrivate,
+        })
+      }
+    }
+    return out
+  }
   const noteNews = (scope, actor, op, line) => {
     if (actor.id === 'user') return
+    if (!modeAllows('write', { botId: actor.id })) return
     const id = scope.kind === 'team' ? actor.id : scope.kind === 'group' ? scope.roomId : scope.botId
     if (rt.botOf(id) === undefined && rt.roomOf(id) === undefined) return
     news.set(id, { at: Date.now(), op, text: splitMeta(String(line ?? '').replace(/^- /, '')).text.slice(0, NEWS_TEXT_MAX) })
@@ -608,7 +674,8 @@ export function install(rt) {
     const files = loadScope(scope)
     const entries = allEntries(files)
     const same = entries.find(entry => squash(entry.text) === squash(text))
-    const line = formatEntry(text, { id: meta.id ?? newEntryId(entries), ...meta })
+    const newId = meta.id ?? newEntryId(entries)
+    const line = formatEntry(text, { id: newId, ...meta })
     if (same !== undefined) {
       // An exact copy lets a move finish after its destination was saved before a restart.
       if (moving && (formatEntry(same.text, { id: same.meta.id, ...same.meta }) !== line || (scope.kind === 'team' && same.file.topic === undefined))) {
@@ -632,6 +699,7 @@ export function install(rt) {
       ? [writeStep(main.path, joinLines(room.lines))]
       : [writeStep(target.path, joinLines(written)), ...(room.lines === mainLines ? [] : [writeStep(main.path, joinLines(room.lines))])]
     await publish({ op: 'add', scope: scopeKey(scope), steps: [...steps, ...room.steps], row: { op: 'add', scope: scopeKey(scope), file: target.file, ...actorOf(actor), after: line, ...movedRow(room) } })
+    mirrorUpsert(scope, target.topic, text, newId)
     noteNews(scope, actor, 'add', line)
     const where = target === main ? MAIN : fresh ? `the new topic [[${name}]], linked from MEMORY.md` : `topic [[${name}]]`
     const after = target === main ? room.lines : written
@@ -669,6 +737,7 @@ export function install(rt) {
         steps: [writeStep(old.file.path, joinLines(room.lines)), ...room.steps],
         row: { op: 'replace', scope: scopeKey(scope), file: old.file.file, ...actorOf(actor), before, after: line, ...movedRow(room) },
       })
+      mirrorUpsert(scope, old.file.topic, text, entryId(old))
       noteNews(scope, actor, 'replace', line)
       return { changed: true, file: old.file, message: `Updated in ${label} (${fileName(old.file)}): "${old.text}" is now "${text}".${movedNote(room)}` }
     })
@@ -703,6 +772,7 @@ export function install(rt) {
       steps,
       row: { op: 'remove', scope: scopeKey(scope), file: old.file.file, ...actorOf(actor), before, ...(empty ? { removedTopic: true } : {}) },
     })
+    mirrorDelete(scope, entryId(old))
     noteNews(scope, actor, 'remove', before)
     return { changed: true, file: old.file, message: `Removed from ${label} (${fileName(old.file)}): "${old.text}", all of it, so save again with bot_remember any part that is still true. The change log keeps a copy.${empty ? ` The topic [[${old.file.topic}]] was empty, so it is gone too.` : ''}` }
   }
@@ -893,6 +963,7 @@ export function install(rt) {
     if (sessionId === undefined) return ''
     const bot = rt.botOf(rt.selfOf(sessionId))
     if (bot === undefined) return ''
+    if (!modeAllows('inject', { botId: bot.id, sessionId })) return ''
     // A section frozen under another role (made a Main Bot or a group admin since, or no
     // longer one) is frozen again, so the rule it states matches what the tools allow.
     // A group Session's section is the Bot's own; its group's memory comes as a message
@@ -980,6 +1051,7 @@ export function install(rt) {
   const SAID = new Set(['user', 'schedule', 'bot'])
   function autoRecall(agent, bot, roomId, decision) {
     if (state.prefs.memoryAutoRecall === false) return undefined
+    if (!modeAllows('inject', { botId: bot.id, roomId, sessionId: agent.id })) return undefined
     const said = decision.messages.findLast(message => message?.role === 'user' && SAID.has(message.source?.kind))
     const query = said === undefined ? '' : textOf(said.content).slice(0, AUTO_RECALL_QUERY_MAX)
     if (query.trim() === '') return undefined
@@ -1030,6 +1102,7 @@ export function install(rt) {
   // of its own at the end of the conversation: the prompt above stays byte for byte, so
   // the provider's prefix cache holds. A Session's own writes are not news to it.
   function memoryUpdate(sessionId, bot, roomId) {
+    if (!modeAllows('inject', { botId: bot.id, roomId, sessionId })) return undefined
     const seen = seenOf(sessionId)
     const now = new Date().toISOString()
     if (seen === undefined) {
@@ -1894,6 +1967,6 @@ export function install(rt) {
 
   Object.assign(rt, {
     memoryEnabled: true, renewMemory, archiveBotMemory, archiveGroupMemory, memoryEndpoint, memoryEdit, memoryAdd, memoryReviews,
-    memoryNews: () => Object.fromEntries(news), botShot, tidyMemoryNow: tidyNow,
+    memoryExportEntries, memoryNews: () => Object.fromEntries(news), botShot, tidyMemoryNow: tidyNow,
   })
 }

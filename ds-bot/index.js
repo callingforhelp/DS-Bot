@@ -31,7 +31,17 @@ import * as resume from './src/host/resume.js'
 import * as memory from './src/host/memory.js'
 import * as parts from './src/host/parts.js'
 import * as botTasks from './src/host/bot-tasks.js'
+import * as swarm from './src/host/swarm.js'
+import * as swarmTools from './src/host/swarm-tools.js'
+import * as swarmMonitor from './src/host/swarm-monitor.js'
 import * as changes from './src/host/changes.js'
+import * as memoryPrivacy from './src/host/memory-privacy.js'
+import * as memoryEmbeddings from './src/host/memory-embeddings.js'
+import * as memoryIndex from './src/host/memory-index.js'
+import * as provenance from './src/host/provenance.js'
+import * as ingest from './src/host/ingest.js'
+import * as takeover from './src/host/takeover.js'
+import * as artifacts from './src/host/artifacts.js'
 import * as images from './src/host/images.js'
 import * as avatarLibrary from './src/host/avatar-library.js'
 import * as browser from './src/host/browser.js'
@@ -71,7 +81,7 @@ export { name, inject } from './src/host/entry.js'
 // install. Listeners run and tools are listed in registration order, so this order holds:
 // usage meters model requests after every listener that rewrites them. privacy checks a
 // call before the hooks of tools do, so a closed call never reaches a card they show.
-const MODULES = [diagnostics, store, ledger, models, providers, permissions, turns, steer, handoffs, requests, botResponsePolicy, delivery, roster, folders, privacy, agents, prompt, timeContext, tools, issueReport, deepseekServices, chatIndex, groups, goals, agentCommands, tasks, approvals, resume, memory, parts, botTasks, changes, images, avatarLibrary, secrets, connectors, capabilities, learning, schedules, browser, browserPlugins, computer, usage, update, dshUpdate, thinking, mobile, feed, phone, mcpServer, im, channel, remote, officeSkills, goalSkills, manualSkills, localAgents, cloudHandoff, voiceLive]
+const MODULES = [diagnostics, store, ledger, models, providers, permissions, turns, steer, handoffs, requests, botResponsePolicy, delivery, roster, folders, privacy, agents, prompt, timeContext, tools, issueReport, deepseekServices, chatIndex, groups, goals, agentCommands, tasks, approvals, resume, memoryPrivacy, memoryEmbeddings, memoryIndex, ingest, provenance, takeover, artifacts, memory, parts, botTasks, swarm, swarmTools, swarmMonitor, changes, images, avatarLibrary, secrets, connectors, capabilities, learning, schedules, browser, browserPlugins, computer, usage, update, dshUpdate, thinking, mobile, feed, phone, mcpServer, im, channel, remote, officeSkills, goalSkills, manualSkills, localAgents, cloudHandoff, voiceLive]
 
 export function apply(ctx, config = {}) {
   createRuntime(ctx, config)
