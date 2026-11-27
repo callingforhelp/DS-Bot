@@ -331,7 +331,9 @@ test('an idle round wakes the admin for a goal check; [PASS] waits for the user'
   host.begin('ga')
   host.finish('ga', '[PASS]')
   await settle(() => check() !== undefined)
-  assert.equal(goal(host).idle, true)
+  // Writer's task is still pending, so the check sends it instead of going idle.
+  await settle(() => host.agentOf('r1').calls.some(call => call.source?.role === 'post' && text(call).includes('@Writer')))
+  assert.notEqual(goal(host).idle, true)
   assert.equal(host.agentOf('r1').calls.filter(call => call.source?.role === 'goal' && call.source.goal === 'nudge').length, 0)
 })
 
@@ -378,7 +380,9 @@ test('two goal checks without progress mark the goal idle; a user message clears
   host.begin('ga')
   host.finish('ga', 'still waiting')
   await settle(() => two() !== undefined)
-  assert.equal(goal(host).idle, true)
+  // Writer's task is still pending, so the second check sends it instead of going idle.
+  await settle(() => host.agentOf('r1').calls.some(call => call.source?.role === 'post' && text(call).includes('@Writer')))
+  assert.notEqual(goal(host).idle, true)
   // A user message clears the idle wait and the count starts over.
   const third = host.round('c4', host.say('@Chief new ask'))
   await settle(() => host.agentOf('ga').calls.length === 4)
@@ -652,7 +656,8 @@ test('a member call while the goal waits brings it back', async (t) => {
   host.begin('ga')
   host.finish('ga', 'still waiting')
   await settle(() => two() !== undefined)
-  assert.equal(goal(host).idle, true)
+  await settle(() => host.agentOf('r1').calls.some(call => call.source?.role === 'post' && text(call).includes('@Writer')))
+  assert.notEqual(goal(host).idle, true)
   // The admin's own post calling a member clears the wait through the task hook.
   await host.tool('post_to_group', { group: 'Ops', message: '@Writer write the draft' }, 'a')
   const third = host.round('c4', host.takePost())
@@ -774,7 +779,9 @@ test('repeated turn settlements without member progress respect the idle check b
 
   assert.equal(nudges().length, 2, 'PASS-only settlements must stop after 2 goal checks')
   assert.equal(goal(host).nudges, 2)
-  assert.equal(goal(host).idle, true)
+  // Writer's task is still pending, so the limit routes it once and does not go idle.
+  assert.notEqual(goal(host).idle, true)
+  assert.ok(host.agentOf('r1').calls.some(call => call.source?.role === 'post' && text(call).includes('@Writer')))
 })
 
 test('concurrent and admin-interleaved goalSettled calls stop at the idle limit (#1330)', async (t) => {
@@ -786,7 +793,8 @@ test('concurrent and admin-interleaved goalSettled calls stop at the idle limit 
   await Promise.all(Array.from({ length: 6 }, () => host.rt.goalSettled(room)))
   assert.equal(nudges().length, 2)
   assert.equal(goal(host).nudges, 2)
-  assert.equal(goal(host).idle, true)
+  assert.notEqual(goal(host).idle, true)
+  assert.ok(host.agentOf('r1').calls.some(call => call.source?.role === 'post' && text(call).includes('@Writer')))
 
   // User message clears idle, then admin-only rounds + settlements still stop at 2 more checks.
   host.rt.goalUserMessage('r1')
@@ -796,7 +804,7 @@ test('concurrent and admin-interleaved goalSettled calls stop at the idle limit 
   }
   assert.equal(nudges().length, 4)
   assert.equal(goal(host).nudges, 2)
-  assert.equal(goal(host).idle, true)
+  assert.notEqual(goal(host).idle, true)
 
   // Real non-admin member work in a round still resets the check budget once idle is cleared.
   host.rt.goalUserMessage('r1')

@@ -1119,7 +1119,9 @@ export function install(rt) {
       const doneIds = batch.doneIds ?? []
       const last = members.find(bot => bot.id === doneIds.at(-1)) ?? members.find(bot => doneIds.includes(bot.id))
         ?? members.find(bot => bot.name === batch.done.at(-1)) ?? members.find(bot => bot.id !== batch.by)
-      if (!room.members.includes(batch.by) || batch.done.length === 0 || last === undefined || !batch.worked || batch.answered) {
+      // A posted reply wakes the caller even when the member used no tool. A reply
+      // that called someone else (`answered`) does not: that call is the handoff.
+      if (!room.members.includes(batch.by) || batch.done.length === 0 || last === undefined || batch.answered || (!batch.worked && !batch.wakeAfter)) {
         delete batches()[batch.key]
         changed = true
         continue
@@ -1518,8 +1520,32 @@ export function install(rt) {
     callIn(round, callees, `${member.name} mentioned you`, member.id, {
       parent, event: `line:${room.seq}`, reviewFix, text, category,
     })
-    // An @Name from the admin hands the member its goal task.
-    if (rt.isAdminOf(room, member.id)) for (const peer of callees) rt.goalTaskWorking?.(room.id, peer.id)
+    // A call that actually started hands that member its current-stage task.
+    for (const peer of callees) rt.goalTaskWorking?.(room.id, peer.id)
+  }
+
+  // A text reply that did not use a tool wakes its caller once the round has closed,
+  // so the round itself can finish. The post is a result, the same shape as a restart wake.
+  async function flushWakeAfter(room) {
+    for (const batch of Object.values(batches())) {
+      if (batch.roomId !== room.id || batch.wakeAfter !== true || batch.answered || batch.pending.length > 0) continue
+      const members = room.members.map(rt.botOf).filter(Boolean)
+      const doneIds = batch.doneIds ?? []
+      const last = members.find(bot => bot.id === doneIds.at(-1))
+        ?? members.find(bot => doneIds.includes(bot.id))
+        ?? members.find(bot => bot.name === batch.done.at(-1))
+      if (last === undefined || !room.members.includes(batch.by)) {
+        delete batches()[batch.key]
+        continue
+      }
+      batch.wakeAfter = false
+      await postToRoom(room, last, '', {
+        late: true, done: true, askedBy: batch.by, batch: batch.key, batchEnd: true, parent: batch.parent, event: `result:${batch.key}`,
+      }).catch((error) => {
+        delete batches()[batch.key]
+        rt.warn('ds-bot: a finished reply in %s did not wake its caller: %s', room.name, error)
+      })
+    }
   }
 
   // A round runs every call that can start, and wakes when a turn ends, a call comes
@@ -1551,6 +1577,7 @@ export function install(rt) {
     round.closed = true
     await Promise.allSettled([...turns])
     delete round.nudge
+    await flushWakeAfter(room)
     // The admin was alone with the user's message and passed: the round ends with
     // nothing said. The group says so once, so the user knows to call a member.
     const alone = round.soleAdmin !== undefined && round.slots.find(slot => slot.id === round.soleAdmin.id)?.status === 'passed'
@@ -1697,13 +1724,33 @@ export function install(rt) {
         say(room, { who: 'DS Bot', kind: 'notice', reason: 'missed', names: [member.name], about: member.id, minutes: Math.round(ROOM_REPLY_TIMEOUT_MS / 60000) })
       }
     }
-    // A result the admin asked for reports its goal task; a failed model call puts it back.
-    if (slot.status === 'posted' && slot.by === room.admin && final !== undefined) rt.goalTaskReported?.(room.id, member.id)
+    // A posted reply reports this member's current-stage task, whoever asked for it.
+    // A failed model call puts it back.
+    if (slot.status === 'posted' && final !== undefined) rt.goalTaskReported?.(room.id, member.id)
     if (reply?.failure !== undefined) rt.goalTaskReset?.(room.id, member.id, 'Could not finish: its model call failed')
     // Yielding to work, approval or an unanswered turn keeps the task pending.
     if (['posted', 'passed', 'failed', 'left', 'cancelled'].includes(slot.status)) {
-      const batch = batchOfSlot(room.id, slot)
-      if (batch !== undefined) {
+      const seen = new Set()
+      const owed = []
+      const addOwed = (batch) => {
+        if (batch === undefined || seen.has(batch.key)) return
+        seen.add(batch.key)
+        owed.push(batch)
+      }
+      // This turn's own call, plus any earlier call this member handed off and
+      // still owes a reply to. A second direct call stays out of that list.
+      addOwed(batchOfSlot(room.id, slot))
+      for (const batch of batchesOf(room.id, member.id)) if (batch.returnPending === true) addOwed(batch)
+      const everyone = room.members.map(rt.botOf).filter(Boolean)
+      const substantive = final !== undefined && !isIdleRelayText(final, everyone, [])
+      for (const batch of owed) {
+        // Calling someone other than the Bot that asked is a handoff, not the
+        // answer. Stay in that batch until a later reply calls nobody.
+        if (slot.status === 'posted' && called.size > 0 && !called.has(batch.by)) {
+          batch.returnPending = true
+          if (worked) batch.worked = true
+          continue
+        }
         if (slot.status === 'posted') {
           batch.done.push(member.name)
           batch.doneIds.push(member.id)
@@ -1712,18 +1759,23 @@ export function install(rt) {
           if (worked) batch.worked = true
         }
         leaveBatch(room, batch, member.id)
-        if (batch.pending.length === 0 && batch.done.length > 0 && batch.worked && !batch.answered && !signal.aborted) {
+        if (batch.pending.length === 0 && batch.done.length > 0 && !batch.answered && !signal.aborted) {
           const caller = rt.botOf(batch.by)
           const wake = { names: [...batch.done], results: [...batch.results] }
-          // A caller still waiting in this round starts with the results. One still in its
-          // own turn cannot see them, so it answers in a turn after that one.
-          if (caller !== undefined && room.members.includes(caller.id)) {
+          // Tool work wakes the caller in this round. A real reply that used no tool
+          // wakes the caller after the round, so a status line does not hold it open.
+          if (batch.worked && caller !== undefined && room.members.includes(caller.id)) {
             if (!round.slots.some(other => other.id === caller.id && other.status === 'waiting')) {
               callIn(round, [caller], finishedNote(wake.names), undefined, {
                 from: member.id, resultIds: new Set([caller.id]), parent: slot.routing ?? slot.parent, event: `result:${batch.key}`,
               })
             }
             giveResults(round, caller.id, wake)
+          } else if (!batch.worked && substantive && caller !== undefined && room.members.includes(caller.id)) {
+            batch.wakeAfter = true
+            // leaveBatch drops a batch once nobody is still in it. This one still
+            // has to wake its caller after the round, so put it back.
+            batches()[batch.key] = batch
           }
         }
       }
@@ -2245,7 +2297,8 @@ export function install(rt) {
     const results = new Set(rest.filter(peer => resultCall(post, peer, named)).map(peer => peer.id))
     callIn(round, rest, wake === undefined ? note : finishedNote(wake.names), undefined, { ...scope, ordered, from: sender.id, resultIds: results })
     if (wake !== undefined) giveResults(round, extra.askedBy, wake)
-    if (rt.isAdminOf(room, sender.id)) for (const peer of speakers) rt.goalTaskWorking?.(room.id, peer.id)
+    // Named callees only. A result wake is in `rest` and must not retask the caller.
+    for (const peer of by) rt.goalTaskWorking?.(room.id, peer.id)
     if (extra.reportBack) {
       (round.reports ??= []).push({ post: { botId: sender.id, name: sender.name, reportBack: true, parent: scope.parent, event: extra.event, ...(extra.sub ? { sub: extra.sub } : {}), ...(extra.fromRoomId ? { fromRoomId: extra.fromRoomId } : {}), ...(extra.fromPart ? { fromPart: extra.fromPart } : {}) }, ids: speakers.map(peer => peer.id), from: room.seq + 1 })
     }
@@ -2326,14 +2379,20 @@ export function install(rt) {
     }
     const batch = batchOfTurn(room.id, member.id, info)
     const askedBy = info.role === 'room' ? info.askedBy : (info.askedBy ?? batch?.by)
-    // The admin asked for this result: its goal task is reported at once, even
-    // while the other members of the batch still work.
-    if (askedBy === room.admin && (!isPass(text) || shown)) rt.goalTaskReported?.(room.id, member.id)
+    // Whoever asked, a real reply reports this member's current-stage task at once,
+    // even while the other members of the batch still work.
+    if (!isPass(text) || shown) rt.goalTaskReported?.(room.id, member.id)
     const named = mentionsIn(text, room.members.map(rt.botOf).filter(Boolean)).found.filter(bot => bot.id !== member.id)
+    const parent = info.routing ?? info.taskContext
+    const category = info.routing?.category ?? info.category
+    // A refused @ did not start anyone, so it must not swallow the caller's wake.
+    const allowedNamed = named.filter(bot => rt.botResponse.check({
+      sender: member.id, recipient: bot, room, named: true, text, kind: 'call', parent, category, reviewFix: reviewFixOf(text),
+    }).allow)
     let waitingPeers = false
     let batchDoneBefore = false
     if (batch !== undefined) {
-      if (named.length > 0) batch.answered = true
+      if (allowedNamed.length > 0) batch.answered = true
       if (!isPass(text) || shown) {
         batch.done.push(member.name)
         ;(batch.doneIds ??= []).push(member.id)

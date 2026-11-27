@@ -421,8 +421,39 @@ const DUTY_DRAFT = [
   '2. List the decisions only the user can make. Ask them in one message, numbered, each with your recommended answer, so the user can reply "as recommended". Skip this when nothing is open.',
   '3. Then call group_goal start: the objective, how to check it is done (commands, tests, files, evidence), the rules to keep, and the stages in order, each with its own check and its tasks for named members.',
 ].join('\n')
-const NUDGE_LINE = 'Goal check from DS Bot: nothing is running in this group and the goal is not finished. Take the next step now: hand out the current stage\'s tasks that are not done, check a stage whose members have reported, or complete the goal if every stage passed. If you are waiting for the user, reply [PASS].'
+const NUDGE_LINE = 'Goal check from DS Bot: nothing is running in this group and the goal is not finished. Take the next step now: send message_bot with task_category to each current-stage member whose task is pending or working, check a stage whose members have reported, or complete the goal if every stage passed. Writing @Name does not start a member who needs a category. If you are waiting for the user and no member still has a pending or working task, reply [PASS].'
 const RESUME_LINE = 'The user resumed the goal. Take the next step now.'
+
+// Current-stage tasks that still belong to a member other than the admin.
+function openMemberTasks(goal, adminId) {
+  const stage = goal.stages?.[goal.current]
+  if (stage === undefined || stage.status === 'passed') return []
+  return (stage.tasks ?? []).filter(task => (task.status === 'pending' || task.status === 'working') && task.botId !== adminId)
+}
+
+function categoryFor(bot) {
+  const categories = bot?.responsibility?.categories
+  if (!Array.isArray(categories) || categories.length === 0) return undefined
+  const preset = bot.responsibility?.preset
+  if (preset === 'reviewer' && categories.includes('review')) return 'review'
+  if (preset === 'coder' && categories.includes('coding')) return 'coding'
+  if (categories.includes('coordination')) return 'coordination'
+  return categories[0]
+}
+
+// One post per open task, from the admin, carrying a category when the member needs one.
+async function dispatchOpenTasks(rt, room, admin, tasks, parent) {
+  for (const task of tasks) {
+    const bot = rt.botOf(task.botId)
+    if (bot === undefined) continue
+    const category = categoryFor(bot)
+    await rt.postToRoom?.(room, admin, `@${bot.name} ${task.task}`, {
+      member: true,
+      ...(category === undefined ? {} : { category }),
+      parent,
+    })
+  }
+}
 
 export function install(rt) {
   const { ctx } = rt
@@ -615,7 +646,23 @@ export function install(rt) {
     // A round nobody spoke in — e.g. a stop notice or a stale check — never nudges.
     if (round.stoppedOnly === true || round.slots.length === 0) return
     if (round.userMessage === true || round.slots.some(slot => slot.worked === true && slot.id !== admin.id)) goal.nudges = 0
+    const parent = round.slots.reduce((scope, { routing }) => routing !== undefined && routing.task === scope?.task && routing.hops > scope.hops ? routing : scope,
+      round.parent ?? goal.taskContext) ?? newTaskContext()
+    const open = openMemberTasks(goal, admin.id)
+    // A stage that still has a member's task does not go idle. The check sends
+    // that task once per goal revision; a later check does not send it again
+    // until the task changes.
+    const routeOpen = async () => {
+      if (open.length === 0) return false
+      if (goal.routedRevision === goal.revision) return true
+      goal.routedRevision = goal.revision
+      goal.updatedAt = Date.now()
+      await rt.save()
+      await dispatchOpenTasks(rt, room, admin, open, parent)
+      return true
+    }
     if (round.goalNudge === true && round.slots.some(slot => slot.id === admin.id && slot.status === 'passed')) {
+      if (await routeOpen()) return
       goal.idle = true
       goal.revision += 1
       goal.updatedAt = Date.now()
@@ -625,10 +672,9 @@ export function install(rt) {
     if ((rt.workingInRoom?.(room) ?? []).length > 0) return
     if (rt.roomBatchPending?.(room.id) === true) return
     if ((rt.roomInbox.get(room.id)?.length ?? 0) > 0) return
-    const parent = round.slots.reduce((scope, { routing }) => routing !== undefined && routing.task === scope?.task && routing.hops > scope.hops ? routing : scope,
-      round.parent ?? goal.taskContext) ?? newTaskContext()
     goal.taskContext = parent
     if (goal.nudges >= GOAL_IDLE_NUDGES) {
+      if (await routeOpen()) return
       goal.idle = true
       goal.revision += 1
       goal.updatedAt = Date.now()
